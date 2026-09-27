@@ -432,7 +432,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
                         dtype=torch.int32,
                         device=sequence_lengths.device,
                     ),
-                    torch.cumsum(sequence_lengths, dim=0),
+                    torch.cumsum(sequence_lengths, dim=0, dtype=torch.int32),
                 )
             )
         cumulative_lengths = cumulative_lengths.to(torch.int32)
