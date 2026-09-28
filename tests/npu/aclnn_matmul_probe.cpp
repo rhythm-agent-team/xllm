@@ -35,6 +35,7 @@ limitations under the License.
 
 #include "acl/acl.h"
 #include "aclnnop/aclnn_batch_matmul.h"
+#include "aclnnop/aclnn_matmul.h"
 #include "aclnnop/aclnn_mm.h"
 
 namespace {
@@ -209,6 +210,88 @@ int32_t probe_mm(const void* x,
     record_error("aclnnMmGetWorkspaceSize", status);
   } else {
     status = execute(workspace_size, executor, stream, "aclnnMm", &aclnnMm);
+    if (status == 0) {
+      g_last_error.clear();
+    }
+  }
+  aclDestroyTensor(x_t);
+  aclDestroyTensor(w_t);
+  aclDestroyTensor(y_t);
+  return status;
+}
+
+// Multidimensional matmul: batch <= 0 selects x [m, k] @ w [k, n] -> y [m, n];
+// a positive batch selects x [batch, m, k] @ w [batch, k, n] -> y
+// [batch, m, n]. Same 3D shapes as probe_bmm, but through aclnnMatmul, which
+// mirrors the 2D aclnnMm path.
+int32_t probe_matmul(const void* x,
+                     const void* w,
+                     void* y,
+                     int64_t batch,
+                     int64_t m,
+                     int64_t k,
+                     int64_t n,
+                     int32_t in_dtype,
+                     int32_t out_dtype,
+                     void* stream) {
+  const aclDataType acl_in = to_acl_dtype(in_dtype);
+  const aclDataType acl_out = to_acl_dtype(out_dtype);
+  if (acl_in == ACL_DT_UNDEFINED || acl_out == ACL_DT_UNDEFINED) {
+    g_last_error = "probe_matmul: unsupported dtype code";
+    return -1;
+  }
+  int64_t x_shape[3] = {m, k, 0};
+  int64_t w_shape[3] = {k, n, 0};
+  int64_t y_shape[3] = {m, n, 0};
+  int64_t dim_num = 2;
+  if (batch > 0) {
+    x_shape[0] = batch;
+    x_shape[1] = m;
+    x_shape[2] = k;
+    w_shape[0] = batch;
+    w_shape[1] = k;
+    w_shape[2] = n;
+    y_shape[0] = batch;
+    y_shape[1] = m;
+    y_shape[2] = n;
+    dim_num = 3;
+  }
+  aclTensor* x_t = aclCreateTensor(x_shape,
+                                   dim_num,
+                                   acl_in,
+                                   nullptr,
+                                   0,
+                                   ACL_FORMAT_ND,
+                                   x_shape,
+                                   dim_num,
+                                   const_cast<void*>(x));
+  aclTensor* w_t = aclCreateTensor(w_shape,
+                                   dim_num,
+                                   acl_in,
+                                   nullptr,
+                                   0,
+                                   ACL_FORMAT_ND,
+                                   w_shape,
+                                   dim_num,
+                                   const_cast<void*>(w));
+  aclTensor* y_t = aclCreateTensor(y_shape,
+                                   dim_num,
+                                   acl_out,
+                                   nullptr,
+                                   0,
+                                   ACL_FORMAT_ND,
+                                   y_shape,
+                                   dim_num,
+                                   y);
+  uint64_t workspace_size = 0;
+  aclOpExecutor* executor = nullptr;
+  int32_t status = aclnnMatmulGetWorkspaceSize(
+      x_t, w_t, y_t, kCubeMathTypeKeepDtype, &workspace_size, &executor);
+  if (status != 0) {
+    record_error("aclnnMatmulGetWorkspaceSize", status);
+  } else {
+    status =
+        execute(workspace_size, executor, stream, "aclnnMatmul", &aclnnMatmul);
     if (status == 0) {
       g_last_error.clear();
     }

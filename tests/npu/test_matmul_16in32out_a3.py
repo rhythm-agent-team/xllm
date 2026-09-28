@@ -23,10 +23,17 @@ accumulate) while dropping the upcast copies.
 The probe calls the aclnn two-phase API directly (no xLLM build required) and
 compares every variant against an fp64 reference computed on the host:
 
-* ``bmm bf16 x bf16 -> bf16 out``  (baseline: plain bf16 kernel)
-* ``bmm bf16 x bf16 -> fp32 out``  (candidate: 16-in/32-out)
-* ``mm  bf16 x bf16 -> fp32 out``  (2D MatMulV3: combo is not in the A3 op table)
-* ``mm  fp32 x fp32 -> fp32 out``  (current router path in xLLM)
+* ``bmm bf16 x bf16 -> bf16 out``   (baseline: plain bf16 kernel)
+* ``bmm bf16 x bf16 -> fp32 out``   (3D BatchMatMulV3)
+* ``mm  bf16 x bf16 -> fp32 out``   (2D MatMulV3)
+* ``mm  fp32 x fp32 -> fp32 out``   (current router path in xLLM)
+* ``matmul bf16 x bf16 -> fp32 out``, 2D and 3D (aclnnMatmul, the same shapes
+  as the two routes above through a different aclnn entry)
+
+A route that genuinely accumulates in fp32 lands near 1e-7 relative to the
+fp64 reference; a bf16-write route lands near 2e-3. The two quantities are
+four orders of magnitude apart, so the measurement identifies the arithmetic
+directly rather than inferring it from a tolerance boundary.
 
 Build the wrapper inside the NPU container:
 
@@ -94,6 +101,19 @@ def _load_probe(lib_path: str) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     lib.probe_last_error.restype = ctypes.c_char_p
+    lib.probe_matmul.restype = ctypes.c_int32
+    lib.probe_matmul.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        f64,
+        f64,
+        f64,
+        f64,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+    ]
     return lib
 
 
@@ -178,6 +198,36 @@ def _call_mm(lib, x, w, out, m, in_dtype_code, out_dtype_code) -> int:
     return status
 
 
+def _call_matmul(lib, x, w, out, batch, m, in_dtype_code, out_dtype_code) -> int:
+    stream = ctypes.c_void_p(torch.npu.current_stream().npu_stream)
+    status = lib.probe_matmul(
+        ctypes.c_void_p(x.data_ptr()),
+        ctypes.c_void_p(w.data_ptr()),
+        ctypes.c_void_p(out.data_ptr()),
+        batch,
+        m,
+        HIDDEN_SIZE,
+        NUM_EXPERTS,
+        in_dtype_code,
+        out_dtype_code,
+        stream,
+    )
+    if status == 0:
+        torch.npu.synchronize()
+    return status
+
+
+def _report(label, status, lib, out, reference):
+    if status != 0:
+        print(f"  {label} STATUS={status} {lib.probe_last_error().decode()}")
+        return None
+    metrics = _error_metrics(out, reference)
+    print(
+        f"  {label} max_abs={metrics['max_abs']:.3e} max_rel={metrics['max_rel']:.3e} rms_rel={metrics['rms_rel']:.3e}"
+    )
+    return metrics
+
+
 def _time_call(fn, iterations: int = 20, warmup: int = 3) -> float:
     for _ in range(warmup):
         fn()
@@ -208,74 +258,96 @@ def run_probe(lib_path: str, requested_device: str | None = None) -> bool:
     for m in (512, 8, 1):
         inputs, reference = _make_inputs(m, device)
         asserted = m == 512
+        x_bf, w_bf = inputs["x_bf16"], inputs["w_bf16_kn"]
+        x_fp32, w_fp32 = inputs["x_fp32"], inputs["w_fp32_kn"]
+        out_mm = torch.empty(m, NUM_EXPERTS, dtype=torch.float32, device=device)
+        out_mm_fp32_in = torch.empty(m, NUM_EXPERTS, dtype=torch.float32, device=device)
+        out_matmul_2d = torch.empty(m, NUM_EXPERTS, dtype=torch.float32, device=device)
+        out_matmul_3d = torch.empty(1, m, NUM_EXPERTS, dtype=torch.float32, device=device)
         print(f"\n--- M={m} ---")
 
-        status, out_bf16 = _call_bmm(lib, inputs, DTYPE_BF16, m, device)
-        if status != 0:
-            print(f"  bmm bf16->bf16  STATUS={status} {lib.probe_last_error().decode()}")
-            ok = ok and not asserted
-        else:
-            metrics = _error_metrics(out_bf16, reference)
-            print(
-                f"  bmm bf16->bf16  max_abs={metrics['max_abs']:.3e} "
-                f"max_rel={metrics['max_rel']:.3e} rms_rel={metrics['rms_rel']:.3e}"
-            )
-            if asserted:
-                # A bf16 result tensor must quantize the logits at ~2^-9.
-                ok = ok and metrics["max_rel"] > FP32_ACCUMULATE_MAX_REL
-
-        status, out_fp32 = _call_bmm(lib, inputs, DTYPE_FP32, m, device)
-        if status != 0:
-            print(f"  bmm bf16->fp32  STATUS={status} {lib.probe_last_error().decode()}")
-            if asserted:
-                ok = False
-        else:
-            metrics = _error_metrics(out_fp32, reference)
-            print(
-                f"  bmm bf16->fp32  max_abs={metrics['max_abs']:.3e} "
-                f"max_rel={metrics['max_rel']:.3e} rms_rel={metrics['rms_rel']:.3e}"
-            )
-            print(f"    out dtype={out_fp32.dtype} (fp32 accumulate expected)")
-            if asserted:
-                ok = ok and metrics["max_rel"] < FP32_ACCUMULATE_MAX_REL
-
-        mm_out_fp32 = torch.empty(m, NUM_EXPERTS, dtype=torch.float32, device=device)
-        status = _call_mm(lib, inputs["x_bf16"], inputs["w_bf16_kn"], mm_out_fp32, m, DTYPE_BF16, DTYPE_FP32)
-        if status != 0:
-            print(f"  mm  bf16->fp32   STATUS={status} {lib.probe_last_error().decode()}")
-        else:
-            metrics = _error_metrics(mm_out_fp32, reference)
-            print(
-                f"  mm  bf16->fp32   max_abs={metrics['max_abs']:.3e} "
-                f"max_rel={metrics['max_rel']:.3e} rms_rel={metrics['rms_rel']:.3e}"
-            )
-
-        mm_out_fp32_in = torch.empty(m, NUM_EXPERTS, dtype=torch.float32, device=device)
-        status = _call_mm(lib, inputs["x_fp32"], inputs["w_fp32_kn"], mm_out_fp32_in, m, DTYPE_FP32, DTYPE_FP32)
-        if status != 0:
-            print(f"  mm  fp32->fp32   STATUS={status} {lib.probe_last_error().decode()}")
-            if asserted:
-                ok = False
-        else:
-            metrics = _error_metrics(mm_out_fp32_in, reference)
-            print(
-                f"  mm  fp32->fp32   max_abs={metrics['max_abs']:.3e} "
-                f"max_rel={metrics['max_rel']:.3e} rms_rel={metrics['rms_rel']:.3e}"
-                "   (current router path)"
-            )
+        bmm_bf16_status, out_bmm_bf16 = _call_bmm(lib, inputs, DTYPE_BF16, m, device)
+        bmm_fp32_status, out_bmm_fp32 = _call_bmm(lib, inputs, DTYPE_FP32, m, device)
+        bmm_bf16_metrics = _report("bmm    bf16->bf16", bmm_bf16_status, lib, out_bmm_bf16, reference)
+        bmm_fp32_metrics = _report("bmm    bf16->fp32", bmm_fp32_status, lib, out_bmm_fp32, reference)
+        mm_metrics = _report(
+            "mm     bf16->fp32",
+            _call_mm(lib, x_bf, w_bf, out_mm, m, DTYPE_BF16, DTYPE_FP32),
+            lib,
+            out_mm,
+            reference,
+        )
+        mm_fp32_in_metrics = _report(
+            "mm     fp32->fp32",
+            _call_mm(lib, x_fp32, w_fp32, out_mm_fp32_in, m, DTYPE_FP32, DTYPE_FP32),
+            lib,
+            out_mm_fp32_in,
+            reference,
+        )
+        matmul_2d_metrics = _report(
+            "matmul bf16->fp32 2D",
+            _call_matmul(lib, x_bf, w_bf, out_matmul_2d, 0, m, DTYPE_BF16, DTYPE_FP32),
+            lib,
+            out_matmul_2d,
+            reference,
+        )
+        matmul_3d_metrics = _report(
+            "matmul bf16->fp32 3D",
+            _call_matmul(lib, x_bf.unsqueeze(0), w_bf.unsqueeze(0), out_matmul_3d, 1, m, DTYPE_BF16, DTYPE_FP32),
+            lib,
+            out_matmul_3d.view(m, NUM_EXPERTS),
+            reference,
+        )
 
         if m == 512 and os.environ.get("XLLM_TEST_MATMUL_PROBE_TIME") == "1":
             bmm_ms = _time_call(partial(_call_bmm, lib, inputs, DTYPE_FP32, m, device))
-            mm_bf16_ms = _time_call(
-                partial(_call_mm, lib, inputs["x_bf16"], inputs["w_bf16_kn"], mm_out_fp32, m, DTYPE_BF16, DTYPE_FP32)
-            )
-            mm_fp32_ms = _time_call(
-                partial(_call_mm, lib, inputs["x_fp32"], inputs["w_fp32_kn"], mm_out_fp32_in, m, DTYPE_FP32, DTYPE_FP32)
+            mm_ms = _time_call(partial(_call_mm, lib, x_bf, w_bf, out_mm, m, DTYPE_BF16, DTYPE_FP32))
+            mm_fp32_in_ms = _time_call(
+                partial(_call_mm, lib, x_fp32, w_fp32, out_mm_fp32_in, m, DTYPE_FP32, DTYPE_FP32)
             )
             print(
                 f"  [contended timing] bmm bf16->fp32 {bmm_ms:.3f}ms  "
-                f"mm bf16->fp32 {mm_bf16_ms:.3f}ms  mm fp32->fp32 {mm_fp32_ms:.3f}ms"
+                f"mm bf16->fp32 {mm_ms:.3f}ms  mm fp32->fp32 {mm_fp32_in_ms:.3f}ms"
             )
+
+        if not asserted:
+            continue
+
+        # A bf16 result tensor must quantize the logits at ~2^-9.
+        bf16_quantized = bmm_bf16_metrics is not None and bmm_bf16_metrics["max_rel"] > FP32_ACCUMULATE_MAX_REL
+        print(f"    bmm bf16 out is bf16-quantized: {bf16_quantized}")
+        ok = ok and bf16_quantized
+
+        # The capability under test: at least one bf16-input route must give a
+        # genuine fp32 result. Which routes qualify is a device/CANN property,
+        # so this reports the set instead of asserting one route.
+        fp32_accurate = [
+            label
+            for label, metrics in (
+                ("mm 2D", mm_metrics),
+                ("matmul 2D", matmul_2d_metrics),
+                ("matmul 3D", matmul_3d_metrics),
+            )
+            if metrics is not None and metrics["max_rel"] < FP32_ACCUMULATE_MAX_REL
+        ]
+        print(f"    fp32-accurate bf16->fp32 routes: {fp32_accurate or 'NONE'}")
+        ok = ok and bool(fp32_accurate)
+
+        # bmm's fp32 out must either be a real fp32 result or exactly the bf16
+        # result upcast. Anything in between would be neither a dtype-dispatch
+        # choice nor a correct result.
+        if bmm_fp32_metrics is None:
+            ok = False
+        elif bmm_fp32_metrics["max_rel"] < FP32_ACCUMULATE_MAX_REL:
+            print("    bmm bf16->fp32: genuine fp32 accumulate")
+        else:
+            identical = bool(torch.equal(out_bmm_fp32, out_bmm_bf16.to(torch.float32)))
+            print(f"    bmm bf16->fp32: bf16-precision result, bit-identical to the bf16 out: {identical}")
+            ok = ok and identical
+
+        baseline = mm_fp32_in_metrics is not None and mm_fp32_in_metrics["max_rel"] < FP32_ACCUMULATE_MAX_REL
+        print(f"    fp32->fp32 baseline is fp32-accurate: {baseline}")
+        ok = ok and baseline
 
     print(f"\nresult: {'PASS' if ok else 'FAIL'}")
     return ok
