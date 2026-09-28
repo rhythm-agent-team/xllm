@@ -18,8 +18,8 @@
 ``xllm.python.kernels`` when the active platform is CUDA, so layers and models
 import one fixed path and carry no hardware branch. Its peers -- ``kernels_npu``
 and any package added for new hardware -- are bound the same way on their own
-platform. Exactly one of them is imported in a process; they share no code and
-never import each other. ``setup.py`` ships only the package matching
+platform. Exactly one of them is initialized in a process; they share no code
+and never import each other. ``setup.py`` ships only the package matching
 ``--device``.
 
 Launchers live under ``triton/`` and ``flashinfer/``; the modules here bind the
@@ -31,9 +31,6 @@ contract.
 
 from __future__ import annotations
 
-# FakeTensor implementations of the C++ operators. Imported first so that a
-# graph capture reaching any kernel below finds a registered fake.
-from . import _custom_op  # noqa: F401
 from .activation import silu_and_mul
 from .attention import (
     reshape_paged_cache,
@@ -85,6 +82,12 @@ from .sparse_attention import (
     sparse_flash_attention_lse,
     sparse_flash_attention_out,
 )
+
+
+def _initialize_runtime() -> None:
+    """Register native-op FakeTensor implementations when CUDA is selected."""
+    from . import _custom_op  # noqa: F401
+
 
 __all__ = [
     "rms_norm",

@@ -102,18 +102,21 @@ void ensure_python_interpreter() {
         }
       }
       prepend_sys_path(model_path);
-#if defined(USE_NPU)
-      if (we_initialized) {
-        py::module_::import("xllm.python._npu_bootstrap");
-      }
-#endif
+      const char* phase = "importing xllm.python";
       try {
+#if defined(USE_NPU)
+        if (we_initialized) {
+          phase = "importing xllm.python._npu_bootstrap";
+          py::module_::import("xllm.python._npu_bootstrap");
+        }
+#endif
+        phase = "importing xllm.python";
         py::module_ python_package = py::module_::import("xllm.python");
+        phase = "initializing xllm.python runtime";
         python_package.attr("initialize_runtime")();
       } catch (const py::error_already_set& e) {
-        LOG(FATAL) << "Failed to initialize the 'xllm.python' model runtime. "
-                      "Set --python_model_path (or XLLM_PYTHON_MODEL_PATH) to "
-                      "the directory containing the 'xllm' package. Error: "
+        LOG(FATAL) << "Failed while " << phase << " (python_model_path='"
+                   << model_path << "'; empty uses the default Python path). "
                    << e.what();
       }
     }

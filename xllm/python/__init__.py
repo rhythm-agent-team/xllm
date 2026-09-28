@@ -68,9 +68,9 @@ def initialize_runtime() -> None:
 def __getattr__(name: str) -> Any:
     if name == "kernels":
         raise RuntimeError(
-            "xllm.python runtime is not initialized; the embedded C++ "
-            "bootstrap must call xllm.python.initialize_runtime() before "
-            "importing model or layer modules"
+            "xllm.python runtime is not initialized; call "
+            "xllm.python.initialize_runtime() after registering native "
+            "torch operators and before importing model or layer modules"
         )
     if name in {"get_model_class", "register_model"}:
         registry = importlib.import_module("xllm.python.registry")

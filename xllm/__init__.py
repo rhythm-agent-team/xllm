@@ -12,7 +12,24 @@ def _get_python_version_tag() -> str:
 
 
 def _find_export_so_path() -> str:
-    pkg_dir = os.path.dirname(__file__)
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    source_root = os.path.dirname(pkg_dir)
+    if os.path.isfile(os.path.join(source_root, "setup.py")) and os.path.isfile(
+        os.path.join(source_root, "CMakeLists.txt")
+    ):
+        # A source checkout owns its setuptools build. Never use an old manual
+        # copy in the source package or an extension from another installation.
+        build_lib = f"lib.{sysconfig.get_platform()}-{sys.implementation.cache_tag}"
+        export_path = os.path.join(
+            source_root, "build", build_lib, "xllm", f"xllm_export{sysconfig.get_config_var('EXT_SUFFIX')}"
+        )
+        if os.path.isfile(export_path):
+            return export_path
+        raise ImportError(
+            f"cannot find xllm_export shared library for source checkout {source_root!r}. "
+            f"Expected: {export_path!r}. Build the extension with this Python interpreter."
+        )
+
     pyver = _get_python_version_tag()
 
     # Preferred, exact tags we build for today.
@@ -36,6 +53,12 @@ def _load_xllm_export() -> ModuleType:
     loaded_module = sys.modules.get("xllm_export")
     if loaded_module is not None:
         return loaded_module
+
+    # Initialize torch_npu on the main thread before loading its shared
+    # libraries or letting the C++ engine spawn worker threads. It is absent
+    # on non-NPU platforms. Both offline entry points need this ordering.
+    if importlib.util.find_spec("torch_npu") is not None:
+        import torch_npu  # noqa: F401
 
     export_so_path = _find_export_so_path()
     spec = importlib.util.spec_from_file_location("xllm_export", export_so_path)
@@ -92,15 +115,6 @@ def _load_public_api() -> None:
     if _PUBLIC_API_LOADED:
         return
 
-    # torch_npu must be imported on the main thread before the C++ engine
-    # spawns worker threads: torch_npu::init_npu() lazily imports python
-    # modules there, which fails off the main thread. Importing it here,
-    # before xllm_export loads the torch_npu shared libraries, also keeps
-    # torch's accelerator registration clean. It is absent on non-NPU
-    # platforms.
-    if importlib.util.find_spec("torch_npu") is not None:
-        import torch_npu  # noqa: F401
-
     xllm_export = _load_xllm_export()
 
     from xllm.pybind.args import ArgumentParser
@@ -140,6 +154,10 @@ def _load_public_api() -> None:
 
 
 def __getattr__(name: str) -> Any:
+    if name == "xllm_export":
+        module = _load_xllm_export()
+        globals()[name] = module
+        return module
     if name in _PUBLIC_NAMES:
         _load_public_api()
         return globals()[name]

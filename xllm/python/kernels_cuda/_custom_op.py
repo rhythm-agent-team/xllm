@@ -18,8 +18,8 @@ The schemas live in ``xllm/core/kernels/cuda/cuda_ops_library.cpp``. Every
 operator that a compiled graph may contain needs its shape and dtype contract
 declared here, otherwise tracing fails when it reaches the call.
 
-Importing this module registers all of them; the package ``__init__`` does so
-before exposing any kernel.
+Importing this module registers all of them; the CUDA runtime initializer does
+so after native operators are registered and before model execution.
 """
 
 from __future__ import annotations
