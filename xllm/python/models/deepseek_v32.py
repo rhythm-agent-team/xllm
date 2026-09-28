@@ -563,6 +563,39 @@ class W8A8StaticLinear(W8A8AttentionLinear):
         self._non_persistent_buffers_set.update(("weight_scale", "weight_offset"))
 
 
+class RouterGate(nn.Module):
+    """MoE router gate: bf16 [T, H] x bf16 [H, E] -> fp32 [T, E].
+
+    The checkpoint weight and the hidden state are both bf16, so the fp32 gate
+    of the reference model only upcasts them without adding information. The
+    16-in/32-out matmul multiplies those exact bf16 values into an fp32
+    accumulator, which keeps the fp32 logits the routing consumers expect while
+    dropping the per-call activation upcast and the fp32 weight copy.
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int, device: torch.device) -> None:
+        super().__init__()
+        # Keep the checkpoint layout [num_experts, hidden_size] so the weight
+        # loader keeps addressing this parameter as ``gate.weight``.
+        self.weight = nn.Parameter(
+            torch.empty(num_experts, hidden_size, dtype=torch.bfloat16, device=device),
+            requires_grad=False,
+        )
+        # Derived from ``weight``, so it stays a plain attribute: it must not
+        # enter the state dict or the loader's parameter snapshot.
+        self.weight_kn: torch.Tensor | None = None
+
+    def process_weights_after_loading(self) -> None:
+        """Materialize the contiguous [H, E] operand the matmul reads."""
+        self.weight_kn = self.weight.data.transpose(0, 1).contiguous()
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.weight_kn is None:
+            # Built without a checkpoint (weight-less construction, unit tests).
+            self.process_weights_after_loading()
+        return kernels.matmul_16in32out(hidden, self.weight_kn)
+
+
 class W8A8DynamicLinear(nn.Module):
     """Dynamic-activation W8A8 linear (MLP / experts)."""
 
@@ -1532,14 +1565,9 @@ class DeepseekV3MoE(nn.Module):
         self.local_expert_start = self.ep_rank * num_local_experts
         self.local_expert_end = self.local_expert_start + num_local_experts
 
-        # Match the ATB router's FP32 precision.
-        self.gate = nn.Linear(
-            cfg.hidden_size,
-            self.num_experts,
-            bias=False,
-            dtype=torch.float32,
-            device=device,
-        )
+        # bf16 operands into an fp32 accumulator: same precision as the ATB
+        # router's fp32 gate, without upcasting the activation or the weight.
+        self.gate = RouterGate(cfg.hidden_size, self.num_experts, device)
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.num_experts, dtype=torch.float32, device=device),
@@ -1665,6 +1693,7 @@ class DeepseekV3MoE(nn.Module):
         world, rank = moe_shard(self.cfg)
         self.load_experts(loader, mlp_prefix + "experts.", world=world, rank=rank)
         loader.copy_replicated(mlp_prefix + "gate.weight")
+        self.gate.process_weights_after_loading()
         loader.copy_in(
             mlp_prefix + "e_score_correction_bias",
             loader.load_tensor(mlp_prefix + "gate.e_score_correction_bias"),
@@ -1672,7 +1701,7 @@ class DeepseekV3MoE(nn.Module):
         self.shared_experts.load_from_checkpoint(loader, mlp_prefix + "shared_experts.", world=world, rank=rank)
 
     def _run_routed_experts(self, hidden: torch.Tensor) -> torch.Tensor:
-        logits = self.gate(hidden.to(torch.float32))
+        logits = self.gate(hidden)
         return kernels.grouped_moe(
             hidden,
             logits,
@@ -1750,7 +1779,7 @@ class DeepseekV3MoE(nn.Module):
 
             gate_stream.wait_event(start_event)
             with torch.npu.stream(gate_stream):
-                logits = self.gate(hidden.to(torch.float32))
+                logits = self.gate(hidden)
                 topk_weights, topk_ids = kernels.moe_gate_routing(
                     logits,
                     self.e_score_correction_bias,
@@ -1805,7 +1834,7 @@ class DeepseekV3MoE(nn.Module):
         shared_stream.wait_stream(current_stream)
 
         with torch.npu.stream(gate_stream):
-            logits = self.gate(hidden.to(torch.float32))
+            logits = self.gate(hidden)
             topk_weights, topk_ids = kernels.moe_gate_routing(
                 logits,
                 self.e_score_correction_bias,

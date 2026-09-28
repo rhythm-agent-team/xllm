@@ -39,7 +39,7 @@ _EXPORTS = {
         "fused_gdn_gating",
         "fused_sigmoid_gating_delta_rule_decode",
     ),
-    "linear": ("atb_matmul_ein_sum", "prepare_quant_weight", "prepare_row_parallel_weight"),
+    "linear": ("atb_matmul_ein_sum", "matmul_16in32out", "prepare_quant_weight", "prepare_row_parallel_weight"),
     "mla": (
         "MLA_PREPROCESS_V2_MAX_TOKENS",
         "deepseek_mla_preprocess_decode",
@@ -125,6 +125,7 @@ __all__ = [
     "update_decode_graph_metadata",
     "vision_fusion_attention",
     "atb_matmul_ein_sum",
+    "matmul_16in32out",
     "fused_qk_norm_rope",
     "interleaved_rotary_embedding",
     "npu_inplace_partial_rotary_mul",

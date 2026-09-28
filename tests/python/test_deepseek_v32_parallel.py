@@ -33,6 +33,7 @@ sys.modules.setdefault("xllm.python.kernels_cuda", _kernels_cuda)
 from xllm.python import distributed, kernels  # noqa: E402
 
 kernels.grouped_moe = MagicMock()
+kernels.matmul_16in32out = MagicMock()
 kernels.prepare_grouped_moe_weights = MagicMock(side_effect=lambda w13, w2: (w13, w2))
 kernels.supports_cutlass_moe = MagicMock(return_value=False)
 kernels.moe_fused_topk = MagicMock()

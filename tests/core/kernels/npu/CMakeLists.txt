@@ -74,4 +74,26 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
+# Needs an NPU: the 16-in/32-out matmul runs the aclnn kernel on device and is
+# checked against an fp64 reference computed on the host.
+cc_test(
+  NAME
+    matmul_16in32out_test
+  SRCS
+    matmul_16in32out_test.cpp
+  DEPS
+    ascendcl
+    nnopbase
+    torch
+    torch_npu
+    kernels
+    npu_kernels
+    GTest::gtest_main
+    glog::glog
+)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(matmul_16in32out_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()
+
 add_subdirectory(tilelang)
