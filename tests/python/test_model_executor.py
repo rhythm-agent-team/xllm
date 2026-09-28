@@ -14,8 +14,8 @@
 
 """Unit tests for xllm.python.model_executor.executor.
 
-Tests the device-conditional backend dispatch, ModelExecutor construction
-validation, and execution routing — using CPU mocks so no GPU/NPU required.
+Tests backend dispatch, ModelExecutor construction validation, and execution
+routing with test-specific mocks after real runtime initialization.
 """
 
 from __future__ import annotations
@@ -30,8 +30,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-# conftest.py stands in for xllm.python, whose import would bind the active
-# platform's kernel package and reach for operators from the C++ binary.
 from xllm.python.attention.backend import (  # noqa: E402
     AttentionBackend,
     AttentionMetadata,

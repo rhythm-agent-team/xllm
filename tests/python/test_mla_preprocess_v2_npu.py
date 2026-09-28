@@ -41,14 +41,8 @@ _QUANT_MODE = 0  # per_tensor_quant_asymm
 def _require_mla_preprocess_v2() -> ModuleType:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("requires an available Ascend NPU")
-    try:
-        import xllm
+    from xllm.python.kernels_npu import mla
 
-        # Loading the built export module registers torch.ops.xllm_ops.
-        _ = xllm.xllm_export
-        from xllm.python.kernels_npu import mla
-    except (ImportError, OSError) as exc:
-        pytest.skip(f"xLLM native extension is not built: {exc}")
     if not mla.has_mla_preprocess_v2():
         pytest.skip("aclnnMlaPreprocessV2 is not available in the loaded runtime")
     return mla

@@ -14,21 +14,12 @@
 # ==============================================================================
 
 import ast
-import importlib.util
 import unittest
 from pathlib import Path
-from typing import Any
+
+from xllm.pybind.args import ArgumentParser
 
 _ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_argument_parser() -> type[Any]:
-    module_path = _ROOT / "xllm" / "pybind" / "args.py"
-    spec = importlib.util.spec_from_file_location("xllm_args", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module.ArgumentParser
 
 
 def _constructor_defaults(module_name: str, class_name: str) -> dict[str, object]:
@@ -44,12 +35,12 @@ def _constructor_defaults(module_name: str, class_name: str) -> dict[str, object
 
 class PublicContextParallelApiTest(unittest.TestCase):
     def test_offline_cli_defaults_and_accepts_context_parallel_size(self) -> None:
-        parser = _load_argument_parser()().parser
+        parser = ArgumentParser().parser
         self.assertEqual(parser.parse_args([]).cp_size, 1)
         self.assertEqual(parser.parse_args(["--cp_size", "4"]).cp_size, 4)
 
     def test_offline_cli_rejects_removed_spelling(self) -> None:
-        parser = _load_argument_parser()().parser
+        parser = ArgumentParser().parser
         removed_option = "--enable_" + "prefill_sp"
         with self.assertRaises(SystemExit):
             parser.parse_args([removed_option])

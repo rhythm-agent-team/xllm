@@ -14,23 +14,19 @@
 
 from __future__ import annotations
 
-import sys
-import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-sys.modules.setdefault("torch_npu", types.ModuleType("torch_npu"))
-
 from xllm.python.attention.npu_paged_attention import (  # noqa: E402
     NpuPagedAttentionBackend,
     _build_stable_sfa_page_layout,
 )
 from xllm.python.model_executor.cp_utils import build_cp_context, cp_shard_rows  # noqa: E402
-from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
-    _StaticAttentionMetadata,
+from xllm.python.model_executor.runners.acl_graph import (  # noqa: E402
+    StaticGraphAttentionMetadata,
 )
 
 
@@ -53,12 +49,15 @@ def test_decode_prepare_does_not_require_cp_metadata_fields() -> None:
 def test_mla_index_context_accepts_decode_graph_static_metadata() -> None:
     backend = object.__new__(NpuPagedAttentionBackend)
     slot_mapping = torch.arange(2, dtype=torch.int64)
-    backend._metadata = _StaticAttentionMetadata(
+    backend._metadata = StaticGraphAttentionMetadata(
         slot_mapping=slot_mapping,
         paged_kv_indptr=torch.arange(3, dtype=torch.int32),
         paged_kv_indices=torch.arange(2, dtype=torch.int32),
         paged_kv_last_page_len=torch.ones(2, dtype=torch.int32),
     )
+    assert not backend._metadata.is_prefill
+    assert not backend._metadata.has_kv_shard
+    assert backend._metadata.local_slot_mapping is None
     backend._block_table_i32 = torch.arange(2, dtype=torch.int32).view(2, 1)
     backend._mla_actual_seq_q = torch.arange(1, 3, dtype=torch.int32)
     backend._mla_actual_seq_kv = torch.arange(1, 3, dtype=torch.int32)
@@ -76,6 +75,8 @@ def test_mla_index_context_accepts_decode_graph_static_metadata() -> None:
         context = backend.mla_index_context(SimpleNamespace(layer_id=0))
 
     assert context.slot_mapping.data_ptr() == slot_mapping.data_ptr()
+    assert context.cp_context is None
+    assert context.block_table is backend._block_table_i32
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])

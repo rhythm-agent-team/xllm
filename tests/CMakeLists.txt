@@ -3,19 +3,9 @@ if(NOT BUILD_TESTING)
 endif()
 
 if(USE_NPU)
-  add_test(
-    NAME python_executor_test
-    COMMAND
-      "${CMAKE_COMMAND}" -E env
-      "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
-      "${Python3_EXECUTABLE}" -m pytest -q "${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  set_tests_properties(
-    python_executor_test
-    PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-  )
+  add_subdirectory(python)
 
-  # Run separately so tests/python runtime stubs cannot affect the probe.
+  # The multi-process HCCL probe requires exclusive device use.
   add_test(
     NAME python_hccl_decode_graph_test
     COMMAND

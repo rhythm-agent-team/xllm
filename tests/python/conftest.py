@@ -12,38 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Package stubs for pure-Python tests that run without platform kernels."""
+"""Initialize the real native operators and Python kernels before collection."""
 
-from __future__ import annotations
+from xllm import xllm_export  # noqa: F401
+from xllm.python import initialize_runtime
 
-import sys
-import types
-from pathlib import Path
-
-_PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
-
-
-def _install_python_package_stub() -> None:
-    kernels = types.ModuleType("xllm.python.kernels")
-    kernels.MLA_PREPROCESS_V2_MAX_TOKENS = 1024
-    kernels_npu = types.ModuleType("xllm.python.kernels_npu")
-    kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
-    distributed = types.ModuleType("xllm.python.distributed")
-    distributed.dcp_group = lambda _device=None: None
-
-    package = types.ModuleType("xllm.python")
-    # Keep source submodules importable without executing the real package binding.
-    package.__path__ = [str(_PYTHON_ROOT)]
-    package.kernels = kernels
-    package.kernels_npu = kernels_npu
-    package.distributed = distributed
-
-    distributed.tp_rank = lambda device: 0
-
-    sys.modules["xllm.python"] = package
-    sys.modules["xllm.python.kernels"] = kernels
-    sys.modules["xllm.python.kernels_npu"] = kernels_npu
-    sys.modules["xllm.python.distributed"] = distributed
-
-
-_install_python_package_stub()
+initialize_runtime()

@@ -16,23 +16,12 @@
 
 from __future__ import annotations
 
-import sys
-import types
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-# Bind the CUDA kernel package without executing its __init__, which requires
-# operators from the compiled runtime. conftest.py supplies the generic kernel
-# and distributed stubs used by these CPU/mock tests.
-_PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
-_KERNELS_CUDA = types.ModuleType("xllm.python.kernels_cuda")
-_KERNELS_CUDA.__path__ = [str(_PYTHON_ROOT / "kernels_cuda")]
-sys.modules.setdefault("xllm.python.kernels_cuda", _KERNELS_CUDA)
-
-from tests.python.qwen3_5_test_utils import (  # noqa: E402
+from tests.python.qwen3_5_test_utils import (
     StateDict as _StateDict,
 )
 from tests.python.qwen3_5_test_utils import (
@@ -50,32 +39,32 @@ from tests.python.qwen3_5_test_utils import (
 from tests.python.qwen3_5_test_utils import (
     make_linear_config as _linear_config,
 )
-from xllm.python import distributed, kernels  # noqa: E402
-from xllm.python.kernels_cuda.moe import supports_cutlass_moe  # noqa: E402
-from xllm.python.layers.cuda.qwen3_5.attention import (  # noqa: E402
+from xllm.python import distributed, kernels
+from xllm.python.kernels_cuda.moe import supports_cutlass_moe
+from xllm.python.layers.cuda.qwen3_5.attention import (
     CudaQwen3_5Attention,
 )
-from xllm.python.layers.cuda.qwen3_5.decoder_layer import (  # noqa: E402
+from xllm.python.layers.cuda.qwen3_5.decoder_layer import (
     CudaQwen3_5DecoderLayer,
 )
-from xllm.python.layers.cuda.qwen3_5.gated_delta_net import (  # noqa: E402
+from xllm.python.layers.cuda.qwen3_5.gated_delta_net import (
     CudaQwen3_5GatedDeltaNet,
 )
-from xllm.python.layers.cuda.qwen3_5.moe import (  # noqa: E402
+from xllm.python.layers.cuda.qwen3_5.moe import (
     CudaQwen3_5SparseMoEBlock,
 )
-from xllm.python.layers.fused_moe import FusedMoE  # noqa: E402
-from xllm.python.layers.gated_mlp import GatedMLP  # noqa: E402
-from xllm.python.layers.qwen3_5_decoder_layer import (  # noqa: E402
+from xllm.python.layers.fused_moe import FusedMoE
+from xllm.python.layers.gated_mlp import GatedMLP
+from xllm.python.layers.qwen3_5_decoder_layer import (
     get_qwen3_5_decoder_layer_class,
 )
-from xllm.python.model_executor.forward_context import forward_context  # noqa: E402
-from xllm.python.model_loader import (  # noqa: E402
+from xllm.python.model_executor.forward_context import forward_context
+from xllm.python.model_loader import (
     ParallelLoadContext,
     ScopedWeightLoader,
 )
-from xllm.python.models import qwen3_5 as qwen3_5_model  # noqa: E402
-from xllm.python.models.qwen3_5 import (  # noqa: E402
+from xllm.python.models import qwen3_5 as qwen3_5_model
+from xllm.python.models.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5ForCausalLM,
     Qwen3_5Model,

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 import time
@@ -30,29 +29,9 @@ import torch
 import torch.distributed as dist
 
 from xllm.python import distributed
+from xllm.python.distributed import collectives
+from xllm.python.distributed import cuda as cuda_collectives
 from xllm.python.models import glm5_2
-from xllm.python.platform import current_platform
-
-_MODULE_PATH = Path(__file__).parents[2] / "xllm" / "python" / "distributed" / "collectives.py"
-# conftest supplies a lightweight distributed stub; expose the backend leaf
-# packages without executing the real distributed package initializer.
-distributed.__path__ = [str(_MODULE_PATH.parent)]
-from xllm.python.distributed import cuda as cuda_collectives  # noqa: E402
-
-_SPEC = importlib.util.spec_from_file_location("_xllm_collectives_under_test", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-collectives = importlib.util.module_from_spec(_SPEC)
-# Exercise import-time NPU selection without requiring NPU hardware. The real
-# helper validates CPU inputs before reaching native ops; only its runtime
-# registration import is stubbed when torch_npu has not already been imported.
-with (
-    patch.object(current_platform, "is_npu", return_value=True),
-    pytest.MonkeyPatch.context() as module_patch,
-):
-    # Restore only torch_npu: patch.dict would also remove backend modules
-    # imported here, leaving the selected callable bound to an evicted module.
-    module_patch.setitem(sys.modules, "torch_npu", sys.modules.get("torch_npu", SimpleNamespace()))
-    _SPEC.loader.exec_module(collectives)
 
 
 class _FakeGroup:

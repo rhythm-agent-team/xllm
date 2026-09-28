@@ -32,9 +32,6 @@ _Project = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 @pytest.fixture(scope="module")
 def project() -> _Project:
     assert torch.npu.is_available(), "MLA projection tests require an Ascend NPU"
-    import xllm
-
-    _ = xllm.xllm_export
     from xllm.python.kernels_npu.linear import atb_matmul_ein_sum
 
     return atb_matmul_ein_sum

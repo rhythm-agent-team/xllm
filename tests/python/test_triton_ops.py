@@ -16,23 +16,11 @@
 
 from __future__ import annotations
 
-import sys
-import types
-from pathlib import Path
-
 import pytest
 import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA Triton tests require CUDA", allow_module_level=True)
-
-_PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
-
-# conftest.py stands in for xllm.python. Stand in for the CUDA kernel package
-# too, so that its __init__ does not run while testing the Triton operators.
-_kernels_package = types.ModuleType("xllm.python.kernels_cuda")
-_kernels_package.__path__ = [str(_PYTHON_ROOT / "kernels_cuda")]
-sys.modules["xllm.python.kernels_cuda"] = _kernels_package
 
 from xllm.python.kernels_cuda.triton.causal_conv1d import (
     causal_conv1d_decode as kernel_causal_conv1d_decode,

@@ -12,32 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real NPU tests: XLLM_RUN_NPU_TESTS=1 pytest --noconftest <this file>.
-
-XLLM_NATIVE_LIBRARY must name the matching built xllm_export library. The
-ordinary Python suite uses kernel stubs; this suite deliberately bypasses them.
-"""
+"""Real NPU tests for shared GLM RoPE coefficients and their consumers."""
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(os.environ.get("XLLM_RUN_NPU_TESTS") != "1", reason="explicit real NPU suite")
-
 
 @pytest.fixture(scope="module")
 def runtime() -> tuple[Any, Any]:
-    import torch_npu
-
-    torch.ops.load_library(os.environ["XLLM_NATIVE_LIBRARY"])
-    import xllm.python
-
-    xllm.python.initialize_runtime()
     from xllm.python.models import deepseek_v32, glm5_2
 
     torch.npu.set_device(0)

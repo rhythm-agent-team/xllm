@@ -16,32 +16,19 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-_REPO_ROOT = Path(__file__).parents[2]
-
-
-def _load_npu_moe_module():
-    path = _REPO_ROOT / "xllm/python/kernels_npu/moe.py"
-    spec = importlib.util.spec_from_file_location("pr5_npu_moe", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from xllm.python.kernels_npu import moe
 
 
 def test_selected_expert_moe_matches_native_call_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xllm.python import kernels
-
-    moe = _load_npu_moe_module()
 
     hidden = torch.empty(3, 16, dtype=torch.bfloat16)
     topk_weights = torch.ones(3, 2, dtype=torch.bfloat16)
@@ -134,8 +121,6 @@ def test_selected_expert_moe_matches_native_call_contract(
 
 
 def test_selected_expert_moe_rejects_an_invalid_active_range() -> None:
-    moe = _load_npu_moe_module()
-
     with pytest.raises(ValueError, match="active expert range"):
         moe._grouped_moe_with_selected_experts_impl(
             torch.empty(1, 16, dtype=torch.bfloat16),
@@ -155,8 +140,6 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xllm.python import kernels
-
-    moe = _load_npu_moe_module()
 
     hidden = torch.empty(3, 16, dtype=torch.bfloat16)
     topk_weights = torch.ones(3, 2, dtype=torch.bfloat16)
@@ -230,7 +213,6 @@ def test_npu_softmax_topk_uses_graph_safe_native_op(
     renormalize: bool,
     expected_renorm: int,
 ) -> None:
-    moe = _load_npu_moe_module()
     logits = torch.zeros(2, 4, dtype=torch.bfloat16)
     weights = torch.tensor([[0.3, 0.2], [0.4, 0.1]], dtype=torch.bfloat16)
     expert_ids = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
@@ -262,7 +244,6 @@ def test_npu_softmax_topk_uses_graph_safe_native_op(
 def test_grouped_matmul_swiglu_quant_v2_requests_int8_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    moe = _load_npu_moe_module()
     expected = (
         torch.empty(0, dtype=torch.int8),
         torch.empty(0, dtype=torch.float32),
@@ -295,7 +276,6 @@ def test_grouped_matmul_swiglu_quant_v2_requests_int8_output(
 def test_moe_weight_format_cast_enables_internal_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    moe = _load_npu_moe_module()
     config = SimpleNamespace(allow_internal_format=False)
     monkeypatch.setattr(moe.torch, "npu", SimpleNamespace(config=config), raising=False)
 
@@ -320,7 +300,6 @@ def test_gmm2_preserves_routing_metadata(
     group_list_type: int,
     output_mode: str,
 ) -> None:
-    moe = _load_npu_moe_module()
     activations = torch.ones(3, 16, dtype=torch.int8)
     activation_scale = torch.ones(3, dtype=torch.float32)
     weight = torch.ones(4, 16, 32, dtype=torch.int8)

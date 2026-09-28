@@ -1,4 +1,6 @@
-# xLLM Python package layout
+# xLLM Python package
+
+[English](README.md) | [简体中文](README_zh.md)
 
 The Python executor separates model semantics from hardware execution. Keep the
 dependency direction one-way:
@@ -6,7 +8,7 @@ dependency direction one-way:
 ```text
 models  ->  layers  ->  kernels
         model_executor coordinates execution
-        distributed owns tensor-parallel collectives
+        distributed owns parallel collectives
 ```
 
 ## Package responsibilities
@@ -39,15 +41,9 @@ kernels_cuda/
 kernels_npu/
 ```
 
-The peers share no code and never import each other. The embedded C++ bootstrap
-calls `xllm.python.initialize_runtime()` after registering native operators and
-before importing a model module. That function selects the active package and
-publishes it as `xllm.python.kernels`:
-
-```python
-xllm.python.initialize_runtime()
-from xllm.python import kernels
-```
+The peers share no code and never import each other. Runtime initialization
+publishes the active package as `xllm.python.kernels`; the entry points are
+described under [Import and initialization](#import-and-initialization).
 
 Reusable layers and backend-owned layers may write
 `from xllm.python import kernels` and reach the package selected during runtime
@@ -57,23 +53,14 @@ been selected, so its API may follow that backend's native fusion boundary.
 more devices than the executor covers, so a device without a peer package ships
 the rest of `xllm.python` and runtime initialization raises for its platform.
 
-This is one of two places where the executor branches on hardware. The other is
-`model_executor/executor.py`, which selects the attention backend and the graph
-runner. Attention backends are not kernels: they hold state across steps
-(wrappers, workspaces, cached plans) and are wired into the executor's
-lifecycle, whereas a kernel package exports stateless functions. Keeping their
+`model_executor/executor.py` separately selects the attention backend and graph
+runner. Attention backends hold state across steps (wrappers, workspaces,
+cached plans) and are wired into the executor's lifecycle, whereas a kernel
+package exports stateless functions. Keeping their
 selection in the executor is deliberate.
 
-There is no `kernels` directory on disk, so runtime initialization also
-publishes the bound package in `sys.modules` under that name. After
-initialization, every import form resolves -- `import xllm.python.kernels` and
-`from xllm.python.kernels import rms_norm` as well as the attribute form -- and
-all of them reach the same module object, so no kernel package is imported
-twice.
-
-Imports inside a platform package are relative (`from .triton.l2_norm import
-...`), so the package does not name itself and a peer can be created by copying
-it. Absolute imports rooted at `xllm` are for code outside the package.
+Use relative imports for sibling modules and `xllm`-rooted absolute imports
+across packages.
 
 A platform package owns everything specific to its hardware:
 
@@ -84,6 +71,10 @@ A platform package owns everything specific to its hardware:
 - FakeTensor contracts for its C++ operators, collected in `_custom_op.py`;
 - mutation declarations and `torch.compile` graph boundaries;
 - the weight layouts its kernels require.
+
+Heavy launchers (TileLang, Triton, FlashInfer) stay lazily imported inside the
+semantic operator body unless a build tool explicitly imports a leaf DSL
+module.
 
 The NPU package contains two independent leaf implementation libraries:
 
@@ -145,30 +136,136 @@ a peer facade solely to make a shared complex layer compile.
 
 ### `distributed/`
 
-Tensor-parallel process groups and collectives. The collectives are
-hardware-neutral: only the ProcessGroup backend differs (NCCL on CUDA, HCCL on
-NPU) and torch selects it from the device.
+Parallel process groups, topology, and collectives. Shared orchestration
+selects platform-specific collective implementations in `cuda/` and `npu/`.
 
 ### `model_executor/`
 
 Execution orchestration: eager or graph runners, forward context, attention
 backend setup, cache binding, and lifecycle.
 
-## Import safety
+## Import and initialization
 
-`import xllm.python` is runtime-neutral: it does not detect a platform or import
-a kernel package. `import xllm.python.kernels_npu` is also build-safe and does
-not register fake operators or import semantic modules. The C++ worker
-registers `torch.ops.xllm_ops` first and then calls
-`xllm.python.initialize_runtime()`.
+`import xllm` and `import xllm.python` do not load the native extension or
+initialize kernels. Native operator registration, Python runtime
+initialization, and model construction are separate steps:
 
-Heavy launchers (TileLang, Triton, FlashInfer) stay lazily imported inside the
-semantic operator body unless a build tool explicitly imports a leaf DSL
-module. A platform package must never import a peer package.
+| Entry point | When native code becomes available | When Python kernels initialize |
+| --- | --- | --- |
+| `setup.py` / AOT compilation | No extension is loaded during compilation | Not initialized |
+| xLLM server with embedded Python | Native operators are supplied by the host before `ensure_python_interpreter()` initializes Python | `ensure_python_interpreter()` calls `initialize_runtime()` |
+| `tests/python` via pytest | Shared initialization in `conftest.py` loads `xllm_export` before test collection | `conftest.py` then calls `initialize_runtime()` |
+| Python offline inference API (`xllm.LLM`) | `_load_public_api()` loads `xllm_export` while preparing the API, before engine construction | The worker calls `initialize_runtime()` if the Python model executor is selected |
 
-Editing Python needs no rebuild. `--python_model_path` puts the source tree on
-`sys.path`, and every peer package is present there, so a service restart picks
-up the change.
+Extension loading establishes access from a Python process to xLLM's C++
+engine and operators. The offline API and test setup own this step. The server
+already starts with native code and embeds Python afterwards, while the build
+imports DSL sources to produce that native code. Neither needs to load a
+separate extension for those imports.
+
+Loading the extension makes native operators available. `initialize_runtime()`
+then initializes the platform's Python kernels; it does not load the native
+library. Each entry point owns the ordering described below.
+
+### Shared runtime initialization
+
+`initialize_runtime()` requires native operators to be registered already; it
+does not load `xllm_export`. It selects the platform package, calls that
+package's `_initialize_runtime()` hook, and publishes the result both as the
+`xllm.python.kernels` attribute and in `sys.modules`. There is no `kernels/`
+directory. These import forms resolve to the same selected package.
+
+NPU initialization imports `_custom_op.py` to register native FakeTensor
+implementations, then uses `_EXPORTS` to import semantic modules and publish
+their functions. CUDA imports its Python operator wrappers when its package
+is imported, but defers native FakeTensor registration to its runtime hook.
+FakeTensor implementations describe operators for graph tracing.
+
+Successful initialization is reused within each interpreter. Model creation,
+weight loading, and process-group setup happen separately; each worker or
+pytest process has its own initialization state.
+
+### Build time: `setup.py` and AOT compilation
+
+On NPU, `setup.py build` runs TileLang AOT compilation before the C++ build.
+AOT adapters import DSL modules such as `kernels_npu.tilelang.rope`. Python
+executes the parent packages first, but none initializes the runtime on this
+path. The build then compiles the engine, stages Python packages and platform
+resources, and builds `export_module`. `bdist_wheel` packages the staged files.
+
+The NPU package must defer semantic imports here: modules such as `activation`
+bind `torch.ops.xllm_ops` functions at import time. Importing them eagerly would
+require native operators before the build has produced them. `_EXPORTS`
+currently implements that deferred binding. AOT compilation does not run
+pytest or load its `conftest.py`.
+
+### xLLM server with embedded Python
+
+When xLLM server selects the Python model implementation, `PyCausalLM` calls
+`ensure_python_interpreter()`. That function keeps native operator registration
+linked, creates an interpreter if needed, sets the package search path, imports
+`xllm.python`, and calls `initialize_runtime()` before model construction.
+An existing interpreter is reused. On NPU, a newly created interpreter also
+runs the existing `_npu_bootstrap` adaptation before runtime initialization.
+
+The worker supplies native operators from its linked code, so this path does
+not require a separate `xllm_export` extension. `--python_model_path`, or
+`XLLM_PYTHON_MODEL_PATH` when the flag is empty, selects the directory containing
+the `xllm` package. With neither set, normal Python package lookup applies.
+
+### Python tests
+
+After building, run tests directly from the checkout root:
+
+```bash
+python -m pytest tests/python/test_model_executor.py
+```
+
+Before collecting test modules, pytest automatically loads
+`tests/python/conftest.py`. It loads `xllm_export` first, then calls
+`initialize_runtime()`, so tests can import model, layer, and kernel modules
+normally. Test files do not need to repeat these steps. Direct pytest commands
+do not build the extension.
+
+Run the NPU Python suite with `python setup.py test --test-name python_tests`;
+its per-file targets depend on `xllm_export`. CTest runs each file in a separate
+pytest process, using the same `conftest.py`.
+
+### Python offline inference API
+
+This mode uses public Python APIs such as `xllm.LLM` to call the C++ engine:
+
+```text
+from xllm import LLM
+  -> load xllm_export -> import the Python API wrapper
+LLM(...)
+  -> construct Options -> call C++ LLMMaster / VLMMaster -> create model workers
+```
+
+During API initialization, `_load_public_api()` loads the extension before
+importing the Python API wrappers. This happens before engine or model
+construction and does not initialize the Python model runtime. The C++ engine
+may use either a native model or a Python model. Selecting a Python model leads
+to the embedded initialization path above; API callers do not need to call
+`initialize_runtime()` themselves.
+Worker processes may create their own interpreters rather than reuse the API
+caller's interpreter.
+
+### Source checkouts and installed wheels
+
+When loading `xllm_export`, source checkouts use their own standard `build/`
+output matching the current Python interpreter and platform. Missing output
+raises an error; no copy or link into the source package is needed. Installed
+wheels load the extension inside their package. Run outside the checkout,
+without placing its root ahead of the installation on `sys.path`, to use a
+wheel.
+
+Once loaded, the extension is reused in that process. Rebuilding it on disk
+does not replace the loaded code; start a new process to use the new build.
+
+With `--python_model_path` pointing to the checkout root, a service restart
+picks up Python model and layer edits. Changes to C++ or Python DSL kernels
+compiled into native AOT artifacts require rebuilding those artifacts.
 
 ## Adding an operator
 
@@ -178,8 +275,9 @@ up the change.
 2. When the native build consumes a TileLang implementation, add a thin AOT
    adapter under `xllm/compiler/tilelang/targets/ascend/aot/`; do not duplicate
    the program body there.
-3. Bind the name in that platform's family module and add it to that package's
-   `__all__`, registering a `custom_op` and its FakeTensor implementation when
+3. Bind the name in that platform's family module and package exports
+   (`_EXPORTS` for NPU, explicit imports for CUDA), and update `__all__`.
+   Register a `custom_op` and its FakeTensor implementation when
    the computation needs a stable graph node, FakeTensor propagation, or
    mutation tracking. FakeTensor contracts for C++ operators go in the
    platform's `_custom_op.py`.
@@ -197,11 +295,12 @@ up the change.
 2. Keep the package independent: it owns its exports and does not import a
    peer.
 3. Add `_custom_op.py` with the FakeTensor implementations of the platform's
-   C++ operators.
+   C++ operators. Import it from the package's `_initialize_runtime()` hook
+   after native operators have been registered.
 4. Teach `Platform` in `xllm/python/platform.py` to report `<device>` (extend
-   `PlatformEnum` and the detection in `Platform.enum`) and add the matching
+   `PlatformEnum` and `_torch_device_type()`) and add the matching
    branch to `xllm.python.initialize_runtime()`.
-5. `setup.py --device <device>` then ships it. Before that, a build for the
-   device logs the packages that do exist and ships none of them.
+5. `python setup.py build --device <device>` then stages it. Before that, a build
+   for the device logs the packages that do exist and ships none of them.
 6. Mark a model supported in `model_platform_support.py` only after its
    platform path passes functional tests.

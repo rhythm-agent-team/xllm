@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the DeepSeek-V4 CSA/HCA attention backend.
-
-Pure-Python: does not load compiled operators.
-"""
+"""Call-contract tests for the DeepSeek-V4 CSA/HCA attention backend."""
 
 from __future__ import annotations
 

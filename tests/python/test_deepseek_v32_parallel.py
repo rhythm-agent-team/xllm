@@ -16,21 +16,13 @@
 
 from __future__ import annotations
 
-import sys
-import types
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-_python_root = Path(__file__).parents[2] / "xllm" / "python"
-_kernels_cuda = types.ModuleType("xllm.python.kernels_cuda")
-_kernels_cuda.__path__ = [str(_python_root / "kernels_cuda")]
-sys.modules.setdefault("xllm.python.kernels_cuda", _kernels_cuda)
-
-from xllm.python import distributed, kernels  # noqa: E402
+from xllm.python import distributed, kernels
 
 kernels.grouped_moe = MagicMock()
 kernels.prepare_grouped_moe_weights = MagicMock(side_effect=lambda w13, w2: (w13, w2))

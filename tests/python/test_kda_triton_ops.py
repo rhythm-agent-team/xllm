@@ -7,20 +7,12 @@
 from __future__ import annotations
 
 import inspect
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA Triton tests require CUDA", allow_module_level=True)
-
-_ROOT = Path(__file__).parents[2] / "xllm" / "python"
-_package = types.ModuleType("xllm.python.kernels_cuda")
-_package.__path__ = [str(_ROOT / "kernels_cuda")]
-sys.modules["xllm.python.kernels_cuda"] = _package
 
 from xllm.python.kernels_cuda.triton.fla.fused_recurrent import (  # noqa: E402
     fused_recurrent_kda_packed_decode,

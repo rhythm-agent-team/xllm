@@ -310,9 +310,7 @@ def test_dequant_swiglu_quant_can_write_into_caller_buffer(
         raising=False,
     )
 
-    def fake_quant_matmul_out(*_args: object) -> torch.Tensor:
-        out = _args[-1]
-        assert isinstance(out, torch.Tensor)
+    def fake_quant_matmul_out(*_args: object, out: torch.Tensor, **_kwargs: object) -> torch.Tensor:
         calls.append(out)
         return out
 

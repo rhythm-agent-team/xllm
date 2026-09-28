@@ -21,8 +21,6 @@ if not torch.cuda.is_available():
     pytest.skip("FlashInfer tests require CUDA", allow_module_level=True)
 pytest.importorskip("flashinfer", reason="FlashInfer is not installed")
 
-# conftest.py stands in for xllm.python, whose import would bind the active
-# platform's kernel package and reach for operators from the C++ binary.
 from xllm.python.attention.flashinfer import _should_use_tensor_core_decode
 
 
