@@ -17,19 +17,15 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 import torch_npu
 
 from .linear import atb_matmul_ein_sum
 from .normalization import rms_norm
 from .quantization import dynamic_quant, quant_matmul, quantize_per_tensor
 
-_FRACTAL_NZ_FORMAT = 29
 _KROPE_CTKV_CACHE_MODE = 1
 _NZ_CACHE_MODE = 3
 _PER_TENSOR_QUANT_ASYMM_MODE = 0
-_INT8_NZ_ROW_BLOCK_SIZE = 16
-_INT8_NZ_COLUMN_BLOCK_SIZE = 32
 MLA_PREPROCESS_V2_MAX_TOKENS = 1024
 _MLA_PREPROCESS_V2_KV_LORA_RANK = 512
 _MLA_PREPROCESS_V2_QK_ROPE_HEAD_DIM = 64
@@ -79,34 +75,6 @@ def _reorder_rope_axis(
     return torch.cat((prefix, even, odd), dim=dim).contiguous()
 
 
-def _pack_mla_int8_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Pack a two-dimensional int8 weight into MLAPO's NZ block order."""
-    rows, columns = weight.shape
-    padded_rows = (rows + _INT8_NZ_ROW_BLOCK_SIZE - 1) // _INT8_NZ_ROW_BLOCK_SIZE * _INT8_NZ_ROW_BLOCK_SIZE
-    padded_columns = (
-        (columns + _INT8_NZ_COLUMN_BLOCK_SIZE - 1) // _INT8_NZ_COLUMN_BLOCK_SIZE * _INT8_NZ_COLUMN_BLOCK_SIZE
-    )
-    padded = F.pad(
-        weight,
-        (0, padded_columns - columns, 0, padded_rows - rows),
-    )
-    packed = padded.reshape(
-        padded_rows // _INT8_NZ_ROW_BLOCK_SIZE,
-        _INT8_NZ_ROW_BLOCK_SIZE,
-        padded_columns // _INT8_NZ_COLUMN_BLOCK_SIZE,
-        _INT8_NZ_COLUMN_BLOCK_SIZE,
-    ).permute(2, 0, 1, 3)
-    return (
-        packed.reshape(
-            packed.shape[0],
-            packed.shape[1] * packed.shape[2],
-            packed.shape[3],
-        )
-        .unsqueeze(0)
-        .contiguous()
-    )
-
-
 def prepare_mla_preprocess_v2_qkv(
     weight: torch.Tensor,
     descale: torch.Tensor,
@@ -124,7 +92,7 @@ def prepare_mla_preprocess_v2_qkv(
 
     prepared_weight = _prepare(weight)
     if prepared_weight.device.type != "cpu":
-        prepared_weight = torch_npu.npu_format_cast(prepared_weight, _FRACTAL_NZ_FORMAT)
+        prepared_weight = torch_npu.npu_format_cast(prepared_weight, torch_npu.Format.FRACTAL_NZ)
     return prepared_weight, _prepare(descale), _prepare(bias)
 
 
@@ -145,9 +113,10 @@ def prepare_mla_preprocess_v2_q_b(
         reordered = _reorder_rope_axis(viewed, qk_rope_head_dim, 1)
         return reordered.reshape(shape).contiguous()
 
-    prepared_weight = _pack_mla_int8_weight(_prepare(weight))
+    # Let the format cast pack NZ storage while preserving the logical matrix.
+    prepared_weight = _prepare(weight)
     if prepared_weight.device.type != "cpu":
-        prepared_weight = torch_npu.npu_format_cast(prepared_weight, _FRACTAL_NZ_FORMAT)
+        prepared_weight = torch_npu.npu_format_cast(prepared_weight, torch_npu.Format.FRACTAL_NZ)
     return prepared_weight, _prepare(descale), _prepare(bias)
 
 
@@ -228,7 +197,7 @@ def deepseek_mla_preprocess_decode_v2(
 def _mla_cache_mode(kv_cache: torch.Tensor) -> str:
     """Return the cache layout name expected by the fused KV operator."""
     get_npu_format = getattr(torch_npu, "get_npu_format", None)
-    if get_npu_format is not None and get_npu_format(kv_cache) == _FRACTAL_NZ_FORMAT:
+    if get_npu_format is not None and get_npu_format(kv_cache) == torch_npu.Format.FRACTAL_NZ:
         return "PA_NZ"
     return "PA"
 

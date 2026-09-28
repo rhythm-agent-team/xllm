@@ -201,6 +201,35 @@ def _run_low_level_op(inputs: dict[str, Any]) -> tuple[torch.Tensor, ...]:
     )
 
 
+def test_mla_preprocess_v2_q_b_preserves_logical_weight() -> None:
+    mla = _require_mla_preprocess_v2()
+    device = torch.device("npu")
+    head_dim = _QK_NOPE_HEAD_DIM + _QK_ROPE_HEAD_DIM
+    rows = _NUM_HEADS * head_dim
+    weight = torch.arange(rows * _Q_LORA_RANK, device=device).remainder(127).to(torch.int8).view(rows, _Q_LORA_RANK)
+    descale = torch.arange(rows, dtype=torch.float32, device=device)
+    bias = torch.arange(rows, dtype=torch.int32, device=device)
+    prepared_weight, prepared_descale, prepared_bias = mla.prepare_mla_preprocess_v2_q_b(
+        weight, descale, bias, _NUM_HEADS, _QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM
+    )
+
+    # NZ changes the storage layout, not the logical matrix dimensions.
+    assert prepared_weight.shape == weight.shape
+    assert torch_npu.get_npu_format(prepared_weight) == torch_npu.Format.FRACTAL_NZ
+    expected_rows = torch.arange(rows).view(_NUM_HEADS, head_dim)
+    expected_rows = torch.cat(
+        (
+            expected_rows[:, :_QK_NOPE_HEAD_DIM],
+            expected_rows[:, _QK_NOPE_HEAD_DIM::2],
+            expected_rows[:, _QK_NOPE_HEAD_DIM + 1 :: 2],
+        ),
+        dim=1,
+    ).flatten()
+    torch.testing.assert_close(prepared_weight.cpu(), weight.cpu()[expected_rows])
+    torch.testing.assert_close(prepared_descale.cpu(), descale.cpu()[expected_rows])
+    torch.testing.assert_close(prepared_bias.cpu(), bias.cpu()[expected_rows])
+
+
 def test_mla_preprocess_v2_writes_outputs_and_selected_cache_slots() -> None:
     mla = _require_mla_preprocess_v2()
     inputs = _make_inputs(mla)
@@ -223,9 +252,8 @@ def test_mla_preprocess_v2_writes_outputs_and_selected_cache_slots() -> None:
 def test_mla_preprocess_v2_python_wrapper_matches_low_level_op() -> None:
     mla = _require_mla_preprocess_v2()
     low_level_inputs = _make_inputs(mla)
-    wrapper_inputs = {
-        name: value.clone() if isinstance(value, torch.Tensor) else value for name, value in low_level_inputs.items()
-    }
+    # Rebuild with the same seed: clone() can discard private NPU formats.
+    wrapper_inputs = _make_inputs(mla)
 
     low_level_outputs = _run_low_level_op(low_level_inputs)
     wrapper_outputs = mla.deepseek_mla_preprocess_decode_v2(
