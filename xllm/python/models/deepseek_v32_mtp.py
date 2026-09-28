@@ -22,14 +22,18 @@ the next MTP step.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 
 from xllm.python.layers import ColumnParallelLinear, RMSNorm
+from xllm.python.model_executor.cp_utils import cp_merge_rows
+from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3Config,
-    DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
+    DeepseekV3Model,
     DeepseekYarnRotaryEmbedding,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader
@@ -44,11 +48,11 @@ _MTP_NORM_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-class DeepseekV32MtpModel(nn.Module):
+class DeepseekV32MtpModel(DeepseekV3Model):
     """MTP body matching ``MtpModelImplBase`` and ``DeepseekV32MtpModel``."""
 
     def __init__(self, cfg: DeepseekV3Config, dtype: torch.dtype, device: torch.device) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         tp = cfg.tp_size
         assert cfg.hidden_size % tp == 0
 
@@ -72,7 +76,7 @@ class DeepseekV32MtpModel(nn.Module):
         )
         self.enorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         self.hnorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
-        self.layers = nn.ModuleList([DeepseekV3DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
+        self.layers = nn.ModuleList([self._make_decoder(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         self.rotary = DeepseekYarnRotaryEmbedding(
             cfg.qk_rope_head_dim,
@@ -87,38 +91,103 @@ class DeepseekV32MtpModel(nn.Module):
             device=device,
         )
         self.enable_rot = False
+        self._reuse_topk_by_layer = (False,) * cfg.n_layers
+
+    def _prepare_token_hidden(self, hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return hidden
+
+    def _recurrent_hidden(self, hidden: torch.Tensor, residual: torch.Tensor | None) -> torch.Tensor:
+        hidden, _ = self.norm(hidden, residual)
+        return hidden
+
+    def _prepare_logits_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden
+
+    def _format_mtp_output(
+        self, hidden: torch.Tensor, topk: torch.Tensor | None
+    ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor | None]:
+        return hidden
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_embedding: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        mtp_topk_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor | None]:
         assert self.embed_tokens is not None
-        token_hidden = self.embed_tokens(input_ids)
+        token_hidden = self._prepare_token_hidden(self.embed_tokens(input_ids), positions)
         if input_embedding is None:
             input_embedding = token_hidden
-
-        rotated_embedding = self.rot(input_embedding) if self.enable_rot else input_embedding
-        enorm_out = self.enorm(token_hidden)
-        hnorm_out = self.hnorm(rotated_embedding)
-
-        h = self.eh_proj(torch.cat((enorm_out, hnorm_out), dim=-1))
-
-        positions = positions.to(torch.int64).contiguous()
-        half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(positions)
+        hnorm_input = self.rot(input_embedding) if self.enable_rot else input_embedding
+        hidden = self.eh_proj(torch.cat((self.enorm(token_hidden), self.hnorm(hnorm_input)), dim=-1))
+        cp_context = self._cp_context()
+        hidden, rope, query_cos_sin = self._prepare_layer_inputs(hidden, positions, cp_context)
         residual: torch.Tensor | None = None
-        for layer in self.layers:
-            h, residual = layer(
-                h,
-                residual,
-                half_rope_cos,
-                half_rope_sin,
-                rope_cos,
-                rope_sin,
-            )
-        h, _ = self.norm(h, residual)
-        return h
+        topk = mtp_topk_indices
+        for layer_id, layer in enumerate(self.layers):
+            reuse = self._reuse_topk_by_layer[layer_id] and topk is not None
+            hidden, residual, topk = layer(hidden, residual, *rope, query_cos_sin, topk, reuse)
+            self._record_layer_event(layer_id)
+        hidden = self._recurrent_hidden(hidden, residual)
+        if cp_context is not None:
+            hidden = cp_merge_rows(hidden, cp_context)
+        return self._format_mtp_output(hidden, topk)
+
+
+def _compute_mtp_logits(
+    model: DeepseekV32MtpModel,
+    lm_head: nn.Module | None,
+    hidden: torch.Tensor,
+    selected_idxes: torch.Tensor | None,
+) -> torch.Tensor:
+    if selected_idxes is not None and selected_idxes.numel() > 0:
+        hidden = hidden.index_select(0, selected_idxes)
+    assert lm_head is not None
+    return lm_head(model._prepare_logits_hidden(hidden))
+
+
+def _load_mtp_weights(
+    model: PyModelBase,
+    load_decoder_weights: Callable[..., None],
+    state_dicts: list,
+    tp_rank: int,
+    tp_size: int,
+) -> None:
+    loader = W8A8WeightLoader(
+        model,
+        state_dicts,
+        model.cfg.tp_size,
+        model.cfg.tp_rank,
+        src_prefixes=("", "model."),
+        name_aliases=_MTP_NORM_ALIASES,
+    )
+    load_decoder_weights(
+        state_dicts,
+        tp_rank,
+        tp_size,
+        load_lm_head=False,
+        load_embedding=False,
+        loader=loader,
+    )
+
+    def _copy_if_present(module_name: str, required: bool = False) -> bool:
+        key = module_name + ".weight"
+        if not loader.has(key):
+            if required:
+                raise KeyError(f"missing required MTP weight: {key}")
+            return False
+        tensor = loader.load_tensor(key)
+        parameter = model.get_parameter("model." + key)
+        if tensor.shape != parameter.shape and tensor.dim() == 2:
+            tensor = loader.shard(tensor, dim=0)
+        loader.copy_in("model." + key, tensor)
+        return True
+
+    _copy_if_present("eh_proj", required=True)
+    _copy_if_present("enorm", required=True)
+    _copy_if_present("hnorm", required=True)
+    model.model.enable_rot = _copy_if_present("rot")
 
 
 class DeepseekV32MtpForCausalLM(DeepseekV3ForCausalLM):
@@ -128,38 +197,8 @@ class DeepseekV32MtpForCausalLM(DeepseekV3ForCausalLM):
         super().__init__(config, build_model=False)
         self.model = DeepseekV32MtpModel(self.cfg, self.dtype, self.device)
 
+    def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
+        return _compute_mtp_logits(self.model, self.lm_head, hidden, selected_idxes)
+
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
-        loader = W8A8WeightLoader(
-            self,
-            state_dicts,
-            self.cfg.tp_size,
-            self.cfg.tp_rank,
-            src_prefixes=("", "model."),
-            name_aliases=_MTP_NORM_ALIASES,
-        )
-        super().load_weights(
-            state_dicts,
-            tp_rank,
-            tp_size,
-            load_lm_head=False,
-            load_embedding=False,
-            loader=loader,
-        )
-
-        def copy_if_present(module_name: str, required: bool = False) -> bool:
-            key = module_name + ".weight"
-            if not loader.has(key):
-                if required:
-                    raise KeyError(f"missing required MTP weight: {key}")
-                return False
-            tensor = loader.load_tensor(key)
-            parameter = self.get_parameter("model." + key)
-            if tensor.shape != parameter.shape and tensor.dim() == 2:
-                tensor = loader.shard(tensor, dim=0)
-            loader.copy_in("model." + key, tensor)
-            return True
-
-        copy_if_present("eh_proj", required=True)
-        copy_if_present("enorm", required=True)
-        copy_if_present("hnorm", required=True)
-        self.model.enable_rot = copy_if_present("rot")
+        _load_mtp_weights(self, super().load_weights, state_dicts, tp_rank, tp_size)

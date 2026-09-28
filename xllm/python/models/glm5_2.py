@@ -31,7 +31,6 @@ GLM-5.2 structural deltas live here:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,87 +39,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
-from xllm.python.attention.backend import AttentionBackend, MlaIndexContext, MlaPreprocessContext
+from xllm.python.attention.backend import AttentionBackend, MlaIndexContext
 from xllm.python.device_stream import get_device_stream
-
-# The AICPU tiling of ``aclnnQuantLightningIndexer`` requires
-# ``num_heads_q / num_heads_k == 64``. GLM-5.2 uses ``index_n_heads=32`` and
-# ``num_heads_k=1``, so we pad Q / q_scale / weights along the head axis to
-# 64 heads (padded weights are zero, keeping ``score = sum_h w[h]*q[h]*k``
-# mathematically identical). Pure-Python workaround limited to this file.
-from xllm.python.layers import (
-    Attention,
-    ColumnParallelLinear,
-    HiddenParallelEmbedding,
-    RMSNorm,
-)
+from xllm.python.layers import ColumnParallelLinear
 from xllm.python.model_executor.cp_utils import (
     CpContext,
     cp_gather_kv,
-    cp_merge_rows,
-    cp_shard_positions,
     cp_shard_rows,
 )
 from xllm.python.model_executor.forward_context import (
-    get_execution_buffer,
     get_forward_context,
     record_layer_event,
 )
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
+    DeepseekV3DecoderLayer,
+    DeepseekV3Indexer,
+    DeepseekV3MLAAttention,
     DeepseekV3MLP,
+    DeepseekV3Model,
     DeepseekV3MoE,
-    _apply_half_rope_with_cos_sin,
-    _create_hadamard_matrix,
-    _interleave_rope_with,
-    _swiglu_with_clamp,
+    W8A8AttentionLinear,
     _tp_rank_from_device,
-    _yarn_get_mscale,
+    _validate_rope_cos_sin,
 )
 from xllm.python.models.deepseek_v32 import (
     DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, mla_head_split
-
-# aclnnQuantLightningIndexer tiling hard-requires n_heads_q / n_heads_k == 64
-# (G_SIZE_LIMIT in third_party/xllm_ops/.../quant_lightning_indexer_tiling.h). The
-# xllm_ops kernel fixes matmul M=256 tile with head_dim=128, kv_head=1 for DSV3.2/DSV4
-# shapes; other gSize values are neither exposed nor tested. GLM-5.2 is 32/1 and pads Q
-# up to 64 heads at the caller (see Glm52Indexer._pad_q_heads_to_kernel_gsize).
-_QLI_KERNEL_GSIZE = 64
-
-
-def _select_indexer_query_cos_sin(
-    interleaved: bool,
-    half_rope_cos: torch.Tensor,
-    half_rope_sin: torch.Tensor,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
-    cp_context: CpContext | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select compact CP query rows once; cache K keeps the padded local rows."""
-    cos, sin = (rope_cos, rope_sin) if interleaved else (half_rope_cos, half_rope_sin)
-    if cp_context is not None:
-        return cos.index_select(0, cp_context.query_index), sin.index_select(0, cp_context.query_index)
-    return cos, sin
-
-
-def _validate_rope_cos_sin(
-    cos_sin: tuple[torch.Tensor, torch.Tensor],
-    value: torch.Tensor,
-    rope_dim: int,
-    interleaved: bool,
-    consumer: str,
-) -> None:
-    """Check tensor metadata without synchronizing captured device values."""
-    expected = (value.shape[0], 1, 1, rope_dim) if interleaved else (value.shape[0], rope_dim // 2)
-    for name, coefficient in zip(("cos", "sin"), cos_sin):
-        if coefficient.shape != expected or coefficient.dtype != value.dtype or coefficient.device != value.device:
-            raise ValueError(
-                f"{consumer} {name}: expected shape={expected}, dtype={value.dtype}, device={value.device}; "
-                f"got shape={tuple(coefficient.shape)}, dtype={coefficient.dtype}, device={coefficient.device}"
-            )
 
 
 def _can_use_mlapo_v2(cfg: Glm52Config, device: torch.device) -> bool:
@@ -134,99 +81,9 @@ def _can_use_mlapo_v2(cfg: Glm52Config, device: torch.device) -> bool:
     )
 
 
-class _W8A8AttentionLinear(nn.Module):
-    """Attention linear compatible with static and dynamic W8A8 checkpoints."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        device: torch.device,
-        row_parallel: bool = False,
-    ) -> None:
-        super().__init__()
-        self.out_features = out_features
-        self.row_parallel = row_parallel
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=torch.int8, device=device),
-            requires_grad=False,
-        )
-        self.register_buffer("deq_scale", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("quant_bias", torch.empty(0, dtype=torch.int32, device=device))
-        self.register_buffer("input_scale", torch.empty(0, dtype=torch.bfloat16, device=device))
-        self.register_buffer("input_offset", torch.empty(0, dtype=torch.bfloat16, device=device))
-        self.register_buffer("weight_scale", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("weight_offset", torch.empty(0, dtype=torch.float32, device=device))
-        self._dynamic_activation: bool | None = None
-
-    def _set_dynamic_activation(self, enabled: bool) -> None:
-        self._dynamic_activation = enabled
-        device = self.weight.device
-        if enabled:
-            self.weight_scale.data = torch.empty(self.out_features, 1, dtype=torch.float32, device=device)
-            self.weight_offset.data = torch.empty(self.out_features, 1, dtype=torch.float32, device=device)
-            self.deq_scale.data = torch.empty(0, dtype=torch.float32, device=device)
-            self.quant_bias.data = torch.empty(0, dtype=torch.int32, device=device)
-            self.input_scale.data = torch.empty(0, dtype=torch.bfloat16, device=device)
-            self.input_offset.data = torch.empty(0, dtype=torch.bfloat16, device=device)
-            return
-        self.deq_scale.data = torch.empty(self.out_features, dtype=torch.float32, device=device)
-        self.quant_bias.data = torch.empty(self.out_features, dtype=torch.int32, device=device)
-        self.input_scale.data = torch.empty(1, dtype=torch.bfloat16, device=device)
-        self.input_offset.data = torch.empty(1, dtype=torch.bfloat16, device=device)
-        self.weight_scale.data = torch.empty(0, dtype=torch.float32, device=device)
-        self.weight_offset.data = torch.empty(0, dtype=torch.float32, device=device)
-
-    def process_weights_after_loading(self) -> None:
-        if self._dynamic_activation is None:
-            raise RuntimeError("W8A8 attention quantization format must be selected before processing weights")
-        if not self._dynamic_activation:
-            self.weight.data = kernels.prepare_quant_weight(self.weight.data)
-            return
-        if not bool(torch.all(self.weight_offset == 0)):
-            raise ValueError("dynamic W8A8 attention requires symmetric INT8 weights with zero weight_offset")
-        self.weight.data = kernels.prepare_quant_weight(self.weight.data)
-        self.weight_scale.data = self.weight_scale.data.flatten().contiguous()
-        self.weight_offset.data = self.weight_offset.data.flatten().contiguous()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._dynamic_activation is None:
-            raise RuntimeError("W8A8 attention quantization format must be selected before execution")
-        if self._dynamic_activation:
-            x_int8, pertoken = kernels.dynamic_quant(x)
-            return kernels.quant_matmul(
-                x_int8,
-                self.weight,
-                False,
-                self.weight_scale,
-                None,
-                pertoken,
-                None,
-                torch.bfloat16,
-            )
-        x_int8 = kernels.quantize_per_tensor(
-            x,
-            self.input_scale,
-            self.input_offset,
-            torch.qint8,
-            -1,
-        )
-        bias = self.quant_bias if not (self.row_parallel and distributed.tp_rank(x.device) != 0) else None
-        return kernels.quant_matmul(
-            x_int8,
-            self.weight,
-            False,
-            self.deq_scale,
-            None,
-            None,
-            bias,
-            torch.bfloat16,
-        )
-
-
 def _load_w8a8_attention_projection(
     loader: W8A8WeightLoader,
-    module: _W8A8AttentionLinear,
+    module: W8A8AttentionLinear,
     prefix: str,
     proj: str,
     shard_dims: dict[str, int] | None = None,
@@ -481,505 +338,143 @@ class Glm52Config:
         return mla_head_split(self.n_heads, self.tp_size)
 
 
-class Glm52MLP(DeepseekV3MLP):
-    """GLM dense MLP with numerically stable FP32 TP reduction."""
+class Glm52MLAAttention(DeepseekV3MLAAttention):
+    """Checkpoint, index-sharing and CP/layerwise adapters for common MLA."""
 
-    def _reduce_output(
-        self,
-        out: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if tp_reduce_add is not None:
-            out = out + tp_reduce_add
-        if self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None):
-            output_dtype = out.dtype
-            out = out.to(torch.float32)
-            distributed.tp_all_reduce(out)
-            out = out.to(output_dtype)
-        return out
+    _linear_type = W8A8AttentionLinear
 
-    def _forward_gate_up(
-        self,
-        gate_up: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None,
-    ) -> torch.Tensor:
-        act = _swiglu_with_clamp(gate_up, self.swiglu_limit)
-        out = self.down_proj(act)
-        return self._reduce_output(out, tp_reduce_add)
+    def _mlapo_enabled(self, cfg: Glm52Config, device: torch.device) -> bool:
+        return _can_use_mlapo_v2(cfg, device)
 
-    def forward_dequant_swiglu_quant(
-        self,
-        x: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x_int8, pertoken = kernels.dynamic_quant(x)
-        gate_up = self.gate_up_proj.forward_accumulated(x_int8)
-        act_int8, act_scale = kernels.dequant_swiglu_quant(
-            gate_up,
-            self.gate_up_proj.weight_scale,
-            pertoken,
-        )
-        out = self.down_proj.forward_quantized(act_int8, act_scale)
-        return self._reduce_output(out, tp_reduce_add)
+    def _init_a_projections(self, cfg: Glm52Config, device: torch.device) -> None:
+        self._combined_qkv: W8A8AttentionLinear | None = None
+        self.q_a_proj = W8A8AttentionLinear(cfg.hidden_size, cfg.q_lora_rank, device)
+        self.kv_a_proj_with_mqa = W8A8AttentionLinear(cfg.hidden_size, cfg.kv_lora_rank + cfg.qk_rope_head_dim, device)
 
-
-class Glm52MLAAttention(Attention):
-    """Absorbed-MLA attention with per-layer full/shared DSA indexer."""
-
-    def __init__(
-        self,
-        cfg: Glm52Config,
-        layer_id: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        tp = cfg.tp_size
-        num_heads, _ = cfg.head_split()
-        kv_lora = cfg.kv_lora_rank
-        qk_nope = cfg.qk_nope_head_dim
-        qk_rope = cfg.qk_rope_head_dim
-        v_head = cfg.v_head_dim
-        scale = (qk_nope + qk_rope) ** -0.5
-        attn_mscale = _yarn_get_mscale(cfg.rope_scaling_factor, cfg.rope_mscale_all_dim)
-        scale = scale * attn_mscale * attn_mscale
-        super().__init__(
-            num_heads=num_heads,
-            num_kv_heads=1,
-            head_dim=kv_lora,
-            scale=scale,
-            sliding_window=0,
-            layer_id=layer_id,
-        )
-        self.cfg = cfg
-        self.qk_nope_head_dim = qk_nope
-        self.qk_rope_head_dim = qk_rope
-        self.v_head_dim = v_head
-        self.kv_lora_rank = kv_lora
-        self.num_heads_local = num_heads
-        self.q_lora_rank = cfg.q_lora_rank
-        self._use_fused_mla_decode = device.type in (
-            "npu",
-            "privateuseone",
-        )
-        self._use_mlapo_v2 = _can_use_mlapo_v2(cfg, device)
-        self._fused_mla_ready = False
-        self._dynamic_mla_ready = False
-
-        self.q_a_proj = _W8A8AttentionLinear(cfg.hidden_size, cfg.q_lora_rank, device)
-        self.kv_a_proj_with_mqa = _W8A8AttentionLinear(cfg.hidden_size, kv_lora + qk_rope, device)
-        self.q_a_layernorm = RMSNorm(cfg.q_lora_rank, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.kv_a_layernorm = RMSNorm(kv_lora, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.q_b_proj = _W8A8AttentionLinear(cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device)
-        self.kv_b_proj = ColumnParallelLinear(
-            kv_lora,
-            num_heads * (qk_nope + v_head),
-            tp,
-            dtype=dtype,
-            device=device,
-        )
-        self.o_proj = _W8A8AttentionLinear(num_heads * v_head, cfg.hidden_size, device, row_parallel=True)
-        self.register_buffer(
-            "W_UK",
-            torch.empty(num_heads, qk_nope, kv_lora, dtype=dtype, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "W_UV",
-            torch.empty(num_heads, kv_lora, v_head, dtype=dtype, device=device),
-            persistent=False,
-        )
-        # MTP shared layers need a real indexer for the first draft step. The
-        # native executor disables top-k reuse for that step, then reuses the
-        # produced indices on later steps.
-        is_mtp_topk_fallback = cfg.model_type.endswith("_mtp") and cfg.index_share_for_mtp_iteration
-        for name in (
-            "_mlapo_input_norm_weight",
-            "_mlapo_input_norm_bias",
-            "_mlapo_q_norm_bias",
-            "_mlapo_qkv_input_offset",
-            "_mlapo_qkv_weight",
-            "_mlapo_qkv_deq_scale",
-            "_mlapo_qkv_quant_bias",
-            "_mlapo_q_b_input_offset",
-            "_mlapo_q_b_weight",
-            "_mlapo_q_b_deq_scale",
-            "_mlapo_q_b_quant_bias",
-            "_dynamic_qkv_weight",
-            "_dynamic_qkv_weight_scale",
-        ):
-            self.register_buffer(
-                name,
-                torch.empty(0, dtype=dtype, device=device),
-                persistent=False,
-            )
+    def _make_indexer(
+        self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device
+    ) -> Glm52Indexer | None:
+        # A draft shared layer still needs K/cache updates, and full selection
+        # on the first step. Target shared layers have no indexer at all.
+        is_mtp = cfg.model_type.endswith("_mtp") and cfg.index_share_for_mtp_iteration
         self.is_shared = (
-            not is_mtp_topk_fallback
+            not is_mtp
             and cfg.indexer_types is not None
             and layer_id < len(cfg.indexer_types)
             and cfg.indexer_types[layer_id] == "shared"
         )
-        self.indexer = None
-        if not self.is_shared:
-            self.indexer = Glm52Indexer(cfg, dtype, device, layer_id)
+        return None if self.is_shared else Glm52Indexer(cfg, dtype, device, layer_id)
 
-    def _forward_fused_mla_decode(
-        self,
-        hidden: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor],
-        indexer_key_cos_sin: tuple[torch.Tensor, torch.Tensor],
-        backend: AttentionBackend,
-        context: MlaPreprocessContext,
-        prev_topk_indices: torch.Tensor | None,
-        reuse_topk_indices: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if getattr(self, "_dynamic_mla_ready", False):
-            q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode_dynamic(
-                hidden,
-                self._dynamic_qkv_weight,
-                self._dynamic_qkv_weight_scale,
-                self.q_a_layernorm.weight,
-                self.q_b_proj.weight,
-                self.q_b_proj.weight_scale,
-                self.W_UK,
-                self.kv_a_layernorm.weight,
-                rope_cos,
-                rope_sin,
-                context.slot_mapping[: hidden.shape[0]],
-                context.kv_cache,
-                context.rope_cache,
-                self.kv_lora_rank,
-                self.q_lora_rank,
-                self.num_heads_local,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.q_a_layernorm.eps,
-                self.kv_a_layernorm.eps,
-            )
-        else:
-            qkv_proj = getattr(self, "qkv_a_proj", None)
-            qkv_input_scale = qkv_proj.input_scale if qkv_proj is not None else self.kv_a_proj_with_mqa.input_scale
-            if self._use_mlapo_v2 and hidden.shape[0] <= kernels.MLA_PREPROCESS_V2_MAX_TOKENS:
-                q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode_v2(
-                    hidden,
-                    self._mlapo_input_norm_weight,
-                    self._mlapo_input_norm_bias,
-                    qkv_input_scale,
-                    self._mlapo_qkv_input_offset,
-                    self._mlapo_qkv_weight,
-                    self._mlapo_qkv_deq_scale,
-                    self._mlapo_qkv_quant_bias,
-                    self.q_a_layernorm.weight,
-                    self._mlapo_q_norm_bias,
-                    self.q_b_proj.input_scale,
-                    self._mlapo_q_b_input_offset,
-                    self._mlapo_q_b_weight,
-                    self._mlapo_q_b_deq_scale,
-                    self._mlapo_q_b_quant_bias,
-                    self.kv_a_layernorm.weight,
-                    rope_cos,
-                    rope_sin,
-                    self.W_UK,
-                    context.kv_cache,
-                    context.rope_cache,
-                    context.slot_mapping[: hidden.shape[0]],
-                    self.kv_lora_rank,
-                    self.q_lora_rank,
-                    self.qk_rope_head_dim,
-                    self.q_a_layernorm.eps,
-                )
-            else:
-                q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode(
-                    hidden,
-                    qkv_input_scale,
-                    self._mlapo_qkv_input_offset,
-                    self._mlapo_qkv_weight,
-                    self._mlapo_qkv_deq_scale,
-                    self._mlapo_qkv_quant_bias,
-                    self.q_a_layernorm.weight,
-                    self.q_b_proj.input_scale,
-                    self._mlapo_q_b_input_offset,
-                    self._mlapo_q_b_weight,
-                    self._mlapo_q_b_deq_scale,
-                    self._mlapo_q_b_quant_bias,
-                    self.W_UK,
-                    self.kv_a_layernorm.weight,
-                    rope_cos,
-                    rope_sin,
-                    context.slot_mapping[: hidden.shape[0]],
-                    context.kv_cache,
-                    context.rope_cache,
-                    self.kv_lora_rank,
-                    self.q_lora_rank,
-                    self.num_heads_local,
-                    self.qk_nope_head_dim,
-                    self.qk_rope_head_dim,
-                    self.q_a_layernorm.eps,
-                    self.kv_a_layernorm.eps,
-                )
+    def _prepare_a_projection(self) -> W8A8AttentionLinear | None:
+        self._combined_qkv = W8A8AttentionLinear.combine(self.kv_a_proj_with_mqa, self.q_a_proj)
+        return self._combined_qkv
 
-        if reuse_topk_indices:
-            if prev_topk_indices is None:
-                raise ValueError("MTP DSA top-k reuse requires indices from the previous draft step")
-            if self.indexer is not None:
-                index_context = backend.mla_index_context(self)
-                self.indexer._update_index_cache(
-                    hidden,
-                    index_context,
-                    indexer_key_cos_sin,
-                )
-            topk = prev_topk_indices
-        elif self.indexer is not None:
-            index_context = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(
-                hidden,
-                q_c,
-                index_context,
-                indexer_query_cos_sin,
-                indexer_key_cos_sin,
-            )
-        else:
-            if prev_topk_indices is None:
-                raise ValueError(
-                    "Shared DSA layers require top-k indices from a previous "
-                    "full indexer layer (prev_topk_indices is None)."
-                )
-            topk = prev_topk_indices
-
-        attn_out = backend.execute_mla(
-            q_latent,
-            q_pe,
-            None,
-            None,
-            self,
-            topk=topk,
-            cache_is_preprocessed=True,
-        )
-        v_full = kernels.atb_matmul_ein_sum(attn_out, self.W_UV)
-        v_full = v_full.reshape(hidden.shape[0], self.num_heads_local * self.v_head_dim)
-        output = self.o_proj(v_full)
-        if self.cfg.tp_size > 1:
-            output_dtype = output.dtype
-            output = output.to(torch.float32)
-            distributed.all_reduce_(output)
-            output = output.to(output_dtype)
-        return output, topk
-
-    def process_weights_after_loading(self) -> None:
-        static_mla_projections = self._use_fused_mla_decode and all(
-            module._dynamic_activation is False for module in (self.q_a_proj, self.kv_a_proj_with_mqa, self.q_b_proj)
-        )
-        shared_qkv_quant = (
-            static_mla_projections
-            and torch.equal(
-                self.q_a_proj.input_scale,
-                self.kv_a_proj_with_mqa.input_scale,
-            )
-            and torch.equal(
-                self.q_a_proj.input_offset,
-                self.kv_a_proj_with_mqa.input_offset,
-            )
-        )
-        if self._use_mlapo_v2 and not shared_qkv_quant:
-            self._use_mlapo_v2 = False
-
-        dynamic_mla_projections = self._use_fused_mla_decode and all(
-            module._dynamic_activation is True for module in (self.q_a_proj, self.kv_a_proj_with_mqa, self.q_b_proj)
-        )
-        if dynamic_mla_projections:
-            self._dynamic_qkv_weight = kernels.prepare_quant_weight(
-                torch.cat(
-                    (
-                        self.kv_a_proj_with_mqa.weight.data,
-                        self.q_a_proj.weight.data,
-                    ),
-                    dim=0,
-                )
-            )
-            self._dynamic_qkv_weight_scale = torch.cat(
-                (
-                    self.kv_a_proj_with_mqa.weight_scale.flatten(),
-                    self.q_a_proj.weight_scale.flatten(),
-                ),
-                dim=0,
-            ).contiguous()
-            self._dynamic_mla_ready = True
-            self._fused_mla_ready = True
-
-        if shared_qkv_quant:
-            kv_weight = self.kv_a_proj_with_mqa.weight.data
-            q_weight = self.q_a_proj.weight.data
-            kv_deq_scale = self.kv_a_proj_with_mqa.deq_scale
-            q_deq_scale = self.q_a_proj.deq_scale
-            kv_quant_bias = self.kv_a_proj_with_mqa.quant_bias
-            q_quant_bias = self.q_a_proj.quant_bias
-            (
-                self._mlapo_qkv_weight,
-                self._mlapo_qkv_deq_scale,
-                self._mlapo_qkv_quant_bias,
-            ) = kernels.prepare_mla_preprocess_v2_qkv(
-                torch.cat((kv_weight, q_weight), dim=0),
-                torch.cat((kv_deq_scale, q_deq_scale), dim=0),
-                torch.cat((kv_quant_bias, q_quant_bias), dim=0),
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
-            (
-                self._mlapo_q_b_weight,
-                self._mlapo_q_b_deq_scale,
-                self._mlapo_q_b_quant_bias,
-            ) = kernels.prepare_mla_preprocess_v2_q_b(
-                self.q_b_proj.weight.data,
-                self.q_b_proj.deq_scale,
-                self.q_b_proj.quant_bias,
-                self.num_heads_local,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-            )
-            self._mlapo_input_norm_weight = torch.ones(
-                self.cfg.hidden_size,
-                dtype=self.q_a_layernorm.weight.dtype,
-                device=self.q_a_layernorm.weight.device,
-            )
-            self._mlapo_input_norm_bias = torch.zeros_like(self._mlapo_input_norm_weight)
-            self._mlapo_q_norm_bias = torch.zeros_like(self.q_a_layernorm.weight)
-            self._mlapo_qkv_input_offset = self.kv_a_proj_with_mqa.input_offset.to(torch.int8)
-            self._mlapo_q_b_input_offset = self.q_b_proj.input_offset.to(torch.int8)
-            self._fused_mla_ready = True
-
+    def _prepare_separate_a_projections(self) -> None:
         self.q_a_proj.process_weights_after_loading()
         self.kv_a_proj_with_mqa.process_weights_after_loading()
-        self.q_b_proj.process_weights_after_loading()
-        self.o_proj.process_weights_after_loading()
-        w = self.kv_b_proj.weight.data
-        w = w.view(
-            self.num_heads_local,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        w_uk, w_uv = w.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
-        self.W_UK.copy_(w_uk.contiguous())
-        self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
+
+    def _prepare_indexer_weights(self) -> None:
         if self.indexer is not None:
             self.indexer.process_weights_after_loading()
 
-    def forward(
+    def _a_projection(self) -> W8A8AttentionLinear | None:
+        return self._combined_qkv
+
+    def _project_separate_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.q_a_proj(hidden), self.kv_a_proj_with_mqa(hidden)
+
+    def _can_fuse_decode(self) -> bool:
+        ctx = get_forward_context()
+        layerwise = self.cfg.layerwise_split_size > 1 and not (
+            ctx.metadata.is_prefill or ctx.metadata.is_chunked_prefill
+        )
+        return super()._can_fuse_decode() and ctx.cp_context is None and not layerwise
+
+    def _select_topk(
         self,
         hidden: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        backend: AttentionBackend,
         half_rope_cos: torch.Tensor,
         half_rope_sin: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
-        indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor],
-        prev_topk_indices: torch.Tensor | None = None,
-        reuse_topk_indices: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = hidden.shape[0]
-        _validate_rope_cos_sin((rope_cos, rope_sin), hidden, self.qk_rope_head_dim, True, "attention")
-        indexer_key_cos_sin = (
-            (rope_cos, rope_sin) if self.cfg.indexer_rope_interleave else (half_rope_cos, half_rope_sin)
-        )
-        forward_ctx = get_forward_context()
-        backend = forward_ctx.attention_backend
-        cp_context = forward_ctx.cp_context
+        query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
+        prev_topk: torch.Tensor | None,
+        reuse_topk: bool,
+    ) -> torch.Tensor:
+        assert query_cos_sin is not None
+        key_cos_sin = (rope_cos, rope_sin) if self.cfg.indexer_rope_interleave else (half_rope_cos, half_rope_sin)
+        ctx = get_forward_context()
+        cp_context = ctx.cp_context
         layerwise = self.cfg.layerwise_split_size > 1 and not (
-            forward_ctx.metadata.is_prefill or forward_ctx.metadata.is_chunked_prefill
+            ctx.metadata.is_prefill or ctx.metadata.is_chunked_prefill
         )
         layer_owner = self.layer_id % self.cfg.layerwise_split_size
         owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
-        fused_mla_ready = getattr(self, "_fused_mla_ready", hasattr(self, "qkv_a_proj"))
-        if self._use_fused_mla_decode and fused_mla_ready and cp_context is None and not layerwise:
-            preprocess_context = backend.mla_preprocess_context(self)
-            if preprocess_context is not None:
-                return self._forward_fused_mla_decode(
-                    hidden,
-                    rope_cos,
-                    rope_sin,
-                    indexer_query_cos_sin,
-                    indexer_key_cos_sin,
-                    backend,
-                    preprocess_context,
-                    prev_topk_indices,
-                    reuse_topk_indices,
-                )
-
-        q_a_proj = getattr(self, "q_a_proj", None)
-        kv_a_proj = getattr(self, "kv_a_proj_with_mqa", None)
-        if q_a_proj is None or kv_a_proj is None:
-            qkv_proj = self.qkv_a_proj
-            input_quant = kernels.quantize_per_tensor(
-                hidden,
-                qkv_proj.input_scale,
-                qkv_proj.input_offset,
-                torch.qint8,
-                -1,
-            )
-            qkv_a = qkv_proj.forward_quantized(input_quant)
-            kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
-            kv, q_a = qkv_a.split([kv_dim, self.q_lora_rank], dim=-1)
-        else:
-            q_a = q_a_proj(hidden)
-            kv = kv_a_proj(hidden)
-        q_c = self.q_a_layernorm(q_a)
-        q = self.q_b_proj(q_c)
-        q = q.view(
-            num_tokens,
-            self.num_heads_local,
-            self.qk_nope_head_dim + self.qk_rope_head_dim,
-        )
-        q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_latent = kernels.atb_matmul_ein_sum(q_nope, self.W_UK)
-        q_pe = _interleave_rope_with(q_rope, rope_cos, rope_sin)
-        k_latent_raw, k_rope_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_latent = self.kv_a_layernorm(k_latent_raw)
-        k_pe = _interleave_rope_with(k_rope_raw.unsqueeze(1), rope_cos, rope_sin)
-        k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
-        k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
-
-        if reuse_topk_indices:
-            if prev_topk_indices is None:
+        if reuse_topk:
+            if prev_topk is None:
                 raise ValueError("MTP DSA top-k reuse requires indices from the previous draft step")
             if self.indexer is not None:
                 ctx = backend.mla_index_context(self)
                 if not layerwise or owns_layer_cache:
-                    self.indexer._update_index_cache(hidden, ctx, indexer_key_cos_sin)
-            topk = prev_topk_indices
+                    self.indexer._update_index_cache(hidden, ctx, key_cos_sin)
+            topk = prev_topk
         elif self.indexer is not None:
             ctx = backend.mla_index_context(self)
             if layerwise:
                 if owns_layer_cache:
-                    topk = self.indexer.select_qli(hidden, q_c, ctx, indexer_query_cos_sin, indexer_key_cos_sin)
+                    topk = self.indexer.select_qli(hidden, q_c, ctx, query_cos_sin, key_cos_sin)
                 else:
                     topk = torch.empty(
-                        (num_tokens, ctx.index_cache.size(2), self.cfg.index_topk),
+                        (hidden.shape[0], ctx.index_cache.size(2), self.cfg.index_topk),
                         dtype=torch.int32,
                         device=hidden.device,
                     )
                 distributed.broadcast_(topk, layer_owner, "layerwise")
             elif cp_context is None:
-                topk = self.indexer.select_qli(hidden, q_c, ctx, indexer_query_cos_sin, indexer_key_cos_sin)
+                topk = self.indexer.select_qli(hidden, q_c, ctx, query_cos_sin, key_cos_sin)
             else:
                 # Indexer queries are packed to real CP-owned rows.  The key
                 # side is all-gathered inside the indexer so the paged index
                 # cache remains globally addressable.
                 query_index = cp_context.query_index
+                local_q_c = (
+                    tuple(value.index_select(0, query_index) for value in q_c)
+                    if isinstance(q_c, tuple)
+                    else q_c.index_select(0, query_index)
+                )
                 topk = self.indexer.select_qli(
                     hidden.index_select(0, query_index),
-                    q_c.index_select(0, query_index),
+                    local_q_c,
                     ctx,
-                    indexer_query_cos_sin,
-                    indexer_key_cos_sin,
+                    query_cos_sin,
+                    key_cos_sin,
                     cache_hidden=hidden,
                 )
         else:
-            if prev_topk_indices is None:
+            if prev_topk is None:
                 raise ValueError(
-                    "Shared DSA layers require top-k indices from a previous "
-                    "full indexer layer (prev_topk_indices is None)."
+                    "Shared DSA layers require top-k indices from a previous full indexer layer (prev_topk is None)."
                 )
-            topk = prev_topk_indices
+            topk = prev_topk
+        return topk
 
+    def _execute_attention(
+        self,
+        backend: AttentionBackend,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_latent_3d: torch.Tensor,
+        k_pe_3d: torch.Tensor,
+        topk: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx = get_forward_context()
+        layerwise = self.cfg.layerwise_split_size > 1 and not (
+            ctx.metadata.is_prefill or ctx.metadata.is_chunked_prefill
+        )
+        layer_owner = self.layer_id % self.cfg.layerwise_split_size
+        owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
         if layerwise:
             local_query = torch.cat((q_latent, q_pe), dim=-1)
             gathered_query = distributed.all_gather(
@@ -1007,41 +502,47 @@ class Glm52MLAAttention(Attention):
             attn_out = gathered_attn_out.narrow(1, head_offset, self.num_heads_local)
         else:
             attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
-        v_full = kernels.atb_matmul_ein_sum(attn_out, self.W_UV)
-        v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
-        o = self.o_proj(v_full)
-        if self.cfg.tp_size > 1:
-            output_dtype = o.dtype
-            o = o.to(torch.float32)
-            distributed.all_reduce_(o)
-            o = o.to(output_dtype)
-        return o, topk
+        return attn_out
 
-
-class Glm52Indexer(nn.Module):
-    """GLM-5.2 DSA lightning indexer (wq_b W8A8, configurable RoPE)."""
-
-    def __init__(
+    def forward(
         self,
-        cfg: Glm52Config,
-        dtype: torch.dtype,
-        device: torch.device,
-        layer_id: int = 0,
-    ) -> None:
-        super().__init__()
-        self.layer_id = layer_id
-        self.n_head = cfg.index_n_heads
-        self.head_dim = cfg.index_head_dim
-        self.rope_dim = cfg.qk_rope_head_dim
-        self.topk = cfg.index_topk
-        self.indexer_rope_interleave = cfg.indexer_rope_interleave
-        self._q_stream = None
-        self._weights_stream = None
+        hidden: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor],
+        prev_topk_indices: torch.Tensor | None = None,
+        reuse_topk_indices: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _validate_rope_cos_sin((rope_cos, rope_sin), hidden, self.qk_rope_head_dim, True, "attention")
+        return self._forward_with_topk(
+            hidden,
+            half_rope_cos,
+            half_rope_sin,
+            rope_cos,
+            rope_sin,
+            indexer_query_cos_sin,
+            prev_topk_indices,
+            reuse_topk_indices,
+        )
+
+
+class Glm52Indexer(DeepseekV3Indexer):
+    """GLM checkpoint projections and optional DSA projection streams."""
+
+    def _uses_interleaved_rope(self, cfg: Glm52Config) -> bool:
+        return cfg.indexer_rope_interleave
+
+    def _init_streams(self, cfg: Glm52Config, device: torch.device) -> None:
+        super()._init_streams(cfg, device)
         if cfg.enable_dsa_multi_stream:
             self._weights_stream = get_device_stream(device, "dsa_indexer_weights")
             if not self.indexer_rope_interleave:
                 self._q_stream = get_device_stream(device, "dsa_indexer_q")
-        self.wq_b = _W8A8AttentionLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device)
+
+    def _init_projections(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
+        self.wq_b = W8A8AttentionLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False, dtype=dtype, device=device)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head, bias=False, dtype=dtype, device=device)
         self.register_buffer(
@@ -1050,12 +551,6 @@ class Glm52Indexer(nn.Module):
             persistent=False,
         )
         self._wk_weights_proj_ready = False
-        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype, device=device)
-        self.register_buffer(
-            "hadamard",
-            _create_hadamard_matrix(self.head_dim, dtype, device),
-            persistent=False,
-        )
 
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
@@ -1090,230 +585,22 @@ class Glm52Indexer(nn.Module):
             return projected[..., : self.head_dim], projected[..., self.head_dim :].contiguous()
         return self.wk(hidden), self.weights_proj(hidden)
 
-    def _project_index_inputs(
-        self,
-        hidden: torch.Tensor,
-        cache_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cache_hidden is hidden:
-            return self._project_k_and_weights(hidden)
-        return self.wk(cache_hidden), self.weights_proj(hidden)
+    def _project_key(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.wk(hidden)
 
-    def _pad_q_heads_to_kernel_gsize(
-        self,
-        q: torch.Tensor,
-        q_scale: torch.Tensor,
-        weights: torch.Tensor,
-        required_q_heads: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # aclnnQuantLightningIndexer tiling hard-requires n_heads_q/n_heads_k == 64
-        # (G_SIZE_LIMIT in quant_lightning_indexer_tiling.h; xllm_ops kernel hard-codes
-        # matmul M=256 tile, head_dim=128 and kv_head=1 for DSV3.2/DSV4 shapes). GLM-5.2
-        # is index_n_heads=32 / kv_head=1, so pad Q from 32 to 64 heads to satisfy the
-        # kernel. The score sum_h(w_h * q_h . k) is mathematically unchanged: padded Q
-        # rows are zero, so q_h . k = 0 for h >= n_head; padded weights are zero so those
-        # zero terms cannot contribute even if the kernel processed them differently.
-        pad_heads = required_q_heads - self.n_head
-        if pad_heads == 0:
-            return q, q_scale, weights
-        if pad_heads < 0:
-            raise RuntimeError(f"Glm52Indexer expected index_n_heads<={required_q_heads}, got {self.n_head}")
-        q = torch.cat(
-            [q, torch.zeros((q.size(0), pad_heads, q.size(2)), dtype=q.dtype, device=q.device)],
-            dim=1,
-        )
-        q_scale = torch.cat(
-            [q_scale, torch.zeros((q_scale.size(0), pad_heads), dtype=q_scale.dtype, device=q_scale.device)],
-            dim=1,
-        )
-        weights = torch.cat(
-            [weights, torch.zeros((weights.size(0), pad_heads), dtype=weights.dtype, device=weights.device)],
-            dim=1,
-        )
-        return q, q_scale, weights
-
-    def _apply_interleaved_rope(
-        self,
-        value: torch.Tensor,
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Apply indexer RoPE in place without materializing split tensors."""
-        _validate_rope_cos_sin(cos_sin, value, self.rope_dim, True, "interleaved indexer")
-        cos, sin = cos_sin
-        cos = cos.view(-1, self.rope_dim)
-        sin = sin.view(-1, self.rope_dim)
-        if value.dim() == 2:
-            value = value.view(-1, 1, self.head_dim)
-            kernels.npu_inplace_partial_rotary_mul(value, cos, sin, 0, self.rope_dim)
-            return value.view(-1, self.head_dim)
-        kernels.npu_inplace_partial_rotary_mul(value, cos, sin, 0, self.rope_dim)
-        return value
-
-    def _update_index_cache(
-        self,
-        cache_hidden: torch.Tensor,
-        ctx: MlaIndexContext,
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
-        projected_k: torch.Tensor | None = None,
-    ) -> None:
-        k = self.wk(cache_hidden) if projected_k is None else projected_k
-        k = self.k_norm(k)
-        if self.indexer_rope_interleave:
-            k = self._apply_interleaved_rope(k, cos_sin)
-        else:
-            _validate_rope_cos_sin(cos_sin, k, self.rope_dim, False, "indexer cache K")
-            k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-            k_pe = _apply_half_rope_with_cos_sin(k_pe.unsqueeze(1), *cos_sin).squeeze(1)
-            k = torch.cat([k_pe, k_nope], dim=-1)
-        if ctx.cp_context is not None:
-            # Only the padded K rows obey the equal-size CP gather contract.
-            k = cp_gather_kv(k, ctx.cp_context).contiguous()
-
-        index_cache = ctx.index_cache
-        index_cache_scale = ctx.index_cache_scale
-        k_scale = None
-        use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
-        if use_quant_indexer:
-            rotation_scale = self.head_dim**-0.5
-            k = torch.matmul(k, self.hadamard) * rotation_scale
-            k, k_scale = kernels.dynamic_quant(k)
-            assert k_scale is not None
-            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
-        ctx.update_index_cache(k, k_scale)
-
-    def _project_query(
-        self,
-        qr: torch.Tensor,
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
-        if self.indexer_rope_interleave:
-            return self._apply_interleaved_rope(q, cos_sin)
-        _validate_rope_cos_sin(cos_sin, q, self.rope_dim, False, "indexer query")
-        q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        q_pe = _apply_half_rope_with_cos_sin(q_pe, *cos_sin)
-        return torch.cat([q_pe, q_nope], dim=-1)
+    def _project_weights(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.weights_proj(hidden)
 
     def select_qli(
         self,
         hidden: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         ctx: MlaIndexContext,
         query_cos_sin: tuple[torch.Tensor, torch.Tensor],
         key_cos_sin: tuple[torch.Tensor, torch.Tensor],
         cache_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        actual_seq_q = ctx.actual_seq_q
-        actual_seq_kv = ctx.actual_seq_kv
-        cache_hidden = hidden if cache_hidden is None else cache_hidden
-        # Empty CP ranks still update/gather K without launching empty Q or
-        # weights projections.
-        has_queries = ctx.cp_context is None or ctx.cp_context.query_index.numel() != 0
-        if has_queries:
-            if self._weights_stream is not None:
-                self._weights_stream.wait_for_current()
-            with self._weights_stream.activate() if self._weights_stream is not None else nullcontext():
-                k, weights = self._project_index_inputs(hidden, cache_hidden)
-            if self._q_stream is not None:
-                self._q_stream.wait_for_current()
-                with self._q_stream.activate():
-                    q = self._project_query(qr, query_cos_sin)
-            elif self._weights_stream is not None:
-                q = self._project_query(qr, query_cos_sin)
-            if self._weights_stream is not None:
-                # The fused projection also produces K; join before cache
-                # preparation consumes it, keeping the main-path fusion.
-                self._weights_stream.join()
-                self._weights_stream.record_on_current(k)
-                self._weights_stream.record_on_current(weights)
-        else:
-            k = self.wk(cache_hidden)
-        self._update_index_cache(
-            cache_hidden,
-            ctx,
-            key_cos_sin,
-            projected_k=k,
-        )
-        index_cache = ctx.index_cache
-        index_cache_scale = ctx.index_cache_scale
-        use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
-        index_cache, index_cache_scale, block_table = ctx.materialize_index_cache()
-        if ctx.cp_context is not None and ctx.cp_context.query_index.numel() == 0:
-            # Other ranks still need this rank's keys/cache materialization.
-            # Complete those collectives before skipping empty Q kernels.
-            return torch.full(
-                (ctx.cp_context.total_local, index_cache.size(2), self.topk),
-                -1,
-                dtype=torch.int32,
-                device=hidden.device,
-            )
-
-        if self._q_stream is not None:
-            self._q_stream.join()
-            self._q_stream.record_on_current(q)
-        elif self._weights_stream is None:
-            q = self._project_query(qr, query_cos_sin)
-        if use_quant_indexer:
-            rotation_scale = self.head_dim**-0.5
-            q = torch.matmul(q, self.hadamard) * rotation_scale
-            q, q_scale = kernels.dynamic_quant(q)
-            assert q_scale is not None
-            q_scale = q_scale.to(torch.float16)
-            assert index_cache_scale is not None
-            weight_scale = self.head_dim**-0.5 * self.n_head**-0.5
-            # xLLM stores one index key per source token.
-            cmp_ratio = 1
-
-            required_q_heads = index_cache.size(2) * _QLI_KERNEL_GSIZE
-            q, q_scale, weights_padded = self._pad_q_heads_to_kernel_gsize(q, q_scale, weights, required_q_heads)
-
-            qli_metadata = ctx.get_quant_indexer_metadata(required_q_heads, self.head_dim, self.topk, cmp_ratio)
-            topk = kernels.quant_lightning_indexer(
-                q,
-                index_cache,
-                (weights_padded * weight_scale).to(torch.float16),
-                q_scale,
-                index_cache_scale,
-                qli_metadata,
-                actual_seq_q,
-                actual_seq_kv,
-                block_table,
-                self.topk,
-                cmp_ratio,
-            )
-        else:
-            topk = kernels.lightning_indexer(
-                q,
-                index_cache,
-                weights,
-                actual_seq_q,
-                actual_seq_kv,
-                block_table,
-                "TND",
-                "PA_BSND",
-                self.topk,
-                3,
-                9223372036854775807,
-                9223372036854775807,
-                False,
-            )
-        if ctx.cp_context is not None:
-            local_topk = topk.new_full((ctx.cp_context.total_local, *topk.shape[1:]), -1)
-            local_topk.index_copy_(0, ctx.cp_context.query_index, topk)
-            topk = local_topk
-        graph_state = get_forward_context().execution_state
-        if graph_state is not None:
-            # The QLI result feeds every later MLA layer but is not part of the
-            # model return value for the target graph. Keep one stable result
-            # per graph entry so a concurrent capture/replay cannot recycle a
-            # temporary custom-op allocation used by another entry.
-            topk_buffer = get_execution_buffer(
-                ("GLM52_QLI_TOPK", self.layer_id) + tuple(topk.shape),
-                lambda: torch.empty_like(topk),
-            )
-            topk_buffer.copy_(topk)
-            topk = topk_buffer
-        return topk
+        return self._select_qli(hidden, qr, ctx, query_cos_sin, key_cos_sin, cache_hidden)
 
 
 class Glm52MoE(DeepseekV3MoE):
@@ -1342,116 +629,66 @@ class Glm52MoE(DeepseekV3MoE):
         return cp_shard_rows(global_output, cp_context)
 
 
-class Glm52DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        cfg: Glm52Config,
-        layer_id: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        super().__init__()
-        self.layer_id = layer_id
-        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.self_attn = Glm52MLAAttention(cfg, layer_id, dtype, device)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
+class Glm52DecoderLayer(DeepseekV3DecoderLayer):
+    def _make_attention(
+        self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device
+    ) -> Glm52MLAAttention:
+        return Glm52MLAAttention(cfg, layer_id, dtype, device)
+
+    def _make_mlp(
+        self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device
+    ) -> DeepseekV3MLP | DeepseekV3MoE:
         mlp_type = (
             cfg.mlp_layer_types[layer_id]
             if cfg.mlp_layer_types is not None and layer_id < len(cfg.mlp_layer_types)
             else ("dense" if layer_id < cfg.first_k_dense_replace else "sparse")
         )
         if mlp_type == "dense":
-            self.mlp = Glm52MLP(cfg, cfg.intermediate_size, dtype, device)
-        else:
-            self.mlp = Glm52MoE(cfg, layer_id, dtype, device)
+            return DeepseekV3MLP(cfg, cfg.intermediate_size, dtype, device)
+        return Glm52MoE(cfg, layer_id, dtype, device)
 
-    def forward(
+    def _attention(
         self,
         hidden: torch.Tensor,
-        residual: torch.Tensor | None,
         half_rope_cos: torch.Tensor,
         half_rope_sin: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
-        indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor],
-        prev_topk_indices: torch.Tensor | None = None,
-        reuse_topk_indices: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden
-            hidden = self.input_layernorm(hidden)
-        else:
-            hidden, residual = self.input_layernorm(hidden, residual)
-        hidden, topk_indices = self.self_attn(
+        query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
+        prev_topk: torch.Tensor | None,
+        reuse_topk: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert query_cos_sin is not None
+        return self.self_attn(
             hidden,
             half_rope_cos,
             half_rope_sin,
             rope_cos,
             rope_sin,
-            indexer_query_cos_sin,
-            prev_topk_indices,
-            reuse_topk_indices,
+            query_cos_sin,
+            prev_topk,
+            reuse_topk,
         )
-        hidden, residual = self.post_attention_layernorm(hidden, residual)
-        hidden = self.mlp(hidden)
-        return hidden, residual, topk_indices
 
 
-class Glm52Model(nn.Module):
+class Glm52Model(DeepseekV3Model):
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
-        super().__init__()
-        tp = cfg.tp_size
-        assert cfg.hidden_size % tp == 0
-        self.cfg = cfg
-        self.embed_tokens = HiddenParallelEmbedding(
-            cfg.vocab_size,
-            cfg.hidden_size // tp,
-            tp,
-            dtype=dtype,
-            device=device,
-        )
-        self.layers = nn.ModuleList([Glm52DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.rotary = Glm52YarnRotaryEmbedding(
-            cfg.qk_rope_head_dim,
-            cfg.original_max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            cfg.rope_mscale,
-            cfg.rope_mscale_all_dim,
-            dtype=dtype,
-            device=device,
-        )
+        super().__init__(cfg, dtype, device)
         self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
 
-    def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.embed_tokens(input_ids)
-        positions = positions.to(torch.int64).contiguous()
-        cp_context = get_forward_context().cp_context
-        if cp_context is not None:
-            hidden = cp_shard_rows(hidden, cp_context)
-            positions = cp_shard_positions(positions, cp_context).contiguous()
-        half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(positions)
-        query_cos_sin = _select_indexer_query_cos_sin(
-            self.cfg.indexer_rope_interleave, half_rope_cos, half_rope_sin, rope_cos, rope_sin, cp_context
-        )
-        residual: torch.Tensor | None = None
-        prev_topk: torch.Tensor | None = None
-        aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
-        for layer_id, layer in enumerate(self.layers):
-            hidden, residual, prev_topk = layer(
-                hidden, residual, half_rope_cos, half_rope_sin, rope_cos, rope_sin, query_cos_sin, prev_topk
-            )
-            self.aux_hidden_capture.capture_layer(layer_id, hidden, residual, aux_hidden_buffer)
-            record_layer_event(layer_id)
-        hidden, _ = self.norm(hidden, residual)
-        if cp_context is not None:
-            hidden = cp_merge_rows(hidden, cp_context)
-        return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
+    def _make_decoder(
+        self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device
+    ) -> Glm52DecoderLayer:
+        return Glm52DecoderLayer(cfg, layer_id, dtype, device)
+
+    def _record_layer_event(self, layer_id: int) -> None:
+        record_layer_event(layer_id)
+
+    def _cp_context(self) -> CpContext | None:
+        return get_forward_context().cp_context
+
+    def _indexer_interleaved(self) -> bool:
+        return self.cfg.indexer_rope_interleave
 
 
 class Glm52ForCausalLM(PyModelBase):

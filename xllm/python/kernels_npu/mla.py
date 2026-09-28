@@ -21,7 +21,7 @@ import torch.nn.functional as F
 import torch_npu
 
 from .linear import atb_matmul_ein_sum
-from .normalization import rms_norm
+from .normalization import rms_norm, rms_norm_dynamic_quant
 from .quantization import dynamic_quant, quant_matmul, quantize_per_tensor
 
 _FRACTAL_NZ_FORMAT = 29
@@ -407,8 +407,13 @@ def deepseek_mla_preprocess_decode_dynamic(
     qk_rope_head_dim: int,
     q_norm_epsilon: float,
     kv_norm_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run capturable dynamic-W8A8 MLA preprocessing and cache writes."""
+    fuse_q_norm_quant: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Preprocess MLA and return Q-A and the activation scale used by Q-B.
+
+    Fusion is enabled only when the indexer can consume the same INT8 Q-A as
+    Q-B; otherwise it receives the normalized floating-point activation.
+    """
     hidden_int8, hidden_scale = dynamic_quant(hidden)
     qkv_a = quant_matmul(
         hidden_int8,
@@ -422,8 +427,12 @@ def deepseek_mla_preprocess_decode_dynamic(
     )
     kv_dim = kv_lora_rank + qk_rope_head_dim
     kv, q_a = qkv_a.split([kv_dim, q_lora_rank], dim=-1)
-    q_c = rms_norm(q_a, q_norm_weight, q_norm_epsilon)
-    q_c_int8, q_c_scale = dynamic_quant(q_c)
+    if fuse_q_norm_quant:
+        q_c_int8, q_c_scale = rms_norm_dynamic_quant(q_a, q_norm_weight, q_norm_epsilon)
+        q_c = q_c_int8
+    else:
+        q_c = rms_norm(q_a, q_norm_weight, q_norm_epsilon)
+        q_c_int8, q_c_scale = dynamic_quant(q_c)
     q = quant_matmul(
         q_c_int8,
         q_b_weight,
@@ -458,7 +467,7 @@ def deepseek_mla_preprocess_decode_dynamic(
         qk_rope_head_dim,
         kv_norm_epsilon,
     )
-    return q_c, q_latent, q_pe
+    return q_c, q_c_scale, q_latent, q_pe
 
 
 @deepseek_mla_preprocess_decode_dynamic.register_fake
@@ -483,7 +492,8 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     qk_rope_head_dim: int,
     q_norm_epsilon: float,
     kv_norm_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fuse_q_norm_quant: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del (
         qkv_weight,
         qkv_weight_scale,
@@ -503,7 +513,8 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     )
     num_tokens = hidden.shape[0]
     return (
-        hidden.new_empty((num_tokens, q_lora_rank)),
+        hidden.new_empty((num_tokens, q_lora_rank), dtype=torch.int8 if fuse_q_norm_quant else hidden.dtype),
+        hidden.new_empty((num_tokens,), dtype=torch.float32),
         hidden.new_empty((num_tokens, num_heads, w_uk.shape[-1])),
         hidden.new_empty((num_tokens, num_heads, qk_rope_head_dim)),
     )
