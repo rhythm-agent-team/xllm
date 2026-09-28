@@ -72,22 +72,8 @@ def atb_matmul_ein_sum(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.ops.xllm_ops.atb_matmul_ein_sum(x, weight)
 
 
-def matmul_16in32out(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-    """Multiply bf16 operands with an fp32 accumulator: [M,K],[K,N]->[M,N].
-
-    Both operands must be BF16 tensors on the same NPU in ND format; x2 must
-    be contiguous, while a strided x1 is copied to contiguous storage. Only the
-    2-D form accumulates in fp32 on A3 — the 3-D aclnn forms return
-    bf16-precision values without reporting an error, so the operator rejects
-    them, along with every other dtype or shape mismatch, instead of degrading
-    silently.
-    """
-    return torch.ops.xllm_ops.matmul_16in32out(x1, x2)
-
-
 __all__ = [
     "atb_matmul_ein_sum",
-    "matmul_16in32out",
     "prepare_row_parallel_weight",
     "prepare_quant_weight",
 ]

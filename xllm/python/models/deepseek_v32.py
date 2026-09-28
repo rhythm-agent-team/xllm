@@ -566,34 +566,25 @@ class W8A8StaticLinear(W8A8AttentionLinear):
 class RouterGate(nn.Module):
     """MoE router gate: bf16 [T, H] x bf16 [H, E] -> fp32 [T, E].
 
-    The checkpoint weight and the hidden state are both bf16, so the fp32 gate
-    of the reference model only upcasts them without adding information. The
-    16-in/32-out matmul multiplies those exact bf16 values into an fp32
-    accumulator, which keeps the fp32 logits the routing consumers expect while
-    dropping the per-call activation upcast and the fp32 weight copy.
+    Keep the checkpoint-facing [E, H] weight as a view of contiguous [H, E]
+    storage, so addmm reads it without a second weight copy.
     """
 
     def __init__(self, hidden_size: int, num_experts: int, device: torch.device) -> None:
         super().__init__()
-        # Keep the checkpoint layout [num_experts, hidden_size] so the weight
-        # loader keeps addressing this parameter as ``gate.weight``.
+        # The loader sees [E, H], while weight.t() is contiguous [H, E].
         self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=torch.bfloat16, device=device),
+            torch.empty(hidden_size, num_experts, dtype=torch.bfloat16, device=device).t(),
             requires_grad=False,
         )
-        # Derived from ``weight``, so it stays a plain attribute: it must not
-        # enter the state dict or the loader's parameter snapshot.
-        self.weight_kn: torch.Tensor | None = None
-
-    def process_weights_after_loading(self) -> None:
-        """Materialize the contiguous [H, E] operand the matmul reads."""
-        self.weight_kn = self.weight.data.transpose(0, 1).contiguous()
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        if self.weight_kn is None:
-            # Built without a checkpoint (weight-less construction, unit tests).
-            self.process_weights_after_loading()
-        return kernels.matmul_16in32out(hidden, self.weight_kn)
+        logits = torch.empty(
+            (hidden.shape[0], self.weight.shape[0]),
+            dtype=torch.float32,
+            device=hidden.device,
+        )
+        return torch.addmm(logits, hidden, self.weight.t(), beta=0, alpha=1, out=logits)
 
 
 class W8A8DynamicLinear(nn.Module):
@@ -1693,7 +1684,6 @@ class DeepseekV3MoE(nn.Module):
         world, rank = moe_shard(self.cfg)
         self.load_experts(loader, mlp_prefix + "experts.", world=world, rank=rank)
         loader.copy_replicated(mlp_prefix + "gate.weight")
-        self.gate.process_weights_after_loading()
         loader.copy_in(
             mlp_prefix + "e_score_correction_bias",
             loader.load_tensor(mlp_prefix + "gate.e_score_correction_bias"),

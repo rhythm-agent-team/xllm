@@ -33,7 +33,6 @@ sys.modules.setdefault("xllm.python.kernels_cuda", _kernels_cuda)
 from xllm.python import distributed, kernels  # noqa: E402
 
 kernels.grouped_moe = MagicMock()
-kernels.matmul_16in32out = MagicMock()
 kernels.prepare_grouped_moe_weights = MagicMock(side_effect=lambda w13, w2: (w13, w2))
 kernels.supports_cutlass_moe = MagicMock(return_value=False)
 kernels.moe_fused_topk = MagicMock()
@@ -231,8 +230,9 @@ class TestDeepseekV3MoEForward:
 
     @staticmethod
     def _patch_shared_experts(moe: DeepseekV3MoE, num_tokens: int):
-        """Replace shared_experts.forward to avoid W8A8 kernel calls."""
+        """Replace device kernels unrelated to the parallel layout."""
         moe.shared_experts.forward = MagicMock(return_value=torch.zeros(num_tokens, moe.hidden))
+        moe.gate.forward = MagicMock(return_value=torch.zeros(num_tokens, moe.num_experts, dtype=torch.float32))
 
     def test_dp1_no_gather(self):
         moe = _make_moe(dp_size=1)

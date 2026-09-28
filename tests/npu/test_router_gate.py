@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Router gate A/B: the 16-in/32-out bf16 matmul against the replaced fp32 path.
+"""Router gate A/B: bf16 addmm with fp32 output against the replaced fp32 path.
 
 Requires XLLM_TEST_NATIVE_LIBRARY (the built operator library) and
 XLLM_TEST_NPU_DEVICE. Run tests/npu in its own pytest process so the CPU package
@@ -83,14 +83,20 @@ def _maximum_relative_error(candidate: torch.Tensor, reference: torch.Tensor) ->
     return (candidate - reference).abs().max().item() / reference.abs().max().item()
 
 
+def _gate_logits(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from xllm.python.models.deepseek_v32 import RouterGate
+
+    gate = RouterGate(HIDDEN_SIZE, NUM_EXPERTS, hidden.device)
+    gate.weight.data.copy_(weight)
+    return gate(hidden)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 512])
 def test_logits_match_the_fp32_reference_path(npu_device: torch.device, num_tokens: int) -> None:
-    from xllm.python import kernels
-
     hidden = _hidden(num_tokens, npu_device, seed=num_tokens)
     weight = _router_weight(npu_device)
     reference = _logits_reference(hidden, weight)
-    logits = kernels.matmul_16in32out(hidden, weight.transpose(0, 1).contiguous())
+    logits = _gate_logits(hidden, weight)
 
     assert logits.dtype is torch.float32
     relative_error = _maximum_relative_error(logits, reference)
@@ -113,7 +119,7 @@ def test_expert_selection_matches_the_fp32_reference_path(npu_device: torch.devi
     weight = _router_weight(npu_device)
     generator = torch.Generator().manual_seed(7)
     correction_bias = (torch.randn(NUM_EXPERTS, generator=generator) * 0.1).to(npu_device)
-    logits = kernels.matmul_16in32out(hidden, weight.transpose(0, 1).contiguous())
+    logits = _gate_logits(hidden, weight)
 
     reference_weights, reference_ids = kernels.moe_gate_routing(
         _logits_reference(hidden, weight),
@@ -146,30 +152,25 @@ def test_expert_selection_matches_the_fp32_reference_path(npu_device: torch.devi
     assert weight_error < TOP_K_WEIGHT_MAX_RELATIVE_ERROR
 
 
-def test_router_gate_module_drives_the_op_with_bf16_operands(npu_device: torch.device) -> None:
+def test_router_gate_module_preserves_checkpoint_layout(npu_device: torch.device) -> None:
     from xllm.python.models.deepseek_v32 import RouterGate
 
     hidden = _hidden(512, npu_device, seed=11)
     weight = _router_weight(npu_device)
     gate = RouterGate(HIDDEN_SIZE, NUM_EXPERTS, npu_device)
     gate.weight.data.copy_(weight)
-    gate.process_weights_after_loading()
 
     # Checkpoint layout and dtype stay loader-addressable as ``gate.weight``.
     assert gate.weight.dtype is torch.bfloat16
     assert gate.weight.shape == (NUM_EXPERTS, HIDDEN_SIZE)
     assert [name for name, _ in gate.named_parameters()] == ["weight"]
-    # The derived [H, E] operand is a plain attribute: absent from the state
-    # dict, from named_buffers(), and therefore from the loader's snapshot.
+    assert list(gate.state_dict()) == ["weight"]
     assert list(gate.named_buffers()) == []
-    assert "weight_kn" not in gate.state_dict()
-    assert gate.weight_kn is not None
-    assert gate.weight_kn.dtype is torch.bfloat16
-    assert gate.weight_kn.shape == (HIDDEN_SIZE, NUM_EXPERTS)
-    assert gate.weight_kn.is_contiguous()
-    assert torch.equal(gate.weight_kn, weight.transpose(0, 1))
+    assert torch.equal(gate.weight, weight)
+    assert not gate.weight.is_contiguous()
+    assert gate.weight.t().is_contiguous()
+    assert gate.weight.t().data_ptr() == gate.weight.data_ptr()
 
-    # A passing call also proves the operands were bf16: the op rejects fp32.
     logits = gate(hidden)
     assert logits.dtype is torch.float32
     relative_error = _maximum_relative_error(logits, _logits_reference(hidden, weight))

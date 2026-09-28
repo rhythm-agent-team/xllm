@@ -145,12 +145,6 @@ torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
 
-/// @brief 2-D matmul with bf16 operands and an fp32 accumulator/output.
-///        x1 [M, K] bf16 x x2 [K, N] bf16 -> [M, N] fp32. Only the 2-D form
-///        keeps fp32 accumulation on A3; 3-D shapes are rejected on purpose.
-torch::Tensor matmul_16in32out(const torch::Tensor& x1,
-                               const torch::Tensor& x2);
-
 torch::Tensor matmul_reduce_scatter(
     const torch::Tensor& a,
     const torch::Tensor& b,

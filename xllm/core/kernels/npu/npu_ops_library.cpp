@@ -547,10 +547,6 @@ TORCH_LIBRARY(xllm_ops, m) {
       "dst_kv_seq_lens, Tensor(e!) dst_kv_seq_lens_delta, Tensor(f!) "
       "dst_paged_kv_indptr, Tensor(g!) dst_paged_kv_indices, Tensor(h!) "
       "dst_paged_kv_last_page_len, int padded_num_tokens) -> Tensor");
-  // 2-D bf16 matmul with an fp32 accumulator, used by the MoE router gate.
-  // 3-D is rejected by the C++ op: those aclnn forms silently degrade to bf16
-  // precision on A3.
-  m.def("matmul_16in32out(Tensor x1, Tensor x2) -> Tensor");
   m.def(
       "quant_matmul(Tensor x1, Tensor x2, bool transpose2, Tensor scale, "
       "Tensor? offset, Tensor? pertoken_scale, Tensor? bias, ScalarType? "
@@ -739,7 +735,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("apply_rotary_embedding", TORCH_FN(xllm::apply_rotary_embedding_npu));
   m.impl("update_decode_graph_metadata",
          TORCH_FN(xllm::update_decode_graph_metadata_npu));
-  m.impl("matmul_16in32out", TORCH_FN(xllm::kernel::npu::matmul_16in32out));
   m.impl("quant_matmul", TORCH_FN(xllm::kernel::npu::quant_matmul));
   m.impl("quant_matmul_out", TORCH_FN(xllm::kernel::npu::quant_matmul_out));
   m.impl("grouped_matmul_out", TORCH_FN(xllm::kernel::npu::grouped_matmul_out));
