@@ -31,6 +31,21 @@ from xllm.python.models import glm5_2
 from xllm.python.models.deepseek_v32 import _gather_half_rope_cos_sin
 
 
+def _indexer_out(select):
+    """Preserve the caller-owned indices and BF16 values kernel contract."""
+
+    def write(*args):
+        indices, values = args[-2:]
+        assert indices.dtype == torch.int32
+        assert values.dtype == torch.bfloat16
+        assert values.shape == indices.shape
+        indices.copy_(select(*args[:-2]))
+        values.zero_()
+        return indices
+
+    return write
+
+
 def _three_token_plan(rank: int) -> CpContext:
     shard = [0, -1] if rank == 0 else [1, 2]
     q_ends = [1] if rank == 0 else [1, 2]
@@ -185,8 +200,8 @@ def test_short_prompt_indexer_keeps_queries_local_and_returns_padded_topk(rank: 
         patch.object(glm5_2.kernels, "quant_lightning_indexer_metadata", side_effect=indexer_metadata, create=True),
         patch.object(
             glm5_2.kernels,
-            "quant_lightning_indexer" if quantized else "lightning_indexer",
-            side_effect=select,
+            "quant_lightning_indexer" if quantized else "lightning_indexer_out",
+            side_effect=select if quantized else _indexer_out(select),
             create=True,
         ),
         patch("xllm.python.model_executor.cp_utils.distributed.all_gather", side_effect=all_gather, create=True),
@@ -255,7 +270,7 @@ def test_empty_query_rank_still_populates_index_cache(quantized: bool) -> None:
         patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_dynamic_quant, create=True),
         patch.object(glm5_2.kernels, "scatter_nd_update", side_effect=_scatter, create=True),
         patch.object(glm5_2.kernels, "quant_lightning_indexer", side_effect=select, create=True),
-        patch.object(glm5_2.kernels, "lightning_indexer", side_effect=select, create=True),
+        patch.object(glm5_2.kernels, "lightning_indexer_out", side_effect=_indexer_out(select), create=True),
         patch("xllm.python.model_executor.cp_utils.distributed.all_gather", side_effect=all_gather, create=True),
     ):
         backend.prepare(metadata)
@@ -357,8 +372,8 @@ def test_packed_chunked_pcp4_preserves_segment_owners_and_prefix(quantized: bool
         patch.object(glm5_2.kernels, "quant_lightning_indexer_metadata", side_effect=indexer_metadata, create=True),
         patch.object(
             glm5_2.kernels,
-            "quant_lightning_indexer" if quantized else "lightning_indexer",
-            side_effect=select,
+            "quant_lightning_indexer" if quantized else "lightning_indexer_out",
+            side_effect=select if quantized else _indexer_out(select),
             create=True,
         ),
         patch("xllm.python.model_executor.cp_utils.distributed.all_gather", side_effect=all_gather, create=True),
@@ -551,11 +566,11 @@ def test_indexer_reuses_interleaved_cos_sin_for_query_and_key(multi_stream: bool
             side_effect=lambda *_args: None,
             create=True,
         ),
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(execution_state=None)),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], execution_state=None)),
         patch.object(
             glm5_2.kernels,
-            "lightning_indexer",
-            return_value=torch.zeros(1, 1, 1, dtype=torch.int32),
+            "lightning_indexer_out",
+            side_effect=_indexer_out(lambda *_args: torch.zeros(1, 1, 1, dtype=torch.int32)),
             create=True,
         ),
     ):
@@ -612,11 +627,11 @@ def test_indexer_consumes_explicit_distinct_query_and_key_cos_sin(multi_stream: 
             side_effect=partial_rope,
             create=True,
         ),
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(execution_state=None)),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], execution_state=None)),
         patch.object(
             glm5_2.kernels,
-            "lightning_indexer",
-            return_value=torch.zeros(1, 1, 1, dtype=torch.int32),
+            "lightning_indexer_out",
+            side_effect=_indexer_out(lambda *_args: torch.zeros(1, 1, 1, dtype=torch.int32)),
             create=True,
         ),
     ):

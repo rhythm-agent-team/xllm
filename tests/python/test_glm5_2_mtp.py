@@ -23,7 +23,8 @@ import torch.nn as nn
 
 pytest.importorskip("torch_npu")
 
-from xllm.python.models import glm5_2_mtp
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+from xllm.python.models import deepseek_v32, glm5_2_mtp
 
 
 def _config(**overrides) -> dict:
@@ -80,9 +81,9 @@ class _ScaleNorm(nn.Module):
         return hidden * 2
 
 
-class _NormBody(nn.Module):
+class _NormBody(glm5_2_mtp.Glm52MtpModel):
     def __init__(self) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.norm = _ScaleNorm()
 
 
@@ -125,7 +126,7 @@ def _mtp_body() -> tuple[glm5_2_mtp.Glm52MtpModel, _DecoderLayer]:
     body.hnorm = nn.Identity()
     layer = _DecoderLayer()
     body.layers = nn.ModuleList([layer])
-    body.rotary = glm5_2_mtp.Glm52YarnRotaryEmbedding(
+    body.rotary = deepseek_v32.DeepseekYarnRotaryEmbedding(
         4, 16, 1.0, 10000.0, 32, 1, 1.0, 1.0, dtype=torch.float32, device=torch.device("cpu")
     )
     body.enable_rot = False
@@ -186,11 +187,7 @@ def test_mtp_reuses_external_topk_and_emits_fallback_topk() -> None:
     external_topk = torch.tensor([[[3, 4]], [[5, 6]]], dtype=torch.int32)
 
     with (
-        patch.object(
-            glm5_2_mtp,
-            "get_forward_context",
-            return_value=SimpleNamespace(cp_context=None),
-        ),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
         patch.object(glm5_2_mtp, "record_layer_event"),
     ):
         _, _, reused_topk = body(input_ids, positions, mtp_topk_indices=external_topk)
@@ -208,11 +205,7 @@ def test_mtp_masks_position_zero_token_embedding() -> None:
     positions = torch.tensor([0, 1])
 
     with (
-        patch.object(
-            glm5_2_mtp,
-            "get_forward_context",
-            return_value=SimpleNamespace(cp_context=None),
-        ),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
         patch.object(glm5_2_mtp, "record_layer_event"),
     ):
         hidden, _, _ = body(input_ids, positions)
@@ -274,7 +267,7 @@ def test_mtp_prepares_fresh_coefficients_for_full_and_reuse_steps() -> None:
     topk = None
     positions_by_step = [torch.tensor([0, 1]), torch.tensor([7, 7]), torch.tensor([15, 2])]
     with (
-        patch.object(glm5_2_mtp, "get_forward_context", return_value=SimpleNamespace(cp_context=None)),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
         patch.object(glm5_2_mtp, "record_layer_event"),
         patch.object(body.rotary, "forward", wraps=body.rotary.forward) as prepare,
     ):

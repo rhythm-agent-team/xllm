@@ -26,7 +26,7 @@ import torch
 
 from xllm.python.device_stream import get_device_stream
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, ForwardContext, forward_context
-from xllm.python.models import glm5_2
+from xllm.python.models import deepseek_v32, glm5_2
 from xllm.python.models.glm5_2 import Glm52Config, Glm52ForCausalLM
 from xllm.python.models.weight_utils import W8A8WeightLoader
 
@@ -313,16 +313,14 @@ def test_glm_dsa_projections_precede_indexer(monkeypatch: pytest.MonkeyPatch, mo
         return torch.zeros(num_tokens, cfg_values["num_attention_heads"], cfg_values["kv_lora_rank"])
 
     backend.execute_mla.side_effect = _execute_mla
-    monkeypatch.setattr(
-        glm5_2,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            attention_backend=backend,
-            cp_context=cp_context,
-            metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-        ),
+    context = ForwardContext(
+        backend,
+        torch.device("cpu"),
+        SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+        [],
+        cp_context=cp_context,
     )
-    monkeypatch.setattr(glm5_2, "_interleave_rope_with", lambda tensor, _cos, _sin: tensor)
+    monkeypatch.setattr(deepseek_v32, "_interleave_rope_with", lambda tensor, _cos, _sin: tensor)
     monkeypatch.setattr(
         glm5_2.kernels,
         "atb_matmul_ein_sum",
@@ -331,8 +329,9 @@ def test_glm_dsa_projections_precede_indexer(monkeypatch: pytest.MonkeyPatch, mo
     )
 
     rope = model.model.rotary(torch.arange(num_tokens))
-    query_cos_sin = glm5_2._select_indexer_query_cos_sin(attention.cfg.indexer_rope_interleave, *rope, cp_context)
-    attention(hidden, *rope, query_cos_sin)
+    query_cos_sin = deepseek_v32._select_indexer_query_cos_sin(attention.cfg.indexer_rope_interleave, *rope, cp_context)
+    with forward_context(context):
+        attention(hidden, *rope, query_cos_sin)
 
     assert call_order.index("q_b") < call_order.index("indexer")
     assert call_order.index("kv_a") < call_order.index("indexer")
@@ -426,7 +425,17 @@ def test_glm_indexer_projection_overlap_matches_serial(
     def _select(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, *_args: object) -> torch.Tensor:
         order.append("select")
         # Consume every branch so stale side-stream outputs change the result.
-        return q.float().sum(dim=(1, 2)) + weights.float().sum(dim=1) + k.float().sum()
+        checksum = q.float().sum(dim=(1, 2)) + weights.float().sum(dim=1) + k.float().sum()
+        return (checksum * 1024).round().to(torch.int32).view(-1, 1, 1).expand(-1, 1, indexer.topk)
+
+    def _select_out(*args: object) -> torch.Tensor:
+        indices, values = args[-2:]
+        assert indices.dtype == torch.int32
+        assert values.dtype == torch.bfloat16
+        assert values.shape == indices.shape
+        indices.copy_(_select(*args[:-2]))
+        values.zero_()
+        return indices
 
     def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, start: int, dim: int) -> torch.Tensor:
         value = x[..., start : start + dim]
@@ -437,7 +446,7 @@ def test_glm_indexer_projection_overlap_matches_serial(
         return x
 
     monkeypatch.setattr(glm5_2.kernels, "npu_inplace_partial_rotary_mul", _rope, raising=False)
-    monkeypatch.setattr(glm5_2.kernels, "lightning_indexer", _select, raising=False)
+    monkeypatch.setattr(glm5_2.kernels, "lightning_indexer_out", _select_out, raising=False)
     monkeypatch.setattr(glm5_2.kernels, "quant_lightning_indexer", _select, raising=False)
     monkeypatch.setattr(
         glm5_2.kernels,
@@ -629,7 +638,7 @@ class _TensorStateDict:
 
 @pytest.mark.parametrize("dynamic_activation", [False, True])
 def test_compatible_attention_loader_allocates_only_selected_quantization(dynamic_activation: bool) -> None:
-    projection = glm5_2._W8A8AttentionLinear(4, 6, torch.device("cpu"))
+    projection = deepseek_v32.W8A8AttentionLinear(4, 6, torch.device("cpu"))
     model = torch.nn.Module()
     model.proj = projection
     tensors = {"proj.weight": torch.zeros(6, 4, dtype=torch.int8)}
@@ -686,13 +695,13 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
     q_scale = torch.tensor([[0.1], [0.2]])
     kv_scale = torch.tensor([[0.3], [0.4]])
 
-    def dynamic_projection(weight: torch.Tensor, scale: torch.Tensor) -> SimpleNamespace:
-        return SimpleNamespace(
-            _dynamic_activation=True,
-            weight=SimpleNamespace(data=weight),
-            weight_scale=scale,
-            process_weights_after_loading=MagicMock(),
-        )
+    def dynamic_projection(weight: torch.Tensor, scale: torch.Tensor) -> deepseek_v32.W8A8AttentionLinear:
+        projection = deepseek_v32.W8A8AttentionLinear(weight.shape[1], weight.shape[0], weight.device)
+        projection._set_dynamic_activation(True)
+        projection.weight.data.copy_(weight)
+        projection.weight_scale.copy_(scale)
+        projection.weight_offset.zero_()
+        return projection
 
     attention.q_a_proj = dynamic_projection(q_weight, q_scale)
     attention.kv_a_proj_with_mqa = dynamic_projection(kv_weight, kv_scale)
@@ -717,8 +726,8 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
 
     expected_weight = torch.cat((kv_weight, q_weight), dim=0).transpose(0, 1).contiguous()
     expected_scale = torch.cat((kv_scale.flatten(), q_scale.flatten()))
-    torch.testing.assert_close(attention._dynamic_qkv_weight, expected_weight)
-    torch.testing.assert_close(attention._dynamic_qkv_weight_scale, expected_scale)
+    torch.testing.assert_close(attention._combined_qkv.weight, expected_weight)
+    torch.testing.assert_close(attention._combined_qkv.weight_scale, expected_scale)
     assert attention._dynamic_mla_ready is True
     assert attention._fused_mla_ready is True
 

@@ -97,7 +97,7 @@ def test_indexer_query_and_cache_equal_legacy(
     hidden = torch.randn(rows, 128, dtype=torch.bfloat16, device="npu:0")
     positions = _positions(rows, 1)
     coefficients = rotary(positions.contiguous())
-    cos_sin = glm._select_indexer_query_cos_sin(interleaved, *coefficients, None)
+    cos_sin = ds._select_indexer_query_cos_sin(interleaved, *coefficients, None)
     q = indexer.wq_b(hidden).view(rows, 4, 128)
     k = indexer.k_norm(indexer.wk(hidden))
 
@@ -178,7 +178,7 @@ def test_aclgraph_changed_positions_and_alternating_target_draft_buckets(
             consumers: int = consumers,
         ) -> tuple[torch.Tensor, ...]:
             coefficients = rotary(positions)
-            cos_sin = glm._select_indexer_query_cos_sin(interleaved, *coefficients, None)
+            cos_sin = ds._select_indexer_query_cos_sin(interleaved, *coefficients, None)
             value = query.clone()
             for _ in range(consumers):
                 attention_q = ds._interleave_rope_with(value[..., :64], *coefficients[2:])

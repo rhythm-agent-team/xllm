@@ -21,7 +21,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from xllm.python.models import glm5_2
+from xllm.python.attention.backend import MlaPreprocessContext
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+from xllm.python.models import deepseek_v32, glm5_2
 
 
 class _Embedding(nn.Module):
@@ -139,10 +141,10 @@ def test_cp_model_loop_shards_local_rows_and_merges_after_norm() -> None:
         events.append(f"event_{layer_id}")
 
     with (
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(cp_context=cp_context)),
-        patch.object(glm5_2, "cp_shard_rows", side_effect=shard_rows),
-        patch.object(glm5_2, "cp_shard_positions", side_effect=shard_positions),
-        patch.object(glm5_2, "cp_merge_rows", side_effect=merge_rows),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=cp_context)),
+        patch.object(deepseek_v32, "cp_shard_rows", side_effect=shard_rows),
+        patch.object(deepseek_v32, "cp_shard_positions", side_effect=shard_positions),
+        patch.object(deepseek_v32, "cp_merge_rows", side_effect=merge_rows),
         patch.object(glm5_2, "record_layer_event", side_effect=record_event),
     ):
         output = model(
@@ -183,10 +185,10 @@ def test_cp_one_preserves_full_rows_without_shard_or_merge() -> None:
         events.append(f"event_{layer_id}")
 
     with (
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(cp_context=None)),
-        patch.object(glm5_2, "cp_shard_rows", shard_rows),
-        patch.object(glm5_2, "cp_shard_positions", shard_positions),
-        patch.object(glm5_2, "cp_merge_rows", merge_rows),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
+        patch.object(deepseek_v32, "cp_shard_rows", shard_rows),
+        patch.object(deepseek_v32, "cp_shard_positions", shard_positions),
+        patch.object(deepseek_v32, "cp_merge_rows", merge_rows),
         patch.object(glm5_2, "record_layer_event", side_effect=record_event),
     ):
         output = model(
@@ -218,7 +220,7 @@ def test_cp_one_preserves_aux_hidden_capture() -> None:
     model.aux_hidden_capture = glm5_2.AuxHiddenCapture((0, 1))
 
     with (
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(cp_context=None)),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
         patch.object(glm5_2, "record_layer_event"),
     ):
         output, aux_hidden = model(
@@ -250,11 +252,7 @@ def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
     global_output = global_hidden + 100.0
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context),
-        ),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=cp_context)),
         patch.object(glm5_2, "cp_gather_kv", return_value=global_hidden) as gather,
         patch.object(glm5_2.DeepseekV3MoE, "forward", return_value=global_output) as ep_forward,
         patch.object(
@@ -306,8 +304,8 @@ def test_glm_ep_moe_preserves_parent_combine_behavior() -> None:
     assert output is expected
 
 
-def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
-    mlp = glm5_2.Glm52MLP.__new__(glm5_2.Glm52MLP)
+def test_shared_dense_mlp_fused_path_preserves_reduction_dtype() -> None:
+    mlp = deepseek_v32.DeepseekV3MLP.__new__(deepseek_v32.DeepseekV3MLP)
     nn.Module.__init__(mlp)
     mlp.tp = 2
     mlp.skip_tp_reduce = False
@@ -316,12 +314,13 @@ def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
         forward_accumulated=MagicMock(return_value=torch.ones(2, 4)),
     )
     reduced_input = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    expected = reduced_input + 1
     mlp.down_proj = SimpleNamespace(
         forward_quantized=MagicMock(return_value=reduced_input),
     )
 
     def reduce_output(output: torch.Tensor) -> None:
-        assert output.dtype == torch.float32
+        assert output.dtype == torch.bfloat16
         output.add_(1.0)
 
     with (
@@ -348,25 +347,26 @@ def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
 
     reduce.assert_called_once()
     assert output.dtype == torch.bfloat16
-    torch.testing.assert_close(output, reduced_input + 1)
+    torch.testing.assert_close(output, expected)
 
 
-def test_glm_dense_mlp_unfused_path_reduces_in_fp32() -> None:
-    mlp = glm5_2.Glm52MLP.__new__(glm5_2.Glm52MLP)
+def test_shared_dense_mlp_unfused_path_preserves_reduction_dtype() -> None:
+    mlp = deepseek_v32.DeepseekV3MLP.__new__(deepseek_v32.DeepseekV3MLP)
     nn.Module.__init__(mlp)
     mlp.tp = 2
     mlp.skip_tp_reduce = False
     mlp.swiglu_limit = 0.0
     reduced_input = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    expected = reduced_input + 1
     mlp.down_proj = MagicMock(return_value=reduced_input)
     activation = torch.ones(2, 2, dtype=torch.bfloat16)
 
     def reduce_output(output: torch.Tensor) -> None:
-        assert output.dtype == torch.float32
+        assert output.dtype == torch.bfloat16
         output.add_(1.0)
 
     with (
-        patch.object(glm5_2, "_swiglu_with_clamp", return_value=activation) as swiglu,
+        patch.object(deepseek_v32, "_swiglu_with_clamp", return_value=activation) as swiglu,
         patch.object(
             glm5_2.distributed,
             "tp_all_reduce",
@@ -380,13 +380,14 @@ def test_glm_dense_mlp_unfused_path_reduces_in_fp32() -> None:
     mlp.down_proj.assert_called_once_with(activation)
     reduce.assert_called_once()
     assert output.dtype == torch.bfloat16
-    torch.testing.assert_close(output, reduced_input + 1)
+    torch.testing.assert_close(output, expected)
 
 
-def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> None:
+def test_glm_attention_preserves_o_projection_dtype_for_tensor_parallel() -> None:
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
     attention._use_fused_mla_decode = False
+    attention._combined_qkv = None
     attention.q_a_proj = nn.Identity()
     attention.q_a_layernorm = nn.Identity()
     attention.q_b_proj = nn.Identity()
@@ -420,24 +421,24 @@ def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> Non
         [[0.125, -0.25], [0.5, -0.75]],
         dtype=torch.float32,
     )
+    expected = (projected.reshape(2, 2).float() + reduction_delta).to(projected.dtype)
     backend = MagicMock()
     backend.execute_mla.return_value = torch.tensor([[[5.0]], [[7.0]]])
 
     def reduce_output(output: torch.Tensor) -> None:
-        assert output.dtype == torch.float32
+        assert output.dtype == torch.bfloat16
         output.add_(reduction_delta)
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(
-                attention_backend=backend,
-                cp_context=None,
-                metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-            ),
+        forward_context(
+            ForwardContext(
+                backend,
+                torch.device("cpu"),
+                SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+                [],
+            )
         ),
-        patch.object(glm5_2, "_interleave_rope_with", side_effect=lambda value, *_args: value),
+        patch.object(deepseek_v32, "_interleave_rope_with", side_effect=lambda value, *_args: value),
         patch.object(
             glm5_2.kernels,
             "atb_matmul_ein_sum",
@@ -458,12 +459,9 @@ def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> Non
         )
 
     reduce.assert_called_once()
-    assert reduce.call_args.args[0].dtype == torch.float32
+    assert reduce.call_args.args[0].dtype == torch.bfloat16
     assert output.dtype == projected.dtype
-    torch.testing.assert_close(
-        output,
-        (projected.reshape(2, 2).float() + reduction_delta).to(projected.dtype),
-    )
+    torch.testing.assert_close(output, expected)
     assert topk is previous_topk
 
 
@@ -471,6 +469,7 @@ def test_glm_attention_reuse_updates_index_cache() -> None:
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
     attention._use_fused_mla_decode = False
+    attention._combined_qkv = None
     attention.q_a_proj = nn.Identity()
     attention.q_a_layernorm = nn.Identity()
     attention.q_b_proj = nn.Identity()
@@ -501,16 +500,15 @@ def test_glm_attention_reuse_updates_index_cache() -> None:
     backend.execute_mla.return_value = projected
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(
-                attention_backend=backend,
-                cp_context=None,
-                metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-            ),
+        forward_context(
+            ForwardContext(
+                backend,
+                torch.device("cpu"),
+                SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+                [],
+            )
         ),
-        patch.object(glm5_2, "_interleave_rope_with", side_effect=lambda value, *_args: value),
+        patch.object(deepseek_v32, "_interleave_rope_with", side_effect=lambda value, *_args: value),
         patch.object(
             glm5_2.kernels,
             "atb_matmul_ein_sum",
@@ -557,6 +555,7 @@ def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
     attention._use_fused_mla_decode = True
+    attention._fused_mla_ready = True
     attention._use_mlapo_v2 = use_mlapo_v2
     attention._dynamic_mla_ready = False
     attention.indexer = MagicMock() if reuse_topk_indices else None
@@ -573,7 +572,8 @@ def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
         layerwise_split_rank=0,
         indexer_rope_interleave=True,
     )
-    attention.qkv_a_proj = SimpleNamespace(
+    attention._combined_qkv = SimpleNamespace(
+        _dynamic_activation=False,
         input_scale=torch.ones(1),
         input_offset=torch.zeros(1),
         weight=torch.empty(0),
@@ -613,7 +613,7 @@ def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
     q_pe = torch.ones(num_tokens, 1, 1)
     attn_out = torch.ones(num_tokens, 1, 1)
     projected = torch.ones(num_tokens, 1, 2)
-    preprocess_context = glm5_2.MlaPreprocessContext(
+    preprocess_context = MlaPreprocessContext(
         kv_cache=torch.empty(2, 1, 1),
         rope_cache=torch.empty(2, 1, 1),
         slot_mapping=torch.arange(num_tokens + 1),
@@ -624,14 +624,13 @@ def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
     backend.execute_mla.return_value = attn_out
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(
-                attention_backend=backend,
-                cp_context=None,
-                metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-            ),
+        forward_context(
+            ForwardContext(
+                backend,
+                torch.device("cpu"),
+                SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+                [],
+            )
         ),
         patch.object(
             glm5_2.kernels,
@@ -659,7 +658,7 @@ def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
             reuse_topk_indices=reuse_topk_indices,
         )
 
-    attention.qkv_a_proj.forward_quantized.assert_not_called()
+    attention._combined_qkv.forward_quantized.assert_not_called()
     selected_preprocess = mlapo_v2 if expect_mlapo_v2 else capturable_preprocess
     unselected_preprocess = capturable_preprocess if expect_mlapo_v2 else mlapo_v2
     selected_preprocess.assert_called_once()
@@ -696,8 +695,8 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
     attention._use_fused_mla_decode = True
-    attention._use_mlapo_v2 = False
     attention._fused_mla_ready = True
+    attention._use_mlapo_v2 = False
     attention._dynamic_mla_ready = True
     attention.indexer = MagicMock()
     attention.num_heads_local = 1
@@ -713,8 +712,9 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
         layerwise_split_rank=0,
         indexer_rope_interleave=True,
     )
-    attention._dynamic_qkv_weight = torch.empty(0)
-    attention._dynamic_qkv_weight_scale = torch.empty(0)
+    attention._combined_qkv = SimpleNamespace(
+        _dynamic_activation=True, weight=torch.empty(0), weight_scale=torch.empty(0)
+    )
     attention.q_a_layernorm = SimpleNamespace(weight=torch.ones(2), eps=1e-5)
     attention.q_b_proj = SimpleNamespace(weight=torch.empty(0), weight_scale=torch.empty(0))
     attention.kv_a_layernorm = SimpleNamespace(weight=torch.ones(1), eps=1e-5)
@@ -729,7 +729,7 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
     q_latent = torch.ones(2, 1, 1)
     q_pe = torch.ones(2, 1, 1)
     projected = torch.ones(2, 1, 2)
-    preprocess_context = glm5_2.MlaPreprocessContext(
+    preprocess_context = MlaPreprocessContext(
         kv_cache=torch.empty(2, 1, 1),
         rope_cache=torch.empty(2, 1, 1),
         slot_mapping=torch.arange(3),
@@ -740,19 +740,18 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
     backend.execute_mla.return_value = torch.ones(2, 1, 1)
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(
-                attention_backend=backend,
-                cp_context=None,
-                metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
-            ),
+        forward_context(
+            ForwardContext(
+                backend,
+                torch.device("cpu"),
+                SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+                [],
+            )
         ),
         patch.object(
             glm5_2.kernels,
             "deepseek_mla_preprocess_decode_dynamic",
-            return_value=(q_c, q_latent, q_pe),
+            return_value=(q_c, torch.ones(2), q_latent, q_pe),
             create=True,
         ) as dynamic_preprocess,
         patch.object(
@@ -809,13 +808,13 @@ def test_model_shares_coefficients_across_layers_for_packed_and_empty_queries(
     # A packed shard includes an interior padding row; query order need not be contiguous.
     local_positions = torch.tensor([7, 0, 2, 0])
     with (
-        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(cp_context=context)),
-        patch.object(glm5_2, "cp_shard_rows", side_effect=lambda hidden, _ctx: hidden),
-        patch.object(glm5_2, "cp_shard_positions", return_value=local_positions),
-        patch.object(glm5_2, "cp_merge_rows", side_effect=lambda hidden, _ctx: hidden),
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=context)),
+        patch.object(deepseek_v32, "cp_shard_rows", side_effect=lambda hidden, _ctx: hidden),
+        patch.object(deepseek_v32, "cp_shard_positions", return_value=local_positions),
+        patch.object(deepseek_v32, "cp_merge_rows", side_effect=lambda hidden, _ctx: hidden),
         patch.object(glm5_2, "record_layer_event"),
         patch.object(
-            glm5_2, "_select_indexer_query_cos_sin", wraps=glm5_2._select_indexer_query_cos_sin
+            deepseek_v32, "_select_indexer_query_cos_sin", wraps=deepseek_v32._select_indexer_query_cos_sin
         ) as select_query,
     ):
         model(torch.arange(4), torch.arange(4))
