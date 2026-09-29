@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <torch/library.h>
 
+#include <limits>
 #include <string>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
@@ -81,6 +82,8 @@ at::Tensor sparse_flash_attention(
                                                layout_query,
                                                layout_kv);
   at::Tensor out = construct_sparse_flash_attention_output_tensor(query);
+  at::Tensor softmax_max = at::empty({0}, query.options().dtype(at::kFloat));
+  at::Tensor softmax_sum = at::empty({0}, query.options().dtype(at::kFloat));
 
   std::string query_layout_str = std::string(layout_query);
   std::string kv_layout_str = std::string(layout_kv);
@@ -102,7 +105,13 @@ at::Tensor sparse_flash_attention(
                query_layout_ptr,
                kv_layout_ptr,
                sparse_mode,
-               out);
+               std::numeric_limits<int64_t>::max(),
+               std::numeric_limits<int64_t>::max(),
+               /*attention_mode=*/2,
+               /*return_softmax_lse=*/false,
+               out,
+               softmax_max,
+               softmax_sum);
 
   return out;
 }
@@ -135,6 +144,8 @@ at::Tensor sparse_flash_attention_out(
       << "output shape must match query shape";
   CHECK(output.scalar_type() == query.scalar_type())
       << "output dtype must match query dtype";
+  at::Tensor softmax_max = at::empty({0}, query.options().dtype(at::kFloat));
+  at::Tensor softmax_sum = at::empty({0}, query.options().dtype(at::kFloat));
 
   std::string query_layout_str = std::string(layout_query);
   std::string kv_layout_str = std::string(layout_kv);
@@ -156,7 +167,13 @@ at::Tensor sparse_flash_attention_out(
                query_layout_ptr,
                kv_layout_ptr,
                sparse_mode,
-               output);
+               std::numeric_limits<int64_t>::max(),
+               std::numeric_limits<int64_t>::max(),
+               /*attention_mode=*/2,
+               /*return_softmax_lse=*/false,
+               output,
+               softmax_max,
+               softmax_sum);
   return output;
 }
 
