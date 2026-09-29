@@ -84,6 +84,10 @@ at::Tensor sparse_flash_attention(
   at::Tensor out = construct_sparse_flash_attention_output_tensor(query);
   at::Tensor softmax_max = at::empty({0}, query.options().dtype(at::kFloat));
   at::Tensor softmax_sum = at::empty({0}, query.options().dtype(at::kFloat));
+  int64_t pre_tokens = std::numeric_limits<int64_t>::max();
+  int64_t next_tokens = std::numeric_limits<int64_t>::max();
+  int64_t attention_mode = 2;
+  bool return_softmax_lse = false;
 
   std::string query_layout_str = std::string(layout_query);
   std::string kv_layout_str = std::string(layout_kv);
@@ -105,10 +109,10 @@ at::Tensor sparse_flash_attention(
                query_layout_ptr,
                kv_layout_ptr,
                sparse_mode,
-               std::numeric_limits<int64_t>::max(),
-               std::numeric_limits<int64_t>::max(),
-               /*attention_mode=*/2,
-               /*return_softmax_lse=*/false,
+               pre_tokens,
+               next_tokens,
+               attention_mode,
+               return_softmax_lse,
                out,
                softmax_max,
                softmax_sum);
@@ -146,6 +150,10 @@ at::Tensor sparse_flash_attention_out(
       << "output dtype must match query dtype";
   at::Tensor softmax_max = at::empty({0}, query.options().dtype(at::kFloat));
   at::Tensor softmax_sum = at::empty({0}, query.options().dtype(at::kFloat));
+  int64_t pre_tokens = std::numeric_limits<int64_t>::max();
+  int64_t next_tokens = std::numeric_limits<int64_t>::max();
+  int64_t attention_mode = 2;
+  bool return_softmax_lse = false;
 
   std::string query_layout_str = std::string(layout_query);
   std::string kv_layout_str = std::string(layout_kv);
@@ -167,10 +175,10 @@ at::Tensor sparse_flash_attention_out(
                query_layout_ptr,
                kv_layout_ptr,
                sparse_mode,
-               std::numeric_limits<int64_t>::max(),
-               std::numeric_limits<int64_t>::max(),
-               /*attention_mode=*/2,
-               /*return_softmax_lse=*/false,
+               pre_tokens,
+               next_tokens,
+               attention_mode,
+               return_softmax_lse,
                output,
                softmax_max,
                softmax_sum);
