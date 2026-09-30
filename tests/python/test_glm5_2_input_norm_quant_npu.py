@@ -235,12 +235,12 @@ def test_dynamic_preprocess_rejects_invalid_input_representation(npu_device: tor
         assert (inputs[name].cpu() == _SENTINEL).all()
 
 
-def test_cache_rope_zero_angle_interleaves_half_split_input(npu_device: torch.device) -> None:
+def test_cache_rope_zero_angle_splits_even_odd_pairs(npu_device: torch.device) -> None:
     value = torch.arange(_ROPE_DIM, dtype=torch.bfloat16).reshape(1, 1, 1, _ROPE_DIM).to(npu_device)
     actual = torch_npu.npu_interleave_rope(value, torch.ones_like(value), torch.zeros_like(value))
-    expected = torch.stack((torch.arange(_ROPE_DIM // 2), torch.arange(_ROPE_DIM // 2, _ROPE_DIM)), dim=-1)
-    logger.info("zero-angle RoPE first eight coefficients: %s", actual.cpu().reshape(-1)[:8].tolist())
-    torch.testing.assert_close(actual.cpu().reshape(-1), expected.reshape(-1).to(torch.bfloat16), rtol=0, atol=0)
+    expected = torch.cat((torch.arange(0, _ROPE_DIM, 2), torch.arange(1, _ROPE_DIM, 2)))
+    logger.info("zero-angle RoPE coefficient order: %s", actual.cpu().reshape(-1).tolist())
+    torch.testing.assert_close(actual.cpu().reshape(-1), expected.to(torch.bfloat16), rtol=0, atol=0)
 
 
 def test_shared_int64_slots_write_only_current_destinations(npu_device: torch.device) -> None:
@@ -272,9 +272,9 @@ def test_shared_int64_slots_write_only_current_destinations(npu_device: torch.de
             latent = current_kv.cpu()[:, :_KV_LORA_RANK].float()
             normalized = latent * torch.rsqrt(latent.square().mean(dim=-1, keepdim=True) + _EPS)
             expected_kv, expected_rope = _new_caches(torch.device("cpu"))
-            # Zero-angle interleave RoPE still reorders half-split pairs to adjacent pairs.
-            interleaved_rope = current_kv.cpu()[:, _KV_LORA_RANK:].reshape(_TOKENS, 2, _ROPE_DIM // 2)
-            interleaved_rope = interleaved_rope.transpose(1, 2).reshape(_TOKENS, _ROPE_DIM)
+            # Zero-angle interleave RoPE still separates even/odd pairs into two halves.
+            raw_rope = current_kv.cpu()[:, _KV_LORA_RANK:]
+            interleaved_rope = torch.cat((raw_rope[:, 0::2], raw_rope[:, 1::2]), dim=-1)
             for row, destination in enumerate(destinations):
                 if destination < 0:
                     continue
