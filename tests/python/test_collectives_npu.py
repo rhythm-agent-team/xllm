@@ -55,6 +55,14 @@ def _run_current_stream_gather(rank: int, devices: tuple[int, int], rendezvous_p
     warmup = torch.tensor([rank + 1], dtype=torch.bfloat16, device=device)
     dist.all_reduce(warmup)
     torch.testing.assert_close(warmup.cpu(), torch.tensor([3.0], dtype=warmup.dtype), rtol=0, atol=0)
+    shaped_receive = torch.empty((2, 1, 1, 5), dtype=torch.bfloat16, device=device)
+    flat_receive = torch.empty(10, dtype=torch.bfloat16, device=device).view(2, 1, 1, 5)
+    print(
+        f"rank={rank} shaped_receive_format={torch_npu.get_npu_format(shaped_receive)} "
+        f"flat_receive_format={torch_npu.get_npu_format(flat_receive)}",
+        flush=True,
+    )
+    assert torch_npu.get_npu_format(flat_receive) == 2
     cases = (
         ((1, 5), 1),
         ((1, 5), -1),

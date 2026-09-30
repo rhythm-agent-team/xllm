@@ -370,7 +370,8 @@ def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp
     if group.size() != world_size:
         raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
     dim = _normalize_gather_dim(x, dim)
-    gathered = x.new_empty((world_size, *x.shape))
+    # HCCL receives a flat ND buffer; adding rank to a 3-D shape can select NCHW storage.
+    gathered = x.new_empty((world_size * x.numel(),)).view(world_size, *x.shape)
     _all_gather(x.contiguous(), gathered, group=group)
     if math.prod(x.shape[:dim]) == 1:
         # Rank-major storage already has concatenation order for this layout.
