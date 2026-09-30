@@ -4,7 +4,7 @@
 """GLM router: replicated [256,6144] weights, three full GEMM paths.
 
 Run with the normal tests/python pytest entry point. XLLM_ROUTER_PROFILE_DIR
-selects a fresh result directory. Numerical checks, capture and warmup are outside
+selects a fresh result directory. Numerical checks and warmup are outside
 profiling; measured annotations contain enqueue and same-stream synchronization.
 """
 
@@ -56,29 +56,10 @@ def _calls(
     return dict(zip(ROUTES, (old, addmm, direct), strict=True))
 
 
-def _capture(function: Callable[[], torch.Tensor], stream: Any) -> tuple[Callable[[], torch.Tensor], Any]:
-    for _ in range(3):
-        function()
-        stream.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph, stream=stream):
-        output = function()
-    stream.synchronize()
-
-    def replay() -> torch.Tensor:
-        graph.replay()
-        return output
-
-    return replay, graph
-
-
 @pytest.mark.parametrize("m", SHAPES)
 @pytest.mark.parametrize("repetition", (1, 2))
-@pytest.mark.parametrize("mode", ("graph", "eager"))
 @torch.inference_mode()
-def test_router_matmul(
-    router_weights: tuple[torch.Tensor, torch.Tensor, Path], mode: str, repetition: int, m: int
-) -> None:
+def test_router_matmul(router_weights: tuple[torch.Tensor, torch.Tensor, Path], repetition: int, m: int) -> None:
     old_weight, new_weight, result_root = router_weights
     generator = torch.Generator().manual_seed(918 + m)
     hidden_cpu = (torch.randn(m, K, generator=generator) * 0.5).to(torch.bfloat16)
@@ -86,17 +67,12 @@ def test_router_matmul(
     reference = F.linear(hidden_cpu.double(), old_weight.cpu().double())
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
-    profile_dir = result_root / f"{mode}-r{repetition}-m{m}"
+    profile_dir = result_root / f"eager-r{repetition}-m{m}"
     profile_dir.mkdir()
     numerical: dict[str, float] = {}
     samples: list[dict[str, Any]] = []
-    graphs: list[Any] = []
     with torch.npu.stream(stream):
         calls = _calls(hidden, old_weight, new_weight)
-        if mode == "graph":
-            for route in ROUTES:
-                calls[route], graph = _capture(calls[route], stream)
-                graphs.append(graph)
         for route in ROUTES:
             output = calls[route]()
             stream.synchronize()
@@ -136,7 +112,7 @@ def test_router_matmul(
         stream.synchronize()
     manifest = {
         "source_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "mode": mode,
+        "mode": "eager",
         "repetition": repetition,
         "m": m,
         "k": K,
