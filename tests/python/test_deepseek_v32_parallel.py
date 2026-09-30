@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
 from xllm.python.model_executor.forward_context import (  # noqa: E402
@@ -162,7 +163,14 @@ def _make_moe(
         moe_tp_size=moe_tp_size,
         world_size=max(ep_size, 1) * dp_size,
     )
-    return DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
+    moe = DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
+
+    # These tests cover DP/EP layout on CPU, not the NPU-only mixed-dtype addmm.
+    def _gate_reference(hidden: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden.to(torch.bfloat16).float(), moe.gate.weight.float())
+
+    moe.gate.forward = _gate_reference
+    return moe
 
 
 class TestDeepseekV3MoEConstruction:
