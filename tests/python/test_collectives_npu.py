@@ -34,7 +34,7 @@ def _gather_payload(shape: tuple[int, ...], rank: int, strided: bool, offset: in
 
 
 def _run_current_stream_gather(rank: int, devices: tuple[int, int], rendezvous_path: str) -> None:
-    import torch_npu  # noqa: F401
+    import torch_npu
 
     device = torch.device(f"npu:{devices[rank]}")
     torch.npu.set_device(device)
@@ -70,10 +70,20 @@ def _run_current_stream_gather(rank: int, devices: tuple[int, int], rendezvous_p
             first_values: torch.Tensor | None = None
             for offset in (0, 20):
                 local = _gather_payload(shape, rank, strided, offset).to(device)
+                original_format = torch_npu.get_npu_format(local)
+                # Native current-stream HCCL requires ND, not just logical contiguity.
+                local = torch_npu.npu_format_cast(local, 2)
                 if strided:
-                    backing = torch.empty((*shape[:-1], shape[-1] * 2), dtype=local.dtype, device=device)
+                    backing = torch_npu.npu_format_cast(
+                        torch.empty((*shape[:-1], shape[-1] * 2), dtype=local.dtype, device=device), 2
+                    )
                     backing[..., 1::2].copy_(local)
                     local = backing[..., 1::2]
+                assert torch_npu.get_npu_format(local) == 2
+                print(
+                    f"rank={rank} shape={shape} dim={dim} strided={strided} input_format={original_format}->ND",
+                    flush=True,
+                )
                 original = local.cpu()
                 gathered = collectives.all_gather(local, dim, 2)
                 # Consume immediately on the current stream, without a host wait.
