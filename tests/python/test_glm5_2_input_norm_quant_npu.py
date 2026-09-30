@@ -235,6 +235,14 @@ def test_dynamic_preprocess_rejects_invalid_input_representation(npu_device: tor
         assert (inputs[name].cpu() == _SENTINEL).all()
 
 
+def test_cache_rope_zero_angle_interleaves_half_split_input(npu_device: torch.device) -> None:
+    value = torch.arange(_ROPE_DIM, dtype=torch.bfloat16).reshape(1, 1, 1, _ROPE_DIM).to(npu_device)
+    actual = torch_npu.npu_interleave_rope(value, torch.ones_like(value), torch.zeros_like(value))
+    expected = torch.stack((torch.arange(_ROPE_DIM // 2), torch.arange(_ROPE_DIM // 2, _ROPE_DIM)), dim=-1)
+    logger.info("zero-angle RoPE first eight coefficients: %s", actual.cpu().reshape(-1)[:8].tolist())
+    torch.testing.assert_close(actual.cpu().reshape(-1), expected.reshape(-1).to(torch.bfloat16), rtol=0, atol=0)
+
+
 def test_shared_int64_slots_write_only_current_destinations(npu_device: torch.device) -> None:
     from xllm.python.kernels_npu import mla
 
@@ -264,11 +272,14 @@ def test_shared_int64_slots_write_only_current_destinations(npu_device: torch.de
             latent = current_kv.cpu()[:, :_KV_LORA_RANK].float()
             normalized = latent * torch.rsqrt(latent.square().mean(dim=-1, keepdim=True) + _EPS)
             expected_kv, expected_rope = _new_caches(torch.device("cpu"))
+            # Zero-angle interleave RoPE still reorders half-split pairs to adjacent pairs.
+            interleaved_rope = current_kv.cpu()[:, _KV_LORA_RANK:].reshape(_TOKENS, 2, _ROPE_DIM // 2)
+            interleaved_rope = interleaved_rope.transpose(1, 2).reshape(_TOKENS, _ROPE_DIM)
             for row, destination in enumerate(destinations):
                 if destination < 0:
                     continue
                 expected_kv.flatten(0, 1)[destination, 0] = normalized[row].to(torch.bfloat16)
-                expected_rope.flatten(0, 1)[destination, 0] = current_kv.cpu()[row, _KV_LORA_RANK:]
+                expected_rope.flatten(0, 1)[destination, 0] = interleaved_rope[row]
             torch.testing.assert_close(actual_kv.cpu(), expected_kv, rtol=1e-2, atol=1e-2)
             torch.testing.assert_close(actual_rope.cpu(), expected_rope, rtol=0, atol=0)
             untouched = torch.ones(256, dtype=torch.bool)
