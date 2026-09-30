@@ -41,6 +41,7 @@ class _DecoderLayer(nn.Module):
         super().__init__()
         self._layer_id = layer_id
         self._events = events
+        self.self_attn = SimpleNamespace(_dynamic_mla_ready=False)
         self.rope: tuple[torch.Tensor, ...] | None = None
         self.query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None
         self.prev_topk: torch.Tensor | None = None
@@ -56,7 +57,9 @@ class _DecoderLayer(nn.Module):
         rope_sin: torch.Tensor,
         query_cos_sin: tuple[torch.Tensor, torch.Tensor],
         prev_topk: torch.Tensor | None,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert slot_mapping_int64 is None
         self.rope = (half_rope_cos, half_rope_sin, rope_cos, rope_sin)
         self.query_cos_sin = query_cos_sin
         self.prev_topk = prev_topk
@@ -105,7 +108,11 @@ def _make_model(events: list[str]) -> tuple[glm5_2.Glm52Model, list[_DecoderLaye
     model = glm5_2.Glm52Model.__new__(glm5_2.Glm52Model)
     nn.Module.__init__(model)
     layers = [_DecoderLayer(layer_id, events) for layer_id in range(2)]
-    model.cfg = SimpleNamespace(indexer_rope_interleave=True, enable_attn_dp_weight_sharding=False)
+    model.cfg = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        indexer_rope_interleave=True,
+        enable_attn_dp_weight_sharding=False,
+    )
     model.embed_tokens = _Embedding(events)
     model.layers = nn.ModuleList(layers)
     model.norm = _Norm(events)
