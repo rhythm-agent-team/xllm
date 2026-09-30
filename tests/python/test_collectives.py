@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from datetime import timedelta
@@ -259,6 +260,104 @@ def test_npu_gather_preserves_rank_order_with_embedded_runtime(monkeypatch: pyte
     actual = collectives.tp_all_gather(peers[1], dim, 3)
     torch.testing.assert_close(actual, torch.cat(peers, dim=dim), rtol=0, atol=0)
     native_gather.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [
+        ((1, 5), 1),
+        ((1, 5), -1),
+        ((2, 5), 1),
+        ((4, 5), -1),
+        ((2, 5), 0),
+        ((2, 5), -2),
+        ((1, 1, 5), -1),
+        ((1, 2, 5), -1),
+    ],
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_gather_reconstruction_preserves_values_and_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    dim: int,
+    strided: bool,
+) -> None:
+    group = _FakeGroup(1, 3)
+    collectives._groups[("tp", "cpu")] = group
+    base = torch.arange(math.prod(shape) * 2).reshape(*shape[:-1], shape[-1] * 2)
+    local = base[..., 1::2] if strided else base[..., 1::2].contiguous()
+    original = local.clone()
+    peers = [local + 100 * rank for rank in range(group.size())]
+    received: list[torch.Tensor] = []
+
+    def gather(input: torch.Tensor, output: torch.Tensor, group: _FakeGroup) -> None:
+        assert input.is_contiguous()
+        torch.testing.assert_close(input, peers[group.rank()], rtol=0, atol=0)
+        output.copy_(torch.stack(peers))
+        received.append(output)
+
+    monkeypatch.setattr(collectives, "_all_gather", gather)
+    input = peers[1]
+    if strided:
+        backing = torch.empty((*shape[:-1], shape[-1] * 2), dtype=input.dtype)
+        backing[..., 1::2].copy_(input)
+        input = backing[..., 1::2]
+    actual = collectives.all_gather(input, dim, group.size())
+    torch.testing.assert_close(actual, torch.cat(peers, dim=dim), rtol=0, atol=0)
+    torch.testing.assert_close(input, original + 100, rtol=0, atol=0)
+    assert actual.is_contiguous() and actual.dtype == input.dtype
+    assert actual.data_ptr() != input.data_ptr()
+    normalized_dim = dim + len(shape) if dim < 0 else dim
+    aliases_receive = actual.untyped_storage().data_ptr() == received[-1].untyped_storage().data_ptr()
+    assert aliases_receive == (math.prod(shape[:normalized_dim]) == 1)
+
+    saved = actual.clone()
+    other = collectives.all_gather(input, dim, group.size())
+    assert other.data_ptr() != actual.data_ptr()
+    other.fill_(-1)
+    torch.testing.assert_close(actual, saved, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_single_rank_gather_returns_fresh_storage(monkeypatch: pytest.MonkeyPatch, dim: int) -> None:
+    collectives._groups[("tp", "cpu")] = _FakeGroup(0, 1)
+
+    def gather(input: torch.Tensor, output: torch.Tensor, group: _FakeGroup) -> None:
+        output[0].copy_(input)
+
+    monkeypatch.setattr(collectives, "_all_gather", gather)
+    value = torch.arange(5).reshape(1, 5)
+    actual = collectives.all_gather(value, dim, 1)
+    torch.testing.assert_close(actual, value, rtol=0, atol=0)
+    assert actual.data_ptr() != value.data_ptr()
+
+
+@pytest.mark.parametrize("dim", [-3, 2])
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_gather_rejects_invalid_dimension(dim: int, device: str) -> None:
+    collectives._groups[("tp", device)] = _FakeGroup(0, 2)
+    with pytest.raises(IndexError, match="all-gather dimension.*out of range"):
+        collectives.all_gather(torch.empty(1, 5, device=device), dim, 2)
+
+
+@pytest.mark.parametrize("shape,dim", [((1, 5), -1), ((2, 5), 1), ((4, 5), 0), ((1, 1, 5), -1)])
+def test_gather_fake_preserves_shape_and_dtype(shape: tuple[int, ...], dim: int) -> None:
+    value = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+    actual = collectives.all_gather(value, dim, 3)
+    expected_shape = list(shape)
+    expected_shape[dim] *= 3
+    assert actual.shape == tuple(expected_shape)
+    assert actual.dtype == value.dtype and actual.device == value.device
+    assert actual.is_contiguous()
+
+
+def test_gather_rejects_missing_group_and_world_size_mismatch() -> None:
+    value = torch.ones(1, 5)
+    with pytest.raises(RuntimeError, match="before its process group was initialized"):
+        collectives.all_gather(value, 1, 2)
+    collectives._groups[("tp", "cpu")] = _FakeGroup(0, 3)
+    with pytest.raises(RuntimeError, match="world-size mismatch"):
+        collectives.all_gather(value, 1, 2)
 
 
 def test_npu_variable_gather_preserves_empty_rank_and_padding(monkeypatch: pytest.MonkeyPatch) -> None:
