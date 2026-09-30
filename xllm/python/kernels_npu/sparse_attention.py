@@ -243,10 +243,6 @@ def sparse_flash_attention(
     * RoPE MLA (DeepSeek-V3/V4, GLM-5.2): the rotary part is in
       ``query_rope``/``key_rope``; the op applies it within the absorbed
       MLA contract.
-
-    The legacy custom ``xllm_ops::sparse_flash_attention`` op is deprecated
-    on newer CANN builds (its kernel symbol is no longer loadable); both
-    flavours therefore go through the CANN op.
     """
     # attention_mode=2 = MLA-absorb. query_rope/key_rope carry the decoupled
     # RoPE for DeepSeek/GLM-5.2 (None for GLM-5.3 NoPE). On older CANN this
@@ -293,8 +289,6 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
-    # Route through the CANN npu op; xllm_ops::sparse_flash_attention_out is
-    # deprecated on newer CANN builds (its kernel symbol is no longer loadable).
     # attention_mode=2 = MLA-absorb; the caller passes the decoupled RoPE via
     # query_rope/key_rope (None for NoPE models). The npu op returns a fresh
     # output tensor; copy it into the caller-provided ``output`` buffer to

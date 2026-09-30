@@ -217,8 +217,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_gating_top_k_hash(
 std::tuple<torch::Tensor, torch::Tensor> sparse_attn_sharedkv(
     SparseAttnSharedkvParams& params);
 
-torch::Tensor sparse_flash_attention(SparseFlashAttentionParams& params);
-
 std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,

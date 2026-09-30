@@ -336,39 +336,6 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     c10::string_view layout_kv,
     bool return_softmax_lse);
 
-at::Tensor sparse_flash_attention(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    const c10::optional<at::Tensor>& block_table,
-    const c10::optional<at::Tensor>& actual_seq_lengths_query,
-    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<at::Tensor>& query_rope,
-    const c10::optional<at::Tensor>& key_rope,
-    double scale_value,
-    int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
-    int64_t sparse_mode);
-
-at::Tensor sparse_flash_attention_out(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    const c10::optional<at::Tensor>& block_table,
-    const c10::optional<at::Tensor>& actual_seq_lengths_query,
-    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<at::Tensor>& query_rope,
-    const c10::optional<at::Tensor>& key_rope,
-    double scale_value,
-    int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
-    int64_t sparse_mode,
-    at::Tensor& output);
-
 std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
     const at::Tensor& query,
     const at::Tensor& key,

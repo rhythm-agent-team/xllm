@@ -1842,23 +1842,6 @@ struct SparseAttnSharedkvParams {
   bool return_softmax_lse = false;
 };
 
-struct SparseFlashAttentionParams {
-  torch::Tensor query;
-  torch::Tensor key;
-  torch::Tensor value;
-  torch::Tensor sparse_indices;
-  c10::optional<torch::Tensor> block_table;
-  c10::optional<torch::Tensor> actual_seq_lengths_query;
-  c10::optional<torch::Tensor> actual_seq_lengths_kv;
-  c10::optional<torch::Tensor> query_rope;
-  c10::optional<torch::Tensor> key_rope;
-  double scale_value = 1.0;
-  int64_t sparse_block_size = 0;
-  std::string layout_query;
-  std::string layout_kv;
-  int64_t sparse_mode = 0;
-};
-
 struct CompressorParams {
   torch::Tensor x;
   torch::Tensor wkv;

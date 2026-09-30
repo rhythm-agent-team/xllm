@@ -593,19 +593,6 @@ TORCH_LIBRARY(xllm_ops, m) {
       "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) -> "
       "()");
   m.def(
-      "sparse_flash_attention(Tensor query, Tensor key, Tensor value, Tensor "
-      "sparse_indices, Tensor? block_table, Tensor? actual_seq_lengths_query, "
-      "Tensor? actual_seq_lengths_kv, Tensor? query_rope, Tensor? key_rope, "
-      "float scale_value, int sparse_block_size, str layout_query, str "
-      "layout_kv, int sparse_mode) -> Tensor");
-  m.def(
-      "sparse_flash_attention_out(Tensor query, Tensor key, Tensor value, "
-      "Tensor sparse_indices, Tensor? block_table, Tensor? "
-      "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
-      "query_rope, Tensor? key_rope, float scale_value, int "
-      "sparse_block_size, str layout_query, str layout_kv, int sparse_mode, "
-      "Tensor(a!) output) -> Tensor(a!)");
-  m.def(
       "sparse_flash_attention_lse(Tensor query, Tensor key, Tensor value, "
       "Tensor sparse_indices, Tensor? block_table, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
@@ -738,10 +725,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("lightning_indexer_out",
          TORCH_FN(xllm::kernel::npu::lightning_indexer_out));
   m.impl("scatter_nd_update", TORCH_FN(xllm::kernel::npu::scatter_nd_update));
-  m.impl("sparse_flash_attention",
-         TORCH_FN(xllm::kernel::npu::sparse_flash_attention));
-  m.impl("sparse_flash_attention_out",
-         TORCH_FN(xllm::kernel::npu::sparse_flash_attention_out));
   m.impl("mla_preprocess_v2", TORCH_FN(xllm::kernel::npu::mla_preprocess_v2));
   m.impl("moe_gating_top_k_hash",
          TORCH_FN(xllm::kernel::npu::moe_gating_top_k_hash));

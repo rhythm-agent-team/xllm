@@ -604,76 +604,6 @@ def _scatter_nd_update_fake(
     del var, indices, updates
 
 
-def _sparse_flash_attention_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    sparse_indices: torch.Tensor,
-    block_table: torch.Tensor | None,
-    actual_seq_lengths_query: torch.Tensor | None,
-    actual_seq_lengths_kv: torch.Tensor | None,
-    query_rope: torch.Tensor | None,
-    key_rope: torch.Tensor | None,
-    scale_value: float,
-    sparse_block_size: int,
-    layout_query: str,
-    layout_kv: str,
-    sparse_mode: int,
-) -> torch.Tensor:
-    del (
-        key,
-        value,
-        sparse_indices,
-        block_table,
-        actual_seq_lengths_query,
-        actual_seq_lengths_kv,
-        query_rope,
-        key_rope,
-        scale_value,
-        sparse_block_size,
-        layout_query,
-        layout_kv,
-        sparse_mode,
-    )
-    return query.new_empty(query.shape, dtype=query.dtype)
-
-
-def _sparse_flash_attention_out_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    sparse_indices: torch.Tensor,
-    block_table: torch.Tensor | None,
-    actual_seq_lengths_query: torch.Tensor | None,
-    actual_seq_lengths_kv: torch.Tensor | None,
-    query_rope: torch.Tensor | None,
-    key_rope: torch.Tensor | None,
-    scale_value: float,
-    sparse_block_size: int,
-    layout_query: str,
-    layout_kv: str,
-    sparse_mode: int,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    del (
-        query,
-        key,
-        value,
-        sparse_indices,
-        block_table,
-        actual_seq_lengths_query,
-        actual_seq_lengths_kv,
-        query_rope,
-        key_rope,
-        scale_value,
-        sparse_block_size,
-        layout_query,
-        layout_kv,
-        sparse_mode,
-    )
-    return output
-
-
 # ---------------------------------------------------------------------------
 # DeepSeek-V4 DSA kernel fakes
 # ---------------------------------------------------------------------------
@@ -1168,8 +1098,6 @@ register_fake(
 register_fake("xllm_ops::lightning_indexer", _lightning_indexer_fake)
 register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
-register_fake("xllm_ops::sparse_flash_attention", _sparse_flash_attention_fake)
-register_fake("xllm_ops::sparse_flash_attention_out", _sparse_flash_attention_out_fake)
 register_fake("xllm_ops::rms_norm_dynamic_quant", _rms_norm_dynamic_quant_fake)
 register_fake(
     "xllm_ops::npu_inplace_partial_rotary_mul",
