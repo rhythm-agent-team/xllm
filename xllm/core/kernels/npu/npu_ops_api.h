@@ -145,6 +145,9 @@ torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
 
+torch::Tensor matmul_16in32out(const torch::Tensor& x1,
+                               const torch::Tensor& x2);
+
 torch::Tensor matmul_reduce_scatter(
     const torch::Tensor& a,
     const torch::Tensor& b,

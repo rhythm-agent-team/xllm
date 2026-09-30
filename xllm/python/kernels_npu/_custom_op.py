@@ -100,6 +100,22 @@ def _atb_matmul_ein_sum_fake(input: torch.Tensor, weight: torch.Tensor) -> torch
     return input.new_empty((input.shape[0], input.shape[1], weight.shape[2]))
 
 
+def _matmul_16in32out_fake(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    if x1.ndim != 2 or x2.ndim != 2:
+        raise ValueError("matmul_16in32out expects 2-D operands")
+    if x1.numel() == 0 or x2.numel() == 0:
+        raise ValueError("matmul_16in32out requires nonempty operands")
+    if x1.dtype != torch.bfloat16 or x2.dtype != x1.dtype:
+        raise ValueError("matmul_16in32out requires matching BF16 operands")
+    if x1.device.type != "npu" or x1.device != x2.device:
+        raise ValueError("matmul_16in32out requires operands on the same NPU")
+    if x1.shape[1] != x2.shape[0]:
+        raise ValueError("matmul_16in32out reduction dimension mismatch")
+    if not x1.is_contiguous() or not x2.is_contiguous():
+        raise ValueError("matmul_16in32out requires contiguous operands")
+    return x1.new_empty((x1.shape[0], x2.shape[1]), dtype=torch.float32)
+
+
 def _chunk_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1062,6 +1078,7 @@ register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::rms_norm_gated", _rms_norm_gated_fake)
 register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
+register_fake("xllm_ops::matmul_16in32out", _matmul_16in32out_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
 register_fake("xllm_ops::causal_conv1d_qkv_prefill", _causal_conv1d_qkv_prefill_fake)
 register_fake(
