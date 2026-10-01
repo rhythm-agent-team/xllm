@@ -39,6 +39,7 @@ def _metadata(rows: int) -> SimpleNamespace:
         paged_kv_indptr=None,
         paged_kv_indices=None,
         paged_kv_last_page_len=None,
+        linear_state_indices=None,
         is_prefill=False,
         is_chunked_prefill=False,
         is_spec_verify=False,
