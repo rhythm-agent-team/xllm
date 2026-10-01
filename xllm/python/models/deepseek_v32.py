@@ -1009,6 +1009,7 @@ class DeepseekV3MLAAttention(Attention):
         rope_sin: torch.Tensor,
         context: MlaPreprocessContext,
         hidden_scale: torch.Tensor | None = None,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
         self._validate_hidden_scale(hidden, hidden_scale)
         projection = self._a_projection()
@@ -1038,6 +1039,7 @@ class DeepseekV3MLAAttention(Attention):
                 self.kv_a_layernorm.eps,
                 fuse_q_norm_quant,
                 hidden_scale,
+                slot_mapping_int64[: hidden.shape[0]] if slot_mapping_int64 is not None else None,
             )
             if fuse_q_norm_quant:
                 q_c = (q_c, q_c_scale)
@@ -1153,13 +1155,16 @@ class DeepseekV3MLAAttention(Attention):
         prev_topk: torch.Tensor | None = None,
         reuse_topk: bool = False,
         hidden_scale: torch.Tensor | None = None,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_hidden_scale(hidden, hidden_scale)
         num_tokens = hidden.shape[0]
         backend = get_forward_context().attention_backend
         preprocess = backend.mla_preprocess_context(self) if self._can_fuse_decode() else None
         if preprocess is not None:
-            q_c, q_latent, q_pe = self._preprocess_decode(hidden, rope_cos, rope_sin, preprocess, hidden_scale)
+            q_c, q_latent, q_pe = self._preprocess_decode(
+                hidden, rope_cos, rope_sin, preprocess, hidden_scale, slot_mapping_int64
+            )
             topk = self._select_topk(
                 hidden,
                 q_c,
@@ -1213,6 +1218,7 @@ class DeepseekV3MLAAttention(Attention):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         hidden_scale: torch.Tensor | None = None,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, _ = self._forward_with_topk(
             hidden,
@@ -1221,6 +1227,7 @@ class DeepseekV3MLAAttention(Attention):
             rope_cos,
             rope_sin,
             hidden_scale=hidden_scale,
+            slot_mapping_int64=slot_mapping_int64,
         )
         return output
 
@@ -1977,6 +1984,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         prev_topk_indices: torch.Tensor | None = None,
         reuse_topk_indices: bool = False,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_scale: torch.Tensor | None = None
         if residual is None:
@@ -1998,6 +2006,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             prev_topk_indices,
             reuse_topk_indices,
             hidden_scale,
+            slot_mapping_int64,
         )
         fused_dense_input: tuple[torch.Tensor, torch.Tensor] | None = None
         if self._fuse_dense_norm_quant:
@@ -2028,8 +2037,11 @@ class DeepseekV3DecoderLayer(nn.Module):
         prev_topk: torch.Tensor | None,
         reuse_topk: bool,
         hidden_scale: torch.Tensor | None = None,
+        slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self.self_attn(hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin, hidden_scale), None
+        return self.self_attn(
+            hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin, hidden_scale, slot_mapping_int64
+        ), None
 
 
 class DeepseekV3Model(nn.Module):
@@ -2081,6 +2093,9 @@ class DeepseekV3Model(nn.Module):
     def _indexer_interleaved(self) -> bool:
         return False
 
+    def _prepare_mla_slots(self) -> torch.Tensor | None:
+        return None
+
     def _prepare_layer_inputs(
         self, hidden: torch.Tensor, positions: torch.Tensor, cp_context: CpContext | None
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, torch.Tensor]]:
@@ -2098,11 +2113,14 @@ class DeepseekV3Model(nn.Module):
         hidden = self.embed_tokens(input_ids)
         cp_context = self._cp_context()
         hidden, rope, query_cos_sin = self._prepare_layer_inputs(hidden, positions, cp_context)
+        slot_mapping_int64 = self._prepare_mla_slots()
         residual: torch.Tensor | None = None
         topk: torch.Tensor | None = None
         aux = self.aux_hidden_capture.create_buffer(hidden)
         for layer_id, layer in enumerate(self.layers):
-            hidden, residual, topk = layer(hidden, residual, *rope, query_cos_sin, topk)
+            hidden, residual, topk = layer(
+                hidden, residual, *rope, query_cos_sin, topk, slot_mapping_int64=slot_mapping_int64
+            )
             self.aux_hidden_capture.capture_layer(layer_id, hidden, residual, aux)
             self._record_layer_event(layer_id)
         hidden, _ = self.norm(hidden, residual)

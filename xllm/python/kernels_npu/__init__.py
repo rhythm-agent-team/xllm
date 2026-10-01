@@ -49,6 +49,7 @@ _EXPORTS = {
         "prepare_mla_preprocess_v2_q_b",
         "prepare_mla_preprocess_v2_qkv",
         "supports_mla_preprocess_v2",
+        "supports_mla_kv_cache_slot_reuse",
     ),
     "moe": (
         "cutlass_fused_moe",
@@ -155,6 +156,7 @@ __all__ = [
     "prepare_mla_preprocess_v2_q_b",
     "prepare_mla_preprocess_v2_qkv",
     "supports_mla_preprocess_v2",
+    "supports_mla_kv_cache_slot_reuse",
     "quant_matmul",
     "quant_matmul_out",
     "supports_quant_matmul_out",

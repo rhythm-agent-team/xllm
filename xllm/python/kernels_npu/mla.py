@@ -202,6 +202,11 @@ def _mla_cache_mode(kv_cache: torch.Tensor) -> str:
     return "PA"
 
 
+def supports_mla_kv_cache_slot_reuse(kv_cache: torch.Tensor) -> bool:
+    """Whether this cache writer consumes the model's shared INT64 slots."""
+    return _KV_RMSNORM_ROPE_CACHE is not None and _mla_cache_mode(kv_cache) == "PA"
+
+
 def _write_mla_kv_cache(
     kv: torch.Tensor,
     kv_norm_weight: torch.Tensor,
@@ -213,6 +218,7 @@ def _write_mla_kv_cache(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     kv_norm_epsilon: float,
+    slot_mapping_int64: torch.Tensor | None = None,
 ) -> None:
     """Normalize and rotate MLA KV, then write it into the paged cache."""
     num_tokens = kv.shape[0]
@@ -221,6 +227,13 @@ def _write_mla_kv_cache(
     # operator currently accepts PA_NZ only as a physically packed ND tensor,
     # so keep the established cache writer for the internal-format variant.
     if _KV_RMSNORM_ROPE_CACHE is not None and cache_mode == "PA":
+        if slot_mapping_int64 is not None and (
+            slot_mapping_int64.dtype != torch.int64
+            or slot_mapping_int64.shape != slot_mapping.shape
+            or slot_mapping_int64.device != slot_mapping.device
+            or not slot_mapping_int64.is_contiguous()
+        ):
+            raise ValueError("prepared MLA slots must be contiguous INT64 matching the original slot mapping")
         kv_no_split = kv.view(
             num_tokens,
             1,
@@ -232,7 +245,7 @@ def _write_mla_kv_cache(
             kv_norm_weight,
             rope_cos,
             rope_sin,
-            slot_mapping.to(torch.int64),
+            slot_mapping.to(torch.int64) if slot_mapping_int64 is None else slot_mapping_int64,
             rope_cache,
             kv_cache,
             epsilon=kv_norm_epsilon,
@@ -380,6 +393,7 @@ def deepseek_mla_preprocess_decode_dynamic(
     kv_norm_epsilon: float,
     fuse_q_norm_quant: bool,
     hidden_scale: torch.Tensor | None = None,
+    slot_mapping_int64: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Preprocess MLA and return Q-A and the activation scale used by Q-B.
 
@@ -442,6 +456,7 @@ def deepseek_mla_preprocess_decode_dynamic(
         kv_lora_rank,
         qk_rope_head_dim,
         kv_norm_epsilon,
+        slot_mapping_int64,
     )
     return q_c, q_c_scale, q_latent, q_pe
 
@@ -470,6 +485,7 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     kv_norm_epsilon: float,
     fuse_q_norm_quant: bool,
     hidden_scale: torch.Tensor | None = None,
+    slot_mapping_int64: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del (
         qkv_weight,
