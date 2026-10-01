@@ -22,6 +22,7 @@ around them; process-group rendezvous and topology remain shared.
 from __future__ import annotations
 
 import json
+import math
 import socket
 from collections.abc import Sequence
 from datetime import timedelta
@@ -357,18 +358,32 @@ def _(x: torch.Tensor, group_name: str = "tp") -> None:
     return None
 
 
+def _normalize_gather_dim(x: torch.Tensor, dim: int) -> int:
+    if not -x.ndim <= dim < x.ndim:
+        raise IndexError(f"all-gather dimension {dim} out of range for {x.ndim}-D input")
+    return dim + x.ndim if dim < 0 else dim
+
+
 @torch.library.custom_op("xllm_ops::all_gather", mutates_args=())
 def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
     group = _require_group(x, group_name)
     if group.size() != world_size:
         raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
-    gathered = x.new_empty((world_size, *x.shape))
+    dim = _normalize_gather_dim(x, dim)
+    # HCCL receives a flat ND buffer; adding rank to a 3-D shape can select NCHW storage.
+    gathered = x.new_empty((world_size * x.numel(),)).view(world_size, *x.shape)
     _all_gather(x.contiguous(), gathered, group=group)
+    if math.prod(x.shape[:dim]) == 1:
+        # Rank-major storage already has concatenation order for this layout.
+        shape = list(x.shape)
+        shape[dim] *= world_size
+        return gathered.view(shape)
     return torch.cat(gathered.unbind(0), dim=dim)
 
 
 @all_gather.register_fake
 def _(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    dim = _normalize_gather_dim(x, dim)
     shape = list(x.shape)
     shape[dim] *= world_size
     return x.new_empty(shape)
