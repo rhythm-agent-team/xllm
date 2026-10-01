@@ -230,6 +230,8 @@ def test_native_gmm2_temporary_output_reaches_unpermute(npu_device: torch.device
         probs = torch.full((rows, 2), 0.5, dtype=torch.bfloat16, device=npu_device)
         weight = moe.format_cast_nz(torch.randint(-3, 4, (4, 128, 128), dtype=torch.int8, device=npu_device))
         weight_scale = torch.full((4, 128), 1 / 64, dtype=torch.bfloat16, device=npu_device)
+        # Sparse groups place active experts before the zero-count tail.
+        expert_ids = torch.tensor([0, 2, 1, 3], device=npu_device, dtype=torch.int64)
         state = AclGraphExecutionState({})
 
         def run(
@@ -238,6 +240,7 @@ def test_native_gmm2_temporary_output_reaches_unpermute(npu_device: torch.device
             probs: torch.Tensor = probs,
             weight: torch.Tensor = weight,
             weight_scale: torch.Tensor = weight_scale,
+            expert_ids: torch.Tensor = expert_ids,
             state: AclGraphExecutionState | None = state,
         ) -> torch.Tensor:
             with forward_context(ForwardContext(None, npu_device, None, [], execution_state=state)):
@@ -254,8 +257,6 @@ def test_native_gmm2_temporary_output_reaches_unpermute(npu_device: torch.device
                 )
                 if group_list_type == 2:
                     counts = torch.diff(torch.cat((groups.new_zeros(1), groups)))
-                    # Sparse groups place active experts before the zero-count tail.
-                    expert_ids = torch.tensor([0, 2, 1, 3], device=npu_device, dtype=torch.int64)
                     groups = torch.stack((expert_ids, counts.index_select(0, expert_ids)), -1)
                 output = moe._grouped_matmul_gmm2(
                     act_i8=routed,
