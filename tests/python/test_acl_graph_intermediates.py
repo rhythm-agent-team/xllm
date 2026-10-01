@@ -384,7 +384,8 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
             uv: list[torch.Tensor] = uv,
             ctx: SimpleNamespace = ctx,
             state: AclGraphExecutionState | None = state,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return_topk: bool = False,
+        ) -> tuple[torch.Tensor, ...]:
             with forward_context(
                 ForwardContext(
                     backend,
@@ -410,7 +411,8 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
                         q, q_rope, caches[layer_id], rope_caches[layer_id], topk, blocks, q_ends, kv_lengths, layer_id
                     )
                     projected.append(kernels.atb_matmul_ein_sum(attention, uv[layer_id]))
-                return topk, *projected
+                # Do not retain captured TopK as a graph output.
+                return (topk, *projected) if return_topk else tuple(projected)
 
         for _ in range(3):
             run()
@@ -433,14 +435,15 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
         q.copy_(torch.randn_like(q) / 8)
         for cache in caches:
             cache.copy_(torch.randn_like(cache))
-        eager = run(state=None)
+        eager = run(state=None, return_topk=True)
         graph.replay()
         torch.npu.synchronize()
-        assert actual[0].shape == (q.shape[0], 1, 2048) and actual[0].dtype == torch.int32
+        assert len(actual) == 2
+        assert eager[0].shape == (q.shape[0], 1, 2048) and eager[0].dtype == torch.int32
+        # Check eager indices directly; captured indices remain local to consumers.
         # topk exceeds every causal prefix: all visible tokens occur once and
         # padding is -1. Neither indexer scores nor another out call is the oracle.
-        indices = actual[0].cpu()
-        eager_indices = eager[0].cpu()
+        indices = eager[0].cpu()
         for row in range(q.shape[0]):
             visible = 128 - q.shape[0] + row + 1
             torch.testing.assert_close(
@@ -450,7 +453,6 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
                 atol=0,
             )
             assert indices[row, 0][indices[row, 0] < 0].eq(-1).all()
-            torch.testing.assert_close(indices[row].sort().values, eager_indices[row].sort().values, rtol=0, atol=0)
         for layer_id in (0, 1):
             query, query_rope = q.cpu().float(), q_rope.cpu().float()
             keys = caches[layer_id].cpu().float().view(128, 512)
@@ -462,10 +464,10 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
             logits.masked_fill_(~causal[:, None, :], float("-inf"))
             attention = torch.einsum("thk,kd->thd", logits.softmax(-1), keys).to(torch.bfloat16).float()
             reference = torch.einsum("thd,hdo->tho", attention, uv[layer_id].cpu().float())
-            assert actual[layer_id + 1].shape == (q.shape[0], 4, 128)
-            assert actual[layer_id + 1].dtype == torch.bfloat16
-            torch.testing.assert_close(actual[layer_id + 1].cpu().float(), reference, rtol=5e-2, atol=5e-2)
-            torch.testing.assert_close(actual[layer_id + 1], eager[layer_id + 1], rtol=2e-2, atol=2e-2)
+            assert actual[layer_id].shape == (q.shape[0], 4, 128)
+            assert actual[layer_id].dtype == torch.bfloat16
+            torch.testing.assert_close(actual[layer_id].cpu().float(), reference, rtol=5e-2, atol=5e-2)
+            torch.testing.assert_close(actual[layer_id], eager[layer_id + 1], rtol=2e-2, atol=2e-2)
         assert not state.persistent_buffers
         for previous_id, snapshot in snapshots.items():
             if previous_id != entry_id:
