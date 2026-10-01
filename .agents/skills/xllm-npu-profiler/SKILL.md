@@ -1,6 +1,6 @@
 ---
 name: xllm-npu-profiler
-description: Generate an end-to-end profiling trace of an xLLM Ascend NPU server run, export a Chrome-compatible timeline, and analyze it in Perfetto. Use for NPU profiling or visualization of existing traces, not scheduler latency prediction sampling.
+description: Capture and export xLLM Ascend NPU traces, or analyze existing traces in Perfetto.
 ---
 
 <!-- Copyright 2026 The xLLM Authors. SPDX-License-Identifier: Apache-2.0 -->
@@ -27,16 +27,17 @@ The **execution environment** is the host or container running xLLM; the
 
 | Agent location | How to execute the workflow |
 |---|---|
-| On the NPU server, with xLLM running on the host | Run capture/export commands directly in the server shell. No SSH or container is required. |
+| On the NPU server, with xLLM running on the host | Run capture and export commands directly in the server shell. No SSH or container is required. |
 | Already inside the xLLM container | Run commands there directly; do not SSH back to the host or enter another container. |
 | On the server host, with xLLM in a container | Enter the service container to use its tools and PID namespace. |
 | On another machine | Connect to the NPU server through SSH, then enter a container only if the deployment uses one. |
 
-Resolve checkout paths and script locations from the deployment. If synchronizing
-between two checkouts, compare branches, HEADs, and relevant uncommitted contents;
-a single-checkout run does not need a second checkout or synchronization. Build
-with `python setup.py build` in the configured build environment only if needed.
-Record the executable actually used; a prebuilt binary does not validate a new build.
+Resolve checkout paths and script locations from the deployment. Record source and
+native artifact identities as described in [capture setup](references/capture.md#1-confirm-the-execution-environment).
+Reuse existing native artifacts when their native inputs, build configuration and
+runtime environment still match. Python-only model edits that do not change native
+inputs need a service restart, not recompilation; rebuild affected artifacts when
+native inputs change. A prebuilt binary does not validate a new build.
 
 A headless server can complete capture, export, and optional Trace Processor SQL
 analysis. Return server artifact paths and transfer instructions for later UI
@@ -70,19 +71,15 @@ for environment checks and launch pitfalls.
 
 Poll the deployment's readiness endpoint with a bounded timeout, inspect startup
 logs, and send warmup requests. Stop on startup or request errors. An open port
-alone does not prove that model execution or first-request HCCL setup works.
-Complete graph capture and compilation warmup before starting profiling.
+alone does not prove that model requests work. Complete graph capture and
+compilation warmup before starting profiling.
 
 ### Step 3: Validate the workload
 
-Verify that a representative request succeeds and returns plausible model output.
-Use an existing small accuracy check when the task requires accuracy validation;
-choose expectations for the actual model rather than imposing a universal score.
-Do not profile a known-broken workload as a successful run.
-
-Record actual input/output token counts, concurrency, prefix-cache conditions,
-and early EOS behavior in `workload.log`. A successful request is a sanity check,
-not a full accuracy benchmark.
+Verify that the requests match the intended workload. Record actual input and
+output token counts, concurrency, prefix-cache settings, and early EOS behavior
+in `workload.log`. If accuracy validation is requested, run the relevant accuracy
+check before profiling; request success alone does not establish model accuracy.
 
 ### Step 4: Capture and export the profile
 
@@ -92,38 +89,30 @@ for executable commands. The required order is:
 1. Attach `msprof --dynamic=on` to the verified service parent PID in the same
    PID namespace, using a fresh output directory.
 2. Wait for attachment readiness and enter `start`.
-3. Run the measured workload and verify all requests completed successfully.
+3. Run the profiling workload and verify all requests completed successfully.
 4. Enter `stop`, confirm capture stopped, then enter `quit`. Wait for collector
    exit and data flush before exporting.
 5. Export **every** `PROF_*` directory with `msprof --export=on` and retain logs.
 
-Inspect `WorkerImpl::start_profile/stop_profile` in
-`xllm/core/runtime/worker_impl.cpp` before choosing another capture mechanism.
-The NPU path did not support the online HTTP profiler when this skill was added;
-do not assume CUDA `/start_profile`, `/stop_profile`, or `--profile_dir` applies.
-`enable_profile_step_time` and `ProfileManager` latency tables are not device traces.
+For other profiling methods, check the current implementations of
+`WorkerImpl::start_profile` and `WorkerImpl::stop_profile` in
+`xllm/core/runtime/worker_impl.cpp`.
 
 ### Step 5: Inspect and optionally transfer the timeline
 
 Locate complete `msprof_*.json` files, commonly under
 `PROF_*/mindstudio_profiler_output/`. Existing `trace_view.json` or
 `*.pt.trace.json` files are also candidates if their events are valid. Check for
-nonempty timestamped events and record rank/device, size, and SHA-256. Keep the
+nonempty timestamped events and record rank and device, size, and SHA-256. Keep the
 trace in place if it is already accessible to the viewing machine; otherwise
 transfer it and verify the destination hash. Preserve directories for different ranks.
 
-Open `https://ui.perfetto.dev`, choose **Open trace file**, and load the actual
-timeline accessible to that browser. Confirm nonempty tracks and selectable slices. Inspect a
-representative prefill interval and steady decode steps; save screenshots and
-record the event names, tracks, time windows, and units supporting each conclusion.
-See [Perfetto analysis](references/perfetto.md) for large traces, SQL, and
-interpretation rules.
-
-On a headless server, run optional command-line analysis as described in
-[perfetto.md](references/perfetto.md#headless-server-analysis), and return the
-server path plus a copy command to run on the viewing machine. If browser import
-is unavailable, mark UI validation incomplete and provide manual loading steps.
-CLI parsing or opening the welcome page does not prove browser visualization.
+Use [Perfetto analysis](references/perfetto.md) for command-line or UI inspection.
+When UI inspection is requested and available, open the trace in Perfetto and
+confirm nonempty tracks and selectable slices. Record the events, tracks, time
+windows, units, and screenshots supporting each conclusion. If UI inspection
+was not performed, state that explicitly; command-line parsing does not prove
+browser visualization.
 
 ### Step 6: Clean up and report
 
@@ -131,18 +120,18 @@ Stop collectors and temporary trace processors created for this run. Stop only
 a server started for this task when it is no longer needed; preserve reused
 services and unrelated jobs. Record the service's final state.
 
-Return timeline and report paths with their host/container location, rank/device coverage, capture/export
-status, and whether Perfetto visualization completed. Keep raw `PROF_*` data and
-logs, including failure evidence. A useful artifact layout is:
+Return timeline and report paths, their host or container, rank and device coverage,
+capture and export status, and whether UI inspection was performed. Keep raw
+`PROF_*` data and logs, including failure evidence. A useful artifact layout is:
 
 ```text
 <run_id>/
   manifest.md           # Configuration, versions, executable, commit, parent PID
   capture.log           # Collector commands, timestamps, errors, exit status
-  workload.log          # Warmup and measured request results
+  workload.log          # Warmup and profiling request results
   export.log
   PROF_*/               # Raw data; may remain remote with paths in the manifest
-  timelines/            # Selected exports or verified copies organized by rank/device
+  timelines/            # Selected exports or verified copies organized by rank and device
   timeline_notes.md     # Observations, interval evidence, hypotheses, next steps
   screenshots/          # Overview and selected intervals when UI analysis succeeds
 ```

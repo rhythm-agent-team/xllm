@@ -38,27 +38,19 @@ from `npu-smi`. Record `git remote -v`, `git branch --show-current`,
 `git rev-parse HEAD`, and `git status --short` for the active checkout. When
 synchronizing another checkout, compare these values and relevant uncommitted
 contents too; matching HEADs alone do not prove that running code matches.
+Record `python_model_path` and the hashes and build provenance of the actual
+executable, native extensions, and shared libraries, separately from the source SHA.
 
 Locate and read the deployment's launch and request scripts in the execution environment.
-Treat old scripts as configuration clues: verify the executable,
-`python_model_path`, and current branch, and check platform support for options
-such as cache dtype. Some NPU versions reject `kv_cache_dtype=int8`; do not retain
-it just because an old script uses it. Prefer supported defaults when validating
-the profiling workflow. When reusing a prebuilt executable, record its origin and
-hash and distinguish this from validating a rebuild of the skill branch.
+Treat old scripts as configuration clues: verify the executable, `python_model_path`,
+and requested configuration. If the configuration is unsupported, report it and stop;
+do not silently change options to obtain a trace.
 
 The service launch environment must include `export PROFILING_MODE=dynamic`.
 Verify that the launch script preserves it. If needed, inspect only that variable
 in `/proc/<pid>/environ`, without printing the entire environment. Restart an
 existing service without the variable only within the task's authorization.
 Starting the profiler cannot repair the earlier launch configuration.
-
-The Python model path may create additional HCCL groups on the first request.
-A ready service port does not prove those groups work. A fixed `HCCL_IF_BASE_PORT`
-can cause a bind conflict at this point. Reuse a validated configuration; if logs
-report `Communication_Error_Bind_IP_Port`, inspect the specific address, port,
-and process, and check whether automatic HCCL port selection is appropriate.
-Do not terminate unrelated jobs to release ports.
 
 ## 2. Warm up, then capture a bounded window
 
@@ -85,18 +77,17 @@ consult documentation for that version; do not silently remove essential options
 and still claim complete capture.
 
 Wait for attachment readiness, then enter `start` in terminal A. Confirm capture
-has started, run the measured workload in terminal B where the service endpoint is reachable, and
-save its output and exit status in `workload.log`. After all measured requests
-finish, enter `stop` in A, confirm capture has stopped, then enter `quit`. Wait
-for msprof to exit and flush its data. Record control commands and their times in
-capture.log or the manifest; tee may not record terminal input. Fixed sleeps do
-not replace readiness checks. If a request fails, still stop this capture and
-retain the failure evidence.
+has started, run the profiling workload in terminal B where the service endpoint
+is reachable, and save its output and exit status in `workload.log`. After all
+profiling requests finish, enter `stop` in A, confirm capture has stopped, then
+enter `quit`. Wait for msprof to exit and flush its data. Record control commands
+and their times in `capture.log` or the manifest; tee may not record terminal
+input. Fixed sleeps do not replace readiness checks. If a request fails, stop
+this capture and retain the failure evidence.
 
-For automation, keep an interactive terminal session and send control commands
-at the appropriate stages rather than piping them all at once. If using a FIFO
-script, place it in the deployment's script directory. On failure, stop only this
-collector, close the FIFO, and wait for exit before exporting.
+For automation, send control commands after the corresponding stage is ready,
+rather than piping them all at once. On failure, stop only this collector and
+wait for exit before exporting.
 
 ## 3. Export timelines explicitly
 
@@ -124,8 +115,9 @@ information does not replace a complete kernel timeline.
 Retain original JSON and do not arbitrarily rescale timestamps. Chrome Trace
 commonly uses an event array or an object containing `traceEvents`. Look for timed
 events with `ph`, `ts`, `pid`, and `tid`. Complete slices typically use `ph=X` and
-`dur`; paired `B/E` events are also possible. JSON parsing alone is insufficient:
-verify actual tracks and slices in Perfetto next.
+`dur`; paired `B` and `E` events are also possible. Check that the file contains
+timestamped events; parsing successfully does not prove that useful data was
+captured. For timeline inspection, follow [Perfetto analysis](perfetto.md).
 
 ## 4. Make artifacts accessible to the viewing machine
 
@@ -134,7 +126,7 @@ paths. No download is required for command-line analysis. If the browser already
 has access to those files, open them directly. Transfer is needed only when the
 browser runs on a different machine without access to the trace.
 
-Record the server path and rank/device identity in the manifest. For containers,
+Record the server path, rank, and device in the manifest. For containers,
 also record the corresponding host path. A bind-mounted file is accessible from
 the host; if the export is not mounted, stage only this run's artifacts there:
 
@@ -155,7 +147,7 @@ scp -r developer@npu-host:/host/path/to/exported_device_directory \
   "$VIEW_ARTIFACT_DIR/timelines/"
 ```
 
-Preserve rank/device directories to avoid overwriting files with identical names.
+Preserve rank and device directories to avoid overwriting files with identical names.
 Use `sha256sum` on Linux or `shasum -a 256` on macOS; when transferring, compare
 source and destination hashes. Record byte counts and hashes even when keeping
 files on the server. Raw PROF data may stay in the execution environment; viewing

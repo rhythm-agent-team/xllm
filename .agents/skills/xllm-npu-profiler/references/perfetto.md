@@ -15,12 +15,12 @@ trace_processor query /absolute/path/to/msprof_timestamp.json \
 
 Check the installed version's help for syntax and platform support. If the tool
 is unavailable, validate the exported JSON and provide its absolute server path,
-size, SHA-256, rank/device, and the transfer command from
+size, SHA-256, rank, device, and the transfer command from
 [capture.md](capture.md#4-make-artifacts-accessible-to-the-viewing-machine).
 A second machine or a desktop installation is not required to finish capture.
 
-SQL results can support timeline analysis, but report browser loading and
-screenshots as pending until someone actually opens the trace in Perfetto.
+SQL results support timeline analysis, not a claim that the trace was viewed in
+the browser. If UI inspection was not performed, state that explicitly.
 
 ## Load the actual file
 
@@ -30,7 +30,7 @@ screenshots as pending until someone actually opens the trace in Perfetto.
 2. Wait for parsing and confirm a nonempty timeline, process/thread or device
    stream tracks, and selectable events. Record import warnings. The welcome
    page alone does not mean the trace was loaded.
-3. Start with an overview, then locate steady requests/steps. Search for kernel,
+3. Start with an overview, then locate steady requests or decode steps. Search for kernel,
    HCCL, runtime API, or MSTX names that actually appear. Pin relevant tracks,
    zoom into a window, and inspect slice start times, durations, and arguments.
    Save overview and interval screenshots with rank, phase, and window in filenames.
@@ -42,7 +42,7 @@ Start with a representative rank. Inspect other ranks when investigating
 communication tails or load imbalance. Do not manually concatenate JSON files
 to construct a global timeline across ranks.
 
-## Large files or unavailable file selection
+## Large traces
 
 Perfetto can connect to a local native Trace Processor. Check the installed tool's
 help and the [official large-trace guide](https://perfetto.dev/docs/visualization/large-traces).
@@ -50,20 +50,17 @@ For this browser-connected mode, run it on the **viewing machine**, with the
 trace accessible there, for example:
 
 ```bash
-# Use a separate tools directory; check for an existing installation first.
-curl -fL https://get.perfetto.dev/trace_processor -o trace_processor
-chmod +x trace_processor
-./trace_processor --httpd /absolute/path/to/msprof_timestamp.json
+# Use the installed executable on the viewing machine.
+trace_processor --httpd /absolute/path/to/msprof_timestamp.json
 ```
 
 Some versions also offer `trace_processor server http <trace>`; follow the installed
 version's help. Open Perfetto, select the detected local accelerator, and confirm
 it loaded the intended trace. The default endpoint is `127.0.0.1:9001`; do not bind
-the service publicly to work around file selection. If browser controls run on
-another machine, their localhost is not the capture server. Transfer the trace
-to the viewing machine or retain server-side SQL analysis and report UI validation
-as pending; do not assume a server loopback listener is reachable by that browser. Stop the trace processor
-started for this task when finished.
+the service publicly. If the browser runs on another machine, its localhost is
+not the capture server. Transfer the trace to the viewing machine, or use
+server-side SQL analysis and state that UI inspection was not performed. Stop
+the trace processor started for this task when finished.
 
 ## Cross-check with SQL
 
@@ -83,8 +80,8 @@ ORDER BY total_ms DESC
 LIMIT 40;
 ```
 
-Perfetto SQL uses nanoseconds for `ts/dur`; source Chrome JSON commonly uses
-microseconds. Do not mix units. Select the rank/device/stream and phase before
+Perfetto SQL uses nanoseconds for `ts` and `dur`; source Chrome JSON commonly uses
+microseconds. Do not mix units. Select the rank, device, stream, and phase before
 filtering `track_id` and `ts`. Clip slices crossing window boundaries to the
 selected interval. Nested scopes and concurrent streams cannot simply be summed
 to obtain busy time. If no slices appear, inspect import warnings and raw events
@@ -110,12 +107,11 @@ overflow as additional physical streams or parallelism.
 - Investigate host bubbles using the previous device task's end, the next task's
   start, intervening Host APIs, synchronization, copies, graph replay, and other
   streams. Blank space or a single threshold does not establish a host bottleneck.
-- Compare rank skew only for matching requests/steps with verified clocks. A
-  single-rank trace cannot characterize an entire TP/EP group. Do not concatenate
-  independent JSON files and introduce PID/TID or clock collisions.
-- Timelines alone do not establish KV fragmentation, HBM bandwidth utilization,
-  or fusion opportunities. Obtain the relevant metrics, operator shapes, and
-  current source before concluding. Separate observations, hypotheses, and tests.
+- Compare rank skew only for matching requests or decode steps with verified clocks.
+  A single-rank trace cannot characterize all ranks. Do not concatenate independent
+  JSON files and introduce PID, TID, or clock collisions.
+- A timeline shows recorded activity; causal explanations require supporting
+  measurements or controlled tests. Separate observations from hypotheses.
 - Profiling explains bottlenecks. User-visible speedups require matched
   before/after measurements with profiling disabled; cumulative operator time
   cannot directly establish a throughput improvement.
@@ -138,7 +134,7 @@ Next steps: source locations, testable changes, comparison without profiling
 For decode gaps, identify adjacent device tasks, activity on other streams, host
 activity, and synchronization waits. For HCCL, distinguish total communication
 time from communication time not overlapped by compute. For graph replay,
-distinguish initial capture/compilation from steady replay. Mark unmeasurable
+distinguish initial graph capture and compilation from steady replay. Mark unmeasurable
 fields as not covered; fixed percentage thresholds do not establish causality.
 
 UI reference: [Official Perfetto UI documentation](https://perfetto.dev/docs/visualization/perfetto-ui).
