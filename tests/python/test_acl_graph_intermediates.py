@@ -338,7 +338,7 @@ def test_native_indexer_temporary_output_reaches_sparse_attention(npu_device: to
         )
         weights = torch.ones(rows, 64, device=npu_device, dtype=torch.float16 if quantized else torch.bfloat16)
         qs = torch.full((rows, 64), 1 / 8, device=npu_device, dtype=torch.float16)
-        ks = torch.full((1, 128, 1, 1), 1 / 8, device=npu_device, dtype=torch.float16)
+        ks = torch.full((1, 128, 1), 1 / 8, device=npu_device, dtype=torch.float16)
         q_ends = torch.tensor([rows], device=npu_device, dtype=torch.int32)
         kv_lengths = torch.tensor([128], device=npu_device, dtype=torch.int32)
         blocks = torch.zeros(1, 1, device=npu_device, dtype=torch.int32)
