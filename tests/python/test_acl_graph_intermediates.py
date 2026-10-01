@@ -254,8 +254,9 @@ def test_native_gmm2_temporary_output_reaches_unpermute(npu_device: torch.device
                 )
                 if group_list_type == 2:
                     counts = torch.diff(torch.cat((groups.new_zeros(1), groups)))
-                    expert_ids = torch.arange(weight.shape[0], device=npu_device, dtype=torch.int64)
-                    groups = torch.stack((expert_ids, counts), -1)
+                    # Sparse groups place active experts before the zero-count tail.
+                    expert_ids = torch.tensor([0, 2, 1, 3], device=npu_device, dtype=torch.int64)
+                    groups = torch.stack((expert_ids, counts.index_select(0, expert_ids)), -1)
                 output = moe._grouped_matmul_gmm2(
                     act_i8=routed,
                     act_pertoken_scale=scales,
