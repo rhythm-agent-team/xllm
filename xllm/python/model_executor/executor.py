@@ -25,6 +25,7 @@ from xllm.python.attention.backend import (
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention
+from xllm.python.model_executor import aclgraph_validation as validation
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
@@ -152,6 +153,7 @@ class ModelExecutor:
         acl_graph_decode_batch_size_limit: int | None = None,
     ) -> None:
         self.model = model
+        self._validation_fields = None
         self._kv_bound = False
         cp_size = int(config.get("cp_size", 1))
         cp_rank = int(config.get("cp_rank", 0))
@@ -352,6 +354,42 @@ class ModelExecutor:
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
 
+        if validation.VALIDATION_ENABLED:
+            self._validation_fields = validation.model_fields(execution_model, device, config)
+            self._validation_row_expanded = num_decoding_tokens > 1 or self._validation_fields["model_role"] == "draft"
+            for runner in (self.decode_graph_runner, self.prepared_graph_runner):
+                if runner is not None:
+                    runner._validation_fields = self._validation_fields
+
+    def _log_execution(
+        self,
+        metadata: AttentionMetadata,
+        input_ids: torch.Tensor,
+        mode: str,
+        runner: object,
+        bucket: int | None = None,
+    ) -> None:
+        if validation.VALIDATION_ENABLED:
+            rows = input_ids.numel()
+            effective_rows = bucket
+            if mode == "eager" or runner is self.prepared_graph_runner:
+                effective_rows = rows
+            validation.log_event(
+                "execution",
+                {
+                    **self._validation_fields,
+                    **validation.execution_fields(
+                        metadata,
+                        rows,
+                        self._validation_fields["dp_rank"],
+                        row_expanded=self._validation_row_expanded,
+                    ),
+                    "mode": mode,
+                    "runner": type(runner).__name__,
+                    "effective_rows": effective_rows,
+                },
+            )
+
     @staticmethod
     def _attention_config(
         layer: Attention,
@@ -435,14 +473,19 @@ class ModelExecutor:
             if enable_graph:
                 if self.prepared_graph_runner is None:
                     raise RuntimeError("prepared ACL graph runner is not enabled")
-                return self.prepared_graph_runner.execute(
+                output = self.prepared_graph_runner.execute(
                     input_ids, positions, metadata, input_embedding, layer_synchronizer, mtp_topk_indices
                 )
+                self._log_execution(metadata, input_ids, "graph", self.prepared_graph_runner)
+                return output
             if self._prepared_mtp:
-                return self.eager_runner.execute(
+                output = self.eager_runner.execute(
                     input_ids, positions, metadata, input_embedding, layer_synchronizer, mtp_topk_indices
                 )
-            return self.eager_runner.execute(input_ids, positions, metadata, input_embedding, layer_synchronizer)
+            else:
+                output = self.eager_runner.execute(input_ids, positions, metadata, input_embedding, layer_synchronizer)
+            self._log_execution(metadata, input_ids, "eager", self.eager_runner)
+            return output
         graph_kwargs = {}
         if mtp_topk_indices is not None:
             from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
@@ -461,22 +504,26 @@ class ModelExecutor:
                 graph_key = graph_runner.warmup(input_ids, positions, metadata, input_embedding, **graph_kwargs)
                 if graph_key is not None:
                     graph_kwargs["graph_key"] = graph_key
-            return graph_runner.execute(
+            output = graph_runner.execute(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
                 **graph_kwargs,
             )
+            self._log_execution(metadata, input_ids, "graph", graph_runner, None if graph_key is None else graph_key[0])
+            return output
         if mtp_topk_indices is None and self.inductor_runner is not None:
-            return self.inductor_runner.execute(
+            output = self.inductor_runner.execute(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
                 layer_synchronizer,
             )
-        return self.eager_runner.execute(
+            self._log_execution(metadata, input_ids, "inductor", self.inductor_runner)
+            return output
+        output = self.eager_runner.execute(
             input_ids,
             positions,
             metadata,
@@ -484,3 +531,5 @@ class ModelExecutor:
             layer_synchronizer,
             mtp_topk_indices,
         )
+        self._log_execution(metadata, input_ids, "eager", self.eager_runner)
+        return output

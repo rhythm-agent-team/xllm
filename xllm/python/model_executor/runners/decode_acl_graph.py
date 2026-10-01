@@ -42,6 +42,7 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
+from xllm.python.model_executor import aclgraph_validation as validation
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
 )
@@ -606,6 +607,24 @@ class DecodeAclGraphRunner(AclGraphRunner):
         # those updates before exposing the output to the next model stage.
         assert self._update_done_event is not None
         torch.npu.current_stream().wait_event(self._update_done_event)
+        if validation.VALIDATION_ENABLED:
+            validation.log_event(
+                "replay",
+                {
+                    **self._validation_fields,
+                    "dp_rank": self.dp_rank,
+                    **validation.execution_fields(
+                        metadata,
+                        batch_size,
+                        self.dp_rank,
+                        row_expanded=self.num_decoding_tokens > 1 or self._validation_fields["model_role"] == "draft",
+                    ),
+                    "mode": "graph",
+                    "runner": type(self).__name__,
+                    "bucket": entry.batch_size,
+                    "effective_rows": entry.batch_size,
+                },
+            )
         return output
 
     @staticmethod
