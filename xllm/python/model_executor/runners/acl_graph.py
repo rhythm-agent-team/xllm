@@ -24,6 +24,7 @@ import torch.nn as nn
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
 from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
+from xllm.python.model_executor import aclgraph_validation as validation
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphTask,
@@ -91,6 +92,8 @@ class AclGraphRunner(BaseRunner):
         super().__init__(model, attention_backend, device)
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+        if validation.VALIDATION_ENABLED:
+            self._validation_fields = validation.model_fields(model, device)
 
     def _initialize_task_updates(self) -> None:
         if self._update_stream is None:
@@ -163,11 +166,26 @@ class AclGraphRunner(BaseRunner):
             self.layer_caches,
             execution_state=entry.execution_state,
         )
+        if validation.VALIDATION_ENABLED:
+            memory_fields = {
+                **self._validation_fields,
+                "phase": "decode",
+                "mode": "graph",
+                "dp_rank": getattr(self, "dp_rank", None),
+                "runner": type(self).__name__,
+                "bucket": entry.batch_size,
+                "effective_rows": entry.static_input_ids.numel(),
+            }
+            validation.log_capture_memory("before_warmup", self.device, memory_fields)
         with forward_context(context), torch.npu.stream(stream):
             for _ in range(_CAPTURE_WARMUP_STEPS):
                 self._forward_static(entry)
         torch.npu.synchronize()
+        if validation.VALIDATION_ENABLED:
+            validation.log_capture_memory("after_warmup", self.device, memory_fields)
         entry.graph = torch.npu.NPUGraph()
+        if validation.VALIDATION_ENABLED:
+            validation.log_capture_memory("before_capture", self.device, memory_fields)
         capture_context = AclGraphCaptureContext(stream, [])
         context = ForwardContext(
             self.attention_backend,
@@ -187,6 +205,8 @@ class AclGraphRunner(BaseRunner):
             entry.static_mtp_topk_indices is not None,
             len(entry.graph_tasks),
         )
+        if validation.VALIDATION_ENABLED:
+            validation.log_capture_memory("after_capture", self.device, {**memory_fields, "pool": entry.graph.pool()})
 
     def _forward_static(self, entry: AclGraphEntry) -> ModelExecutionOutput:
         if entry.static_metadata.prepared_attention_state is not None:
