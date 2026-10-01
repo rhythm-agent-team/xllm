@@ -565,6 +565,30 @@ class W8A8StaticLinear(W8A8AttentionLinear):
         self._non_persistent_buffers_set.update(("weight_scale", "weight_offset"))
 
 
+class RouterGate(nn.Module):
+    """MoE router gate: bf16 [T, H] x bf16 [H, E] -> fp32 [T, E].
+
+    Keep the checkpoint-facing [E, H] weight as a view of contiguous [H, E]
+    storage, so addmm reads it without a second weight copy.
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int, device: torch.device) -> None:
+        super().__init__()
+        # The loader sees [E, H], while weight.t() is contiguous [H, E].
+        self.weight = nn.Parameter(
+            torch.empty(hidden_size, num_experts, dtype=torch.bfloat16, device=device).t(),
+            requires_grad=False,
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.empty(
+            (hidden.shape[0], self.weight.shape[0]),
+            dtype=torch.float32,
+            device=hidden.device,
+        )
+        return torch.addmm(logits, hidden, self.weight.t(), beta=0, alpha=1, out=logits)
+
+
 class W8A8DynamicLinear(nn.Module):
     """Dynamic-activation W8A8 linear (MLP / experts)."""
 
@@ -1580,14 +1604,9 @@ class DeepseekV3MoE(nn.Module):
         self.local_expert_start = self.ep_rank * num_local_experts
         self.local_expert_end = self.local_expert_start + num_local_experts
 
-        # Match the ATB router's FP32 precision.
-        self.gate = nn.Linear(
-            cfg.hidden_size,
-            self.num_experts,
-            bias=False,
-            dtype=torch.float32,
-            device=device,
-        )
+        # bf16 operands into an fp32 accumulator: same precision as the ATB
+        # router's fp32 gate, without upcasting the activation or the weight.
+        self.gate = RouterGate(cfg.hidden_size, self.num_experts, device)
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.num_experts, dtype=torch.float32, device=device),
@@ -1720,7 +1739,7 @@ class DeepseekV3MoE(nn.Module):
         self.shared_experts.load_from_checkpoint(loader, mlp_prefix + "shared_experts.", world=world, rank=rank)
 
     def _run_routed_experts(self, hidden: torch.Tensor) -> torch.Tensor:
-        logits = self.gate(hidden.to(torch.float32))
+        logits = self.gate(hidden)
         return kernels.grouped_moe(
             hidden,
             logits,
@@ -1798,7 +1817,7 @@ class DeepseekV3MoE(nn.Module):
 
             gate_stream.wait_event(start_event)
             with torch.npu.stream(gate_stream):
-                logits = self.gate(hidden.to(torch.float32))
+                logits = self.gate(hidden)
                 topk_weights, topk_ids = kernels.moe_gate_routing(
                     logits,
                     self.e_score_correction_bias,
@@ -1853,7 +1872,7 @@ class DeepseekV3MoE(nn.Module):
         shared_stream.wait_stream(current_stream)
 
         with torch.npu.stream(gate_stream):
-            logits = self.gate(hidden.to(torch.float32))
+            logits = self.gate(hidden)
             topk_weights, topk_ids = kernels.moe_gate_routing(
                 logits,
                 self.e_score_correction_bias,
