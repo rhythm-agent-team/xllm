@@ -1,6 +1,6 @@
 # xLLM Unit Test Patterns
 
-Use this reference when creating or changing unit tests under `tests/`.
+Use this reference for C++ unit tests.
 
 ## Layout
 
@@ -9,12 +9,12 @@ Use this reference when creating or changing unit tests under `tests/`.
   - `xllm/core/layers/mlu` -> `tests/core/layers/mlu`
   - `xllm/function_call/...` -> `tests/function_call/...`
 - Keep tests directly in the relevant leaf directory.
-- Avoid new nested `test/` or `tests/` directories. Recent cleanup moved those tests into their parent directories.
+- Avoid new nested `test/` or `tests/` directories.
 - Shared helpers may live beside tests, such as `tests/core/layers/mlu/tests_utils.cpp`.
 
 ## Naming
 
-- Test source files use singular suffixes:
+- Test source names end in `_test` before the file extension:
   - C++: `thing_test.cpp`
   - CUDA source: `thing_test.cu`
 - Test CMake target names also end in `_test`.
@@ -23,7 +23,7 @@ Use this reference when creating or changing unit tests under `tests/`.
 
 ## CMake Basics
 
-Use `cc_test` for C++/CUDA unit test binaries:
+Use `cc_test` to define test binaries:
 
 ```cmake
 include(cc_test)
@@ -97,7 +97,7 @@ target_link_libraries(example_test
 - Put file-local helpers in an anonymous namespace.
 - Prefer fixed-width integers (`int32_t`, `int64_t`) unless an API requires plain `int`.
 - Use `static_cast`, `nullptr`, braces on all control statements, and concise comments only where they clarify test setup.
-- Keep deterministic random or tensor tests seeded with stable labels or fixed seeds.
+- Use fixed seeds when generating random test inputs.
 
 ## Test Design
 
@@ -121,4 +121,4 @@ Run the narrowest feasible validation:
 
 - Local CMake/build target if available.
 - `python setup.py test` in the project container when full validation is requested or risk is high.
-- For development-machine validation, follow the repo AGENTS instructions for `ssh gpu-h800-195`, `/export/home/zhangxu709/xllm`, container `zx-xllm-cuda`, and the build/test commands.
+- Follow checkout instructions for the execution environment and build/test commands.

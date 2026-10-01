@@ -1,11 +1,22 @@
 ---
 name: add-unit-test
-description: Add or update xLLM unit tests in the repository. Use when Codex needs to create a new C++/CUDA/NPU/MLU unit test, place a test under tests/, wire it into CMake with cc_test, update an existing test target, choose platform gates, or validate test naming and dependencies against current xLLM test conventions.
+description: Add or update xLLM C++/Python unit tests. Use when creating tests, wiring test targets, or checking naming, dependencies, and platform gates.
 ---
 
 # Add Unit Test
 
-## Workflow
+## Python tests
+
+Read **Python tests** in `xllm/python/README.md`. Put Python tests in
+`tests/python/`. Use normal imports; `conftest.py` loads `xllm_export` and calls
+`initialize_runtime()` before collection. Do not repeat initialization or add
+test-local extension loading or `sys.path` manipulation.
+
+Run `python -m pytest tests/python/<file>.py` from the checkout root against matching
+native build artifacts in the environment required by checkout instructions.
+Direct pytest does not build the extension.
+
+## C++ test workflow
 
 1. Inspect the production code and the nearest existing tests before writing a new test.
    - Match the production path under `xllm/` to `tests/` where possible.
@@ -35,7 +46,7 @@ description: Add or update xLLM unit tests in the repository. Use when Codex nee
 6. Validate narrowly before finishing.
    - Always run `git diff --check` for the changed test paths.
    - Search for stale filenames after moving or renaming tests.
-   - Run the narrowest build/test command available locally; if not feasible, state the exact reason and what was checked instead.
+   - Run the narrowest relevant build or test command in the required execution environment; if blocked, report the reason and checks performed.
 
 ## Common Commands
 
@@ -45,4 +56,4 @@ rg "old_test_name|old_file_name" tests xllm CMakeLists.txt
 git diff --check -- tests/<area>
 ```
 
-For full remote validation on the development machine, use the repository AGENTS instructions for SSH, container, build, and test commands.
+Follow checkout instructions for the execution environment and build/test commands.
