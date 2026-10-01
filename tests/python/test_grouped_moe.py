@@ -23,6 +23,11 @@ import pytest
 import torch
 
 from xllm.python.kernels_npu import moe
+from xllm.python.model_executor.forward_context import (
+    AclGraphExecutionState,
+    ForwardContext,
+    forward_context,
+)
 
 
 def test_selected_expert_moe_matches_native_call_contract(
@@ -310,10 +315,17 @@ def test_gmm2_preserves_routing_metadata(
         dtype=torch.int64,
     )
     expected = torch.full((3, 32), 7, dtype=torch.bfloat16)
-    output = None if output_mode == "eager" else torch.empty_like(expected)
+    state = AclGraphExecutionState({}) if output_mode != "eager" else None
     native_gmm = MagicMock(return_value=[expected])
-    out_gmm = MagicMock(return_value=output)
-    monkeypatch.setattr(moe, "_graph_gmm2_output", lambda *args: output)
+
+    def write_output(*args: object, output: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        assert output.shape == expected.shape
+        assert output.dtype == torch.bfloat16
+        assert output.device == activations.device
+        output.copy_(expected)
+        return output
+
+    out_gmm = MagicMock(side_effect=write_output)
     monkeypatch.setattr(moe.torch.ops.npu, "npu_grouped_matmul", native_gmm, raising=False)
     monkeypatch.setattr(
         moe.torch.ops.xllm_ops,
@@ -322,16 +334,20 @@ def test_gmm2_preserves_routing_metadata(
         raising=False,
     )
 
-    actual = moe._grouped_matmul_gmm2(
-        act_i8=activations,
-        act_pertoken_scale=activation_scale,
-        weight=weight,
-        weight_scale=weight_scale,
-        group_list=groups,
-        group_list_type=group_list_type,
-    )
+    with forward_context(ForwardContext(None, activations.device, None, [], execution_state=state)):
+        actual = moe._grouped_matmul_gmm2(
+            act_i8=activations,
+            act_pertoken_scale=activation_scale,
+            weight=weight,
+            weight_scale=weight_scale,
+            group_list=groups,
+            group_list_type=group_list_type,
+        )
 
+    if state is not None:
+        assert not state.persistent_buffers
     if output_mode == "graph_native":
+        output = out_gmm.call_args.kwargs["output"]
         native_gmm.assert_not_called()
         out_gmm.assert_called_once_with(
             activations,
@@ -352,5 +368,8 @@ def test_gmm2_preserves_routing_metadata(
         assert kwargs["group_list"] is groups
         assert kwargs["group_list_type"] == group_list_type
         assert kwargs["per_token_scale"][0] is activation_scale
-        assert actual is (expected if output_mode == "eager" else output)
+        if output_mode == "eager":
+            assert actual is expected
+        assert actual.shape == expected.shape
+        assert actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual, expected)
