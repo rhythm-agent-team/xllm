@@ -51,10 +51,7 @@ from xllm.python.model_executor.cp_utils import (
     cp_shard_positions,
     cp_shard_rows,
 )
-from xllm.python.model_executor.forward_context import (
-    get_execution_buffer,
-    get_forward_context,
-)
+from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.weight_utils import (
@@ -1504,18 +1501,6 @@ class DeepseekV3Indexer(nn.Module):
             local_topk = topk.new_full((ctx.cp_context.total_local, *topk.shape[1:]), -1)
             local_topk.index_copy_(0, ctx.cp_context.query_index, topk)
             topk = local_topk
-        graph_state = get_forward_context().execution_state
-        if graph_state is not None and (use_quant_indexer or ctx.cp_context is not None):
-            # The QLI result feeds every later MLA layer but is not part of the
-            # model return value for the target graph. Keep one stable result
-            # per graph entry so a concurrent capture/replay cannot recycle a
-            # temporary custom-op allocation used by another entry.
-            topk_buffer = get_execution_buffer(
-                ("QLI_TOPK", id(self), self.layer_id, topk.dtype, topk.device) + tuple(topk.shape),
-                lambda: torch.empty_like(topk),
-            )
-            topk_buffer.copy_(topk)
-            topk = topk_buffer
         return topk
 
     def _select_unquantized(
@@ -1528,17 +1513,8 @@ class DeepseekV3Indexer(nn.Module):
     ) -> torch.Tensor:
         key_heads = index_cache.size(2) if index_cache.dim() >= 3 else 1
         shape = (q.size(0), key_heads, self.topk)
-        # execution_state owns the entry; the key also separates layers and
-        # target/draft instances, even when their shapes are identical.
-        key = (id(self), self.layer_id, shape, q.dtype, q.device)
-        indices = get_execution_buffer(
-            ("LIGHTNING_INDEXER_INDICES",) + key,
-            lambda: torch.empty(shape, dtype=torch.int32, device=q.device),
-        )
-        values = get_execution_buffer(
-            ("LIGHTNING_INDEXER_VALUES",) + key,
-            lambda: torch.empty(shape, dtype=torch.bfloat16, device=q.device),
-        )
+        indices = torch.empty(shape, dtype=torch.int32, device=q.device)
+        values = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
         return kernels.lightning_indexer_out(
             q,
             index_cache,
@@ -1762,14 +1738,7 @@ class DeepseekV3MoE(nn.Module):
             context = get_forward_context()
             if context.execution_state is not None:
                 output_shape = (hidden.shape[0], self.hidden)
-                output = get_execution_buffer(
-                    ("MOE_SHARED_EXPERT_OUTPUT", self.layer_id, *output_shape, torch.bfloat16),
-                    lambda: torch.empty(
-                        output_shape,
-                        dtype=torch.bfloat16,
-                        device=hidden.device,
-                    ),
-                )
+                output = torch.empty(output_shape, dtype=torch.bfloat16, device=hidden.device)
             return self.shared_experts.forward_dequant_swiglu_quant(hidden, output=output)
         return self.shared_experts(hidden)
 

@@ -33,6 +33,15 @@ from xllm.python.model_executor.forward_context import (
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.decode_cuda_graph import _CAPTURE_WARMUP_STEPS
 
+_GRAPH_POOL: tuple[int, int] | None = None
+
+
+def _get_graph_pool() -> tuple[int, int]:
+    global _GRAPH_POOL
+    if _GRAPH_POOL is None:
+        _GRAPH_POOL = torch.npu.graph_pool_handle()
+    return _GRAPH_POOL
+
 
 @dataclass(slots=True)
 class StaticGraphAttentionMetadata:
@@ -177,7 +186,7 @@ class AclGraphRunner(BaseRunner):
             acl_graph=capture_context,
             execution_state=entry.execution_state,
         )
-        with forward_context(context), torch.npu.graph(entry.graph, stream=stream):
+        with forward_context(context), torch.npu.graph(entry.graph, pool=_get_graph_pool(), stream=stream):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
         logger.info(
