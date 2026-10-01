@@ -219,13 +219,15 @@ def _validate_rope_cos_sin(
     rope_dim: int,
     interleaved: bool,
     consumer: str,
+    dtype: torch.dtype | None = None,
 ) -> None:
     """Check tensor metadata without synchronizing captured device values."""
     expected = (value.shape[0], 1, 1, rope_dim) if interleaved else (value.shape[0], rope_dim // 2)
+    expected_dtype = value.dtype if dtype is None else dtype
     for name, coefficient in zip(("cos", "sin"), cos_sin):
-        if coefficient.shape != expected or coefficient.dtype != value.dtype or coefficient.device != value.device:
+        if coefficient.shape != expected or coefficient.dtype != expected_dtype or coefficient.device != value.device:
             raise ValueError(
-                f"{consumer} {name}: expected shape={expected}, dtype={value.dtype}, device={value.device}; "
+                f"{consumer} {name}: expected shape={expected}, dtype={expected_dtype}, device={value.device}; "
                 f"got shape={tuple(coefficient.shape)}, dtype={coefficient.dtype}, device={coefficient.device}"
             )
 
@@ -941,11 +943,37 @@ class DeepseekV3MLAAttention(Attention):
     def _a_projection(self) -> W8A8AttentionLinear | None:
         return self.qkv_a_proj
 
-    def _project_qkv_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _can_fuse_input_norm_quant(self) -> bool:
+        return False
+
+    def _validate_hidden_scale(self, hidden: torch.Tensor, hidden_scale: torch.Tensor | None) -> None:
+        if hidden_scale is None:
+            if not hidden.is_floating_point():
+                raise ValueError("floating attention input is required when hidden_scale is absent")
+            return
+        if not self._can_fuse_input_norm_quant():
+            raise ValueError("this attention configuration cannot consume quantized normalized hidden")
+        if hidden.dtype != torch.int8 or hidden.ndim != 2 or hidden.shape[1] != self.cfg.hidden_size:
+            raise ValueError("quantized attention input must be INT8 [tokens, hidden_size]")
+        if (
+            hidden_scale.dtype != torch.float32
+            or hidden_scale.device != hidden.device
+            or hidden_scale.shape not in ((hidden.shape[0],), (hidden.shape[0], 1))
+        ):
+            raise ValueError("hidden_scale must be FP32 with one scale per input row on the same device")
+
+    def _project_qkv_a(
+        self, hidden: torch.Tensor, hidden_scale: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         projection = self._a_projection()
-        if projection is None:
+        if hidden_scale is not None:
+            self._validate_hidden_scale(hidden, hidden_scale)
+            projected = projection.forward_quantized(hidden, hidden_scale.reshape(-1))
+        elif projection is None:
             return self._project_separate_a(hidden)
-        kv, q_a = projection(hidden).split([self.kv_lora_rank + self.qk_rope_head_dim, self.q_lora_rank], dim=-1)
+        else:
+            projected = projection(hidden)
+        kv, q_a = projected.split([self.kv_lora_rank + self.qk_rope_head_dim, self.q_lora_rank], dim=-1)
         return q_a, kv
 
     def _project_separate_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -980,7 +1008,9 @@ class DeepseekV3MLAAttention(Attention):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         context: MlaPreprocessContext,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        self._validate_hidden_scale(hidden, hidden_scale)
         projection = self._a_projection()
         assert projection is not None
         if projection._dynamic_activation:
@@ -1007,6 +1037,7 @@ class DeepseekV3MLAAttention(Attention):
                 self.q_a_layernorm.eps,
                 self.kv_a_layernorm.eps,
                 fuse_q_norm_quant,
+                hidden_scale,
             )
             if fuse_q_norm_quant:
                 q_c = (q_c, q_c_scale)
@@ -1121,12 +1152,14 @@ class DeepseekV3MLAAttention(Attention):
         query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         prev_topk: torch.Tensor | None = None,
         reuse_topk: bool = False,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self._validate_hidden_scale(hidden, hidden_scale)
         num_tokens = hidden.shape[0]
         backend = get_forward_context().attention_backend
         preprocess = backend.mla_preprocess_context(self) if self._can_fuse_decode() else None
         if preprocess is not None:
-            q_c, q_latent, q_pe = self._preprocess_decode(hidden, rope_cos, rope_sin, preprocess)
+            q_c, q_latent, q_pe = self._preprocess_decode(hidden, rope_cos, rope_sin, preprocess, hidden_scale)
             topk = self._select_topk(
                 hidden,
                 q_c,
@@ -1141,7 +1174,7 @@ class DeepseekV3MLAAttention(Attention):
             )
             attn_out = backend.execute_mla(q_latent, q_pe, None, None, self, topk=topk, cache_is_preprocessed=True)
             return self._project_attention_output(attn_out), topk
-        q_a, kv = self._project_qkv_a(hidden)
+        q_a, kv = self._project_qkv_a(hidden, hidden_scale)
         q_c, q = self._normalize_and_project_query(q_a)
         q = q.view(
             num_tokens,
@@ -1179,8 +1212,16 @@ class DeepseekV3MLAAttention(Attention):
         half_rope_sin: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        hidden_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        output, _ = self._forward_with_topk(hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin)
+        output, _ = self._forward_with_topk(
+            hidden,
+            half_rope_cos,
+            half_rope_sin,
+            rope_cos,
+            rope_sin,
+            hidden_scale=hidden_scale,
+        )
         return output
 
 
@@ -1937,9 +1978,14 @@ class DeepseekV3DecoderLayer(nn.Module):
         prev_topk_indices: torch.Tensor | None = None,
         reuse_topk_indices: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        hidden_scale: torch.Tensor | None = None
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm(hidden)
+        elif self.self_attn._can_fuse_input_norm_quant():
+            hidden, hidden_scale, residual = kernels.fused_add_rms_norm_dynamic_quant(
+                hidden, residual, self.input_layernorm.weight, self.input_layernorm.eps
+            )
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
         hidden, topk = self._attention(
@@ -1951,6 +1997,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             indexer_query_cos_sin,
             prev_topk_indices,
             reuse_topk_indices,
+            hidden_scale,
         )
         fused_dense_input: tuple[torch.Tensor, torch.Tensor] | None = None
         if self._fuse_dense_norm_quant:
@@ -1980,8 +2027,9 @@ class DeepseekV3DecoderLayer(nn.Module):
         query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
         prev_topk: torch.Tensor | None,
         reuse_topk: bool,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self.self_attn(hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin), None
+        return self.self_attn(hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin, hidden_scale), None
 
 
 class DeepseekV3Model(nn.Module):

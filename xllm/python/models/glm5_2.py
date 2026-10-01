@@ -516,6 +516,19 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
     def _project_separate_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.q_a_proj(hidden), self.kv_a_proj_with_mqa(hidden)
 
+    def _can_fuse_input_norm_quant(self) -> bool:
+        projection = self._a_projection()
+        return (
+            self._use_fused_mla_decode
+            and not self.cfg.model_type.endswith("_mtp")
+            and self.is_shared
+            and self.indexer is None
+            and getattr(self, "_attn_dp_layout", None) is None
+            and self._dynamic_mla_ready
+            and isinstance(projection, W8A8AttentionLinear)
+            and projection._dynamic_activation is True
+        )
+
     def _can_fuse_decode(self) -> bool:
         ctx = get_forward_context()
         layerwise = self.cfg.layerwise_split_size > 1 and not (
@@ -647,11 +660,21 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         prev_topk: torch.Tensor | None = None,
         reuse_topk: bool = False,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if getattr(self, "_attn_dp_layout", None) is None:
             return super()._forward_with_topk(
-                hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin, query_cos_sin, prev_topk, reuse_topk
+                hidden,
+                half_rope_cos,
+                half_rope_sin,
+                rope_cos,
+                rope_sin,
+                query_cos_sin,
+                prev_topk,
+                reuse_topk,
+                hidden_scale,
             )
+        self._validate_hidden_scale(hidden, hidden_scale)
         layout = self._attn_dp_layout
         counts = _attn_dp_execution_counts(self.cfg)
         local_tokens = counts[self.cfg.dp_rank]
@@ -745,8 +768,11 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         indexer_query_cos_sin: tuple[torch.Tensor, torch.Tensor],
         prev_topk_indices: torch.Tensor | None = None,
         reuse_topk_indices: bool = False,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        _validate_rope_cos_sin((rope_cos, rope_sin), hidden, self.qk_rope_head_dim, True, "attention")
+        self._validate_hidden_scale(hidden, hidden_scale)
+        rope_dtype = self.q_a_layernorm.weight.dtype if hidden_scale is not None else hidden.dtype
+        _validate_rope_cos_sin((rope_cos, rope_sin), hidden, self.qk_rope_head_dim, True, "attention", rope_dtype)
         return self._forward_with_topk(
             hidden,
             half_rope_cos,
@@ -756,6 +782,7 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
             indexer_query_cos_sin,
             prev_topk_indices,
             reuse_topk_indices,
+            hidden_scale,
         )
 
 
@@ -899,6 +926,7 @@ class Glm52DecoderLayer(DeepseekV3DecoderLayer):
         query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
         prev_topk: torch.Tensor | None,
         reuse_topk: bool,
+        hidden_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert query_cos_sin is not None
         return self.self_attn(
@@ -910,6 +938,7 @@ class Glm52DecoderLayer(DeepseekV3DecoderLayer):
             query_cos_sin,
             prev_topk,
             reuse_topk,
+            hidden_scale,
         )
 
 

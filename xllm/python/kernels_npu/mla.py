@@ -379,13 +379,18 @@ def deepseek_mla_preprocess_decode_dynamic(
     q_norm_epsilon: float,
     kv_norm_epsilon: float,
     fuse_q_norm_quant: bool,
+    hidden_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Preprocess MLA and return Q-A and the activation scale used by Q-B.
 
     Fusion is enabled only when the indexer can consume the same INT8 Q-A as
     Q-B; otherwise it receives the normalized floating-point activation.
     """
-    hidden_int8, hidden_scale = dynamic_quant(hidden)
+    if hidden_scale is None:
+        hidden_int8, hidden_scale = dynamic_quant(hidden)
+    else:
+        hidden_int8 = hidden
+        hidden_scale = hidden_scale.reshape(-1)
     qkv_a = quant_matmul(
         hidden_int8,
         qkv_weight,
@@ -464,6 +469,7 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     q_norm_epsilon: float,
     kv_norm_epsilon: float,
     fuse_q_norm_quant: bool,
+    hidden_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del (
         qkv_weight,
@@ -484,10 +490,10 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     )
     num_tokens = hidden.shape[0]
     return (
-        hidden.new_empty((num_tokens, q_lora_rank), dtype=torch.int8 if fuse_q_norm_quant else hidden.dtype),
+        hidden.new_empty((num_tokens, q_lora_rank), dtype=torch.int8 if fuse_q_norm_quant else torch.bfloat16),
         hidden.new_empty((num_tokens,), dtype=torch.float32),
-        hidden.new_empty((num_tokens, num_heads, w_uk.shape[-1])),
-        hidden.new_empty((num_tokens, num_heads, qk_rope_head_dim)),
+        hidden.new_empty((num_tokens, num_heads, w_uk.shape[-1]), dtype=torch.bfloat16),
+        hidden.new_empty((num_tokens, num_heads, qk_rope_head_dim), dtype=torch.bfloat16),
     )
 
 
