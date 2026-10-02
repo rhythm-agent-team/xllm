@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <brpc/callback.h>
 #include <brpc/controller.h>
 #include <butil/iobuf.h>
 #include <glog/logging.h>
@@ -22,6 +23,7 @@ limitations under the License.
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -215,14 +217,23 @@ class StreamCall : public Call {
   }
 
   bool is_disconnected() const override {
-    if (stream_) {
-      return connection_status_ != 0;
-    } else {
-      if (controller_) {
-        return controller_->IsCanceled();
+    if (stream_ && openai_http_) {
+      std::lock_guard<std::mutex> lock(stream_start_mutex_);
+      if (stream_finished_.load(std::memory_order_acquire)) {
+        return false;
       }
-      return true;
+      if (!stream_started_) {
+        return controller_ == nullptr || controller_->IsCanceled();
+      }
+      // The controller may be destroyed by done_->Run(). Only the attachment
+      // and its independently owned stop state remain valid after startup.
+      return stream_stopped_->load(std::memory_order_acquire) ||
+             connection_status_.load(std::memory_order_relaxed) != 0;
     }
+    if (stream_) {
+      return connection_status_.load(std::memory_order_relaxed) != 0;
+    }
+    return controller_ == nullptr || controller_->IsCanceled();
   }
 
   void set_system_fingerprint(std::string fingerprint) {
@@ -260,8 +271,15 @@ class StreamCall : public Call {
     return true;
   }
 
+  static void on_stream_stopped(std::shared_ptr<std::atomic<bool>> stopped) {
+    stopped->store(true, std::memory_order_release);
+  }
+
   void start_openai_stream() {
+    std::lock_guard<std::mutex> lock(stream_start_mutex_);
     pa_ = controller_->CreateProgressiveAttachment();
+    stream_stopped_ = std::make_shared<std::atomic<bool>>(false);
+    pa_->NotifyOnStopped(brpc::NewCallback(on_stream_stopped, stream_stopped_));
     controller_->http_response().set_content_type(
         "text/event-stream; charset=utf-8");
     controller_->http_response().set_status_code(200);
@@ -274,6 +292,8 @@ class StreamCall : public Call {
   std::string system_fingerprint_;
   bool openai_http_ = false;
   bool stream_started_ = false;
+  mutable std::mutex stream_start_mutex_;
+  std::shared_ptr<std::atomic<bool>> stream_stopped_;
   proto::Usage stream_usage_;
 
  protected:
@@ -290,7 +310,7 @@ class StreamCall : public Call {
 
   json2pb::Pb2JsonOptions json_options_;
 
-  int connection_status_ = 0;
+  std::atomic<int32_t> connection_status_{0};
 };
 
 // Anthropic SSE stream call with custom event formatting
