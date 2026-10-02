@@ -66,8 +66,8 @@ def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch
     positions = torch.arange(count, dtype=torch.int64)
     rows = positions // 17
     columns = positions % 17
-    # Distinct rank intervals and changing row/column markers stay exact in BF16.
-    values = rank * 8 + (5 * rows + 3 * columns + 7 * iteration) % 8
+    # All markers are exact in BF16; the prime period differs from DMA tiles.
+    values = (31 * rank + 97 * rows + 53 * columns + 71 * iteration) % 251
     return values.to(dtype)
 
 

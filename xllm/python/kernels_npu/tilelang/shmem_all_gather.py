@@ -81,13 +81,18 @@ def build_shmem_all_gather_kernel(
             generation = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             observed = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             with T.Scope("V"):
-                lane = core * 2 + subcore
+                lane = T.Cast("int32", core) * 2 + T.Cast("int32", subcore)
                 T.copy(epochs[lane * SIGNAL_STRIDE], epoch)
                 T.barrier_all()
                 generation[0] = epoch[0]
                 for chunk in T.serial(rounds):
                     offset = chunk * lanes * chunk_elements + lane * chunk_elements
-                    length = T.min(chunk_elements, T.max(count - offset, 0))
+                    remaining = count - offset
+                    length = T.if_then_else(
+                        remaining <= 0,
+                        0,
+                        T.if_then_else(remaining < chunk_elements, remaining, chunk_elements),
+                    )
                     generation[0] = 1 - generation[0]
                     # Scalar writes into UB must precede the MTE3 publication.
                     for element in T.serial(SIGNAL_ELEMENTS):
