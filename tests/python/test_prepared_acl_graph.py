@@ -39,6 +39,7 @@ def _metadata(rows: int) -> SimpleNamespace:
         paged_kv_indptr=None,
         paged_kv_indices=None,
         paged_kv_last_page_len=None,
+        linear_state_indices=None,
         is_prefill=False,
         is_chunked_prefill=False,
         is_spec_verify=False,
@@ -67,6 +68,48 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> PreparedAclGraphRunner:
     result._allocate_entry = Mock(side_effect=AssertionError("owned input allocation"))
     result._fill_entry = Mock(side_effect=AssertionError("whole input copy"))
     return result
+
+
+def test_capture_shares_one_lazy_pool_across_runners_and_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xllm.python.model_executor.runners import acl_graph
+
+    pool = (0, 7)
+    stream = Mock()
+    graph_context = Mock(side_effect=lambda *args, **kwargs: nullcontext())
+    npu = SimpleNamespace(
+        Stream=Mock(return_value=stream),
+        Event=Mock(side_effect=Mock),
+        NPUGraph=Mock(side_effect=Mock),
+        graph_pool_handle=Mock(return_value=pool),
+        current_stream=Mock(return_value=stream),
+        stream=lambda _: nullcontext(),
+        graph=graph_context,
+        synchronize=Mock(),
+    )
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    monkeypatch.setattr(acl_graph, "_GRAPH_POOL", None)
+    backend = SimpleNamespace(prepare=Mock())
+    runners = [
+        PreparedAclGraphRunner(torch.nn.Identity(), backend, torch.device("cpu"), 4),
+        DecodeAclGraphRunner(torch.nn.Identity(), backend, torch.device("cpu"), 4, 128),
+    ]
+    npu.graph_pool_handle.assert_not_called()
+    for graph_runner in runners:
+        graph_runner._forward_static = Mock(return_value=torch.ones(1))
+        for rows in (4, 2):
+            entry = SimpleNamespace(
+                batch_size=rows,
+                static_mtp_topk_indices=None,
+                static_metadata=_metadata(rows),
+                execution_state=None,
+            )
+            graph_runner._capture(entry, stream)
+            assert entry.static_output is graph_runner._forward_static.return_value
+            assert entry.graph_tasks == []
+    npu.graph_pool_handle.assert_called_once_with()
+    assert graph_context.call_count == 4
+    assert all(call.kwargs["pool"] is pool for call in graph_context.call_args_list)
+    assert all(call.kwargs["stream"] is stream for call in graph_context.call_args_list)
 
 
 def test_capture_and_replay_bind_each_slot_without_input_copies(runner: PreparedAclGraphRunner) -> None:
@@ -128,6 +171,7 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
         Event=Mock(side_effect=Mock),
         ExternalEvent=Mock(side_effect=Mock),
         NPUGraph=Mock(side_effect=Mock),
+        graph_pool_handle=Mock(return_value=(0, 1)),
         current_stream=Mock(return_value=stream),
         stream=lambda _: nullcontext(),
         graph=lambda *args, **kwargs: nullcontext(),
@@ -140,6 +184,7 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
         memory_reserved=lambda _: 0,
     )
     monkeypatch.setattr(torch, "npu", npu)
+    monkeypatch.setattr("xllm.python.model_executor.runners.acl_graph._GRAPH_POOL", None)
     monkeypatch.setattr(kernels, "update_decode_graph_metadata", Mock(), raising=False)
     backend = NpuPagedAttentionBackend(8, 2, 64, 0.125, 0, False, torch.device("cpu"), torch.float16)
     cache = torch.empty(4, 128, 2, 64)
@@ -582,6 +627,63 @@ def test_mtp_real_graph_replays_live_inputs_across_slots(reuse_topk: bool, dp_si
         assert metadata.kv_seq_lens_host_values == [1] * tokens.numel()
     assert len(runner._prepared_graphs) == 6
     assert runner.prepared_replays == 9
+
+
+@pytest.mark.parametrize("rows_order", [(8, 2), (2, 8)])
+@torch.inference_mode()
+def test_shared_pool_replays_serial_capture_streams_and_preserves_clones(
+    rows_order: tuple[int, int],
+) -> None:
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+
+    class TemporaryModel(torch.nn.Module):
+        def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            hidden = tokens.to(torch.float32).view(-1, 1).expand(-1, 4096).contiguous()
+            for _ in range(4):
+                hidden = (hidden + 1) * 2
+            return hidden + positions.to(torch.float32).view(-1, 1)
+
+    device = torch.device("npu:0")
+    backend = SimpleNamespace(
+        prepare=lambda *args, **kwargs: None,
+        prepare_graph_replay=lambda metadata: None,
+    )
+    runners = [PreparedAclGraphRunner(TemporaryModel(), backend, device, 8) for _ in rows_order]
+    streams = [torch.npu.Stream(device=device) for _ in rows_order]
+    inputs = []
+    caller_stream = torch.npu.current_stream(device)
+    for runner, stream, rows in zip(runners, streams, rows_order):
+        tokens = torch.zeros(rows, dtype=torch.int32, device=device)
+        positions = torch.zeros_like(tokens)
+        metadata = _metadata(rows)
+        for name in ("slot_mapping", "block_table", "q_seq_lens", "q_cu_seq_lens", "kv_seq_lens"):
+            setattr(metadata, name, getattr(metadata, name).to(device))
+        stream.wait_stream(caller_stream)
+        with torch.npu.stream(stream):
+            runner.warmup_prepared(tokens, positions, metadata)
+        caller_stream.wait_stream(stream)
+        inputs.append((tokens, positions, metadata))
+    entries = [runner._prepared_graphs[runner._prepared_binding(*values)] for runner, values in zip(runners, inputs)]
+    assert entries[0].graph.pool() == entries[1].graph.pool()
+    saved_outputs = []
+    for step, index in enumerate((0, 1, 0, 1, 0)):
+        tokens, positions, metadata = inputs[index]
+        tokens.fill_(step + 1)
+        positions.fill_(step + 3)
+        stream = streams[index]
+        stream.wait_stream(caller_stream)
+        with torch.npu.stream(stream):
+            output = runners[index].execute(tokens, positions, metadata)
+            detached_output = DecodeAclGraphRunner._slice_output(output, tokens.numel())
+        caller_stream.wait_stream(stream)
+        expected = torch.full((tokens.numel(), 4096), (step + 1) * 16 + 30 + step + 3, device=device)
+        torch.testing.assert_close(detached_output, expected.to(torch.float32))
+        saved_outputs.append((detached_output, expected))
+    for output, expected in saved_outputs:
+        torch.testing.assert_close(output, expected.to(torch.float32))
+    assert all(not entry.execution_state.persistent_buffers for entry in entries)
 
 
 @pytest.mark.parametrize("dcp_rank", [0, 3])
