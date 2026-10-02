@@ -300,6 +300,14 @@ def _main() -> None:
     if args.compile_only:
         _compile_only(args, result, result_path)
         return
+    # Native initialization resets its log level; the environment overrides it.
+    # File logging preserves diagnostics if native failure also crashes at exit.
+    os.environ["ACLSHMEM_LOG_LEVEL"] = "DEBUG"
+    os.environ["ACLSHMEM_LOG_TO_STDOUT"] = "0"
+    os.environ["ACLSHMEM_LOG_PATH"] = str(args.artifact_dir)
+    result["environment"].update(
+        {name: os.environ[name] for name in ("ACLSHMEM_LOG_LEVEL", "ACLSHMEM_LOG_TO_STDOUT", "ACLSHMEM_LOG_PATH")}
+    )
     import shmem
     import shmem._pyshmem as shmem_native
     import tilelang
@@ -377,8 +385,12 @@ def _main() -> None:
     ret = shmem.set_conf_store_tls(False, "")
     if ret != 0:
         raise RuntimeError(f"set_conf_store_tls failed: {ret}")
+    _save(result_path, result, "bootstrap/native-init")
     ret = shmem.aclshmem_init(attributes)
+    result["shmem_init_return"] = ret
     if ret != 0:
+        result["status"] = "FAIL"
+        _save(result_path, result, "bootstrap/native-init-failed")
         raise RuntimeError(f"aclshmem_init failed: {ret}")
     result["bootstrap"] = "HYBM/TCP/MTE"
     if shmem.aclshmemx_init_status() != shmem.InitStatus.INITIALIZED:
