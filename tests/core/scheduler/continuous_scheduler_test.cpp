@@ -1073,7 +1073,7 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
   EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
-  batch.clear();
+  batch = BatchGroup();
   request.reset();
   scheduler->wait_for_responses();
   scheduler.reset();
@@ -1128,7 +1128,7 @@ TEST(ContinuousSchedulerTest, FailedStreamReturnsStatusExactlyOnce) {
   scheduler->wait_for_responses();
   EXPECT_EQ(callback_count, 1);
   EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
-  batch.clear();
+  batch = BatchGroup();
   request.reset();
   scheduler.reset();
   EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
