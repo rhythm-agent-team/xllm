@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One rank of a direct Python TileLang SHMEM AllGather correctness test.
+"""One rank of direct AllGather correctness and optional gather-only timing.
 
-Launch one worker per PE with a fresh shared --artifact-dir and explicit NPU
---device. CPU FileStore coordination and SHMEM TCP/MTE bootstrap use no HCCL or
-MPI. The caller must verify device availability and provide matching TileLang
-and SHMEM packages.
-No xLLM native binary, AOT registration, package installation, or runtime shim
-is used. A failure leaves the original traceback and saved phase; it does not
-enter a cleanup rendezvous that could hide the failure behind a peer timeout.
+The default TileLang SHMEM path uses CPU FileStore coordination and official
+TCP/MTE bootstrap, without HCCL, MPI or an xLLM native library. Matched timing
+may explicitly select the existing current-stream native HCCL AllGather instead.
+The caller must verify device availability, package/native identities and prior
+required correctness evidence before requesting measurement.
+
+A failure leaves the original traceback and saved phase; it does not enter a
+cleanup rendezvous that could hide the failure behind a peer timeout.
 """
 
 from __future__ import annotations
@@ -28,9 +29,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import socket
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -168,55 +172,68 @@ def _run_case(
     result: dict[str, Any],
     result_path: Path,
     count: int,
-    receive: torch.Tensor,
-    controls: torch.Tensor,
-    epochs: torch.Tensor,
+    receive: torch.Tensor | None,
+    controls: torch.Tensor | None,
+    epochs: torch.Tensor | None,
+    comm: int | None = None,
 ) -> None:
-    import tilelang
-
-    from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
-
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
     source_storage, source, source_guard = _guarded(count, dtype, device)
     output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
     consumer_storage, consumed, consumer_guard = _guarded(args.world_size * count, dtype, device)
-    scratch = _prepare_scratch(args, device)
-    _save(result_path, result, f"count-{count}/compile")
-    kernel = tilelang.compile(
-        build_shmem_all_gather_kernel(
-            count,
-            args.world_size,
-            args.lanes,
-            args.chunk_bytes,
-            args.dtype,
-            skew_phase=args.skew_phase,
-            skew_iterations=args.skew_iterations,
-        ),
-        out_idx=None,
-        target="ascendc",
-        platform="A3",
-        pass_configs=SHMEM_PASS_CONFIGS,
-    )
-    generated = kernel.get_kernel_source()
-    generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
-    generated_path.write_text(generated, encoding="utf-8")
-    case: dict[str, Any] = {
-        "count": count,
-        "generated_source": _file_identity(generated_path),
-        "jit_library": _file_identity(kernel.adapter.libpath),
-        "checked_iterations": [],
-        "graph_replays": 0,
-    }
+    rank_major_output = output.view(args.world_size, count)
+    case: dict[str, Any] = {"count": count, "checked_iterations": [], "graph_replays": 0}
     result["cases"].append(case)
-    _save(result_path, result, f"count-{count}/compiled")
-    _rendezvous(store, args.rank, args.world_size, f"count-{count}/compiled")
+    scratch = None
+    kernel = None
+    if args.backend == "shmem":
+        import tilelang
+
+        from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
+
+        if receive is None or controls is None or epochs is None:
+            raise RuntimeError("SHMEM AllGather requires its initialized symmetric buffers")
+        scratch = _prepare_scratch(args, device)
+        _save(result_path, result, f"count-{count}/compile")
+        kernel = tilelang.compile(
+            build_shmem_all_gather_kernel(
+                count,
+                args.world_size,
+                args.lanes,
+                args.chunk_bytes,
+                args.dtype,
+                skew_phase=args.skew_phase,
+                skew_iterations=args.skew_iterations,
+            ),
+            out_idx=None,
+            target="ascendc",
+            platform="A3",
+            pass_configs=SHMEM_PASS_CONFIGS,
+        )
+        generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
+        generated_path.write_text(kernel.get_kernel_source(), encoding="utf-8")
+        case.update(
+            {"generated_source": _file_identity(generated_path), "jit_library": _file_identity(kernel.adapter.libpath)}
+        )
+    elif not comm:
+        raise RuntimeError("HCCL AllGather requires a valid initialized communicator")
+    ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
+    _save(result_path, result, ready_phase)
+    _rendezvous(store, args.rank, args.world_size, ready_phase)
     rounds = (count + args.lanes * args.chunk_bytes // source.element_size() - 1) // (
         args.lanes * args.chunk_bytes // source.element_size()
     )
+    stream = torch.npu.Stream() if args.timing_samples else torch.npu.current_stream()
+
+    def _gather() -> None:
+        if args.backend == "shmem":
+            kernel(source, rank_major_output, receive, controls, epochs, scratch["tensor"], args.rank)
+        else:
+            torch.ops.xllm_ops.npu_all_gather(source, output, comm)
 
     def _submit() -> None:
-        kernel(source, output.view(args.world_size, count), receive, controls, epochs, scratch["tensor"], args.rank)
+        _gather()
         # The consumer is on the same current stream immediately after gather.
         torch.add(output, 1, out=consumed)
 
@@ -225,58 +242,97 @@ def _run_case(
         source.copy_(local)
         output.fill_(float("nan"))
         consumed.fill_(float("nan"))
-        scratch["tensor"].copy_(scratch["initial"])
+        if scratch is not None:
+            scratch["tensor"].copy_(scratch["initial"])
         return local
 
-    def _check(iteration: int, local: torch.Tensor, previous_epochs: torch.Tensor) -> None:
-        torch.npu.synchronize()
+    def _previous_epochs() -> torch.Tensor | None:
+        if epochs is None:
+            return None
+        previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        assert torch.all((previous == 0) | (previous == 1)), "Invalid device epoch"
+        return previous
+
+    def _check_guards_all() -> None:
+        _check_guards(source_storage, count, source_guard)
+        _check_guards(output_storage, args.world_size * count, output_guard)
+        _check_guards(consumer_storage, args.world_size * count, consumer_guard)
+
+    def _check_outputs(iteration: int, local: torch.Tensor, previous_epochs: torch.Tensor | None) -> None:
         expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
         torch.testing.assert_close(source.cpu(), local, rtol=0, atol=0)
         torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
         torch.testing.assert_close(consumed.cpu(), expected + 1, rtol=0, atol=0)
-        _check_guards(source_storage, count, source_guard)
-        _check_guards(output_storage, args.world_size * count, output_guard)
-        _check_guards(consumer_storage, args.world_size * count, consumer_guard)
-        _check_scratch(scratch)
-        _check_state(controls, epochs, (previous_epochs + rounds) % 2, args.lanes, args.world_size)
+        _check_guards_all()
+        if scratch is not None:
+            _check_scratch(scratch)
+            _check_state(controls, epochs, (previous_epochs + rounds) % 2, args.lanes, args.world_size)
+
+    def _check(iteration: int, local: torch.Tensor, previous_epochs: torch.Tensor | None) -> None:
+        torch.npu.synchronize()
+        _check_outputs(iteration, local, previous_epochs)
         case["checked_iterations"].append(iteration)
         # Keep the next invocation from changing controls during another PE's
         # host-side state checks. This is once per collective, never per row.
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/checked")
 
+    def _check_capture(local: torch.Tensor, previous_epochs: torch.Tensor | None) -> None:
+        torch.testing.assert_close(source.cpu(), local, rtol=0, atol=0)
+        _check_guards_all()
+        if scratch is not None:
+            band = scratch["elements"] // 2
+            torch.testing.assert_close(scratch["tensor"][:band].cpu(), scratch["initial"][:band], rtol=0, atol=0)
+            _check_guards(scratch["storage"], scratch["elements"], scratch["guard"])
+            observed = _previous_epochs()
+            assert torch.equal(observed, previous_epochs) or torch.equal(observed, (previous_epochs + rounds) % 2), (
+                "Invalid capture epoch transition"
+            )
+            _check_state(controls, epochs, observed, args.lanes, args.world_size)
+
     _save(result_path, result, f"count-{count}/warmup")
     for iteration in (-2, -1):
-        previous_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        previous_epochs = _previous_epochs()
         local = _prepare(iteration)
-        _submit()
+        if args.timing_samples:
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/prepared")
+        with torch.npu.stream(stream):
+            _submit()
         _check(iteration, local, previous_epochs)
 
     graph = None
+    capture_stream = stream
     if args.mode == "graph":
-        _prepare(0)
+        local = _prepare(0)
         torch.npu.synchronize()
+        previous_epochs = _previous_epochs()
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/capture")
         _save(result_path, result, f"count-{count}/capture")
         graph = torch.npu.NPUGraph()
-        capture_stream = torch.npu.Stream()
+        capture_stream = stream if args.timing_samples else torch.npu.Stream()
         with torch.npu.graph(graph, stream=capture_stream):
             _submit()
         torch.npu.synchronize()
-        # Capture is not a numerical pass and its execution is not assumed.
-        # Each replay is checked against the observed state immediately before it.
-        case["epochs_after_capture"] = epochs.cpu().view(args.lanes, 32)[:, 0].tolist()
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/captured")
+        # Capture is not a numerical pass and its execution is not assumed.
+        _check_capture(local, previous_epochs)
+        if epochs is not None:
+            case["epochs_after_capture"] = _previous_epochs().tolist()
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/capture-observed")
 
     for iteration in range(args.repeats):
         _save(result_path, result, f"count-{count}/iteration-{iteration}")
-        previous_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
-        assert torch.all((previous_epochs == 0) | (previous_epochs == 1)), "Invalid device epoch"
+        previous_epochs = _previous_epochs()
         local = _prepare(iteration)
-        if graph is None:
-            _submit()
-        else:
-            graph.replay()
-            case["graph_replays"] += 1
+        if args.timing_samples or graph is not None:
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/prepared")
+        with torch.npu.stream(capture_stream if graph is not None else stream):
+            if graph is None:
+                _submit()
+            else:
+                graph.replay()
+                case["graph_replays"] += 1
         _check(iteration, local, previous_epochs)
 
     torch.npu.synchronize()
@@ -285,6 +341,103 @@ def _run_case(
         del graph
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
     _save(result_path, result, f"count-{count}/checked")
+    if not args.timing_samples:
+        return
+
+    timing: dict[str, Any] = {
+        "backend": args.backend,
+        "mode": args.mode,
+        "scope": "gather_only",
+        "host_completion_scope": "gather_plus_consumer_drain",
+        "comparison_id": args.comparison_id,
+        "round_id": args.round_id,
+        "stage_index": args.stage_index,
+        "row_width": args.row_width,
+        "rows": None if args.row_width is None else count // args.row_width,
+        "warmup_samples": [],
+        "samples": [],
+        "warmup_excluded": True,
+        "consumer_timed": False,
+        "graph_reset": False if args.mode == "graph" else None,
+        "stream_ptr": hex(stream.npu_stream),
+        "stream_ptr_is_trace_stream_id": False,
+    }
+    case["timing"] = timing
+    _save(result_path, result, f"count-{count}/timing/prepare")
+    events = [
+        (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
+        for _ in range(args.timing_warmup + args.timing_samples)
+    ]
+    # Materialize all event handles outside measurement, including measured pairs.
+    with torch.npu.stream(stream):
+        for start, end in events:
+            start.record()
+            end.record()
+    torch.npu.synchronize()
+    timing_graph = None
+    if args.mode == "graph":
+        local = _prepare(args.repeats)
+        torch.npu.synchronize()
+        previous_epochs = _previous_epochs()
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/capture-prepared")
+        timing_graph = torch.npu.NPUGraph()
+        with torch.npu.graph(timing_graph, stream=stream):
+            _gather()
+        torch.npu.synchronize()
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/captured")
+        _check_capture(local, previous_epochs)
+        assert torch.all(torch.isnan(consumed.cpu())), "Gather-only capture changed consumer poison"
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/capture-observed")
+
+    for ordinal, (start, end) in enumerate(events):
+        sample_index = ordinal - args.timing_warmup
+        iteration = args.repeats + ordinal + 1
+        phase = f"count-{count}/timing/sample-{sample_index}"
+        _save(result_path, result, phase)
+        previous_epochs = _previous_epochs()
+        local = _prepare(iteration)
+        torch.npu.synchronize()
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+        start_wall_ns = time.time_ns()
+        with torch.npu.stream(stream):
+            start.record()
+            submit_start = time.monotonic_ns()
+            if timing_graph is None:
+                _gather()
+            else:
+                timing_graph.replay()
+            submit_end = time.monotonic_ns()
+            end.record()
+            # Consumer dependencies are checked, but its work is outside the events.
+            torch.add(output, 1, out=consumed)
+        torch.npu.synchronize()
+        completion = time.monotonic_ns()
+        elapsed_ms = float(start.elapsed_time(end))
+        if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
+            raise RuntimeError(f"Invalid device interval: {elapsed_ms} ms")
+        _check_outputs(iteration, local, previous_epochs)
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+        records = timing["warmup_samples"] if sample_index < 0 else timing["samples"]
+        records.append(
+            {
+                "sample_index": sample_index,
+                "input_iteration": iteration,
+                "start_wall_ns": start_wall_ns,
+                "submit_start_monotonic_ns": submit_start,
+                "submit_end_monotonic_ns": submit_end,
+                "completion_monotonic_ns": completion,
+                "device_elapsed_ms": elapsed_ms,
+            }
+        )
+        _save(result_path, result, f"{phase}/checked")
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/drained")
+    if timing_graph is not None:
+        timing_graph.reset()
+        timing["graph_reset"] = True
+        del timing_graph
+    _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/closed")
+    _save(result_path, result, f"count-{count}/timing/complete")
 
 
 def _run_batch(
@@ -558,8 +711,112 @@ def _run_batch(
     _save(result_path, result, "batch/checked")
 
 
+def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identities: tuple[str, ...]) -> dist.Store:
+    store = dist.FileStore(str(args.artifact_dir / "bootstrap.store"), args.world_size)
+    store.set_timeout(timedelta(seconds=120))
+    if store.add(f"participant/{args.rank}", 1) != 1:
+        raise RuntimeError("FileStore namespace already used by this rank")
+    configuration_fields = (
+        "backend",
+        "timing_samples",
+        "timing_warmup",
+        "comparison_id",
+        "round_id",
+        "stage_index",
+        "row_width",
+        "native_build_revision",
+        "world_size",
+        "mode",
+        "stress_batch",
+        "skew_phase",
+        "skew_iterations",
+        "graph_replays",
+        "alternate_count",
+        "dtype",
+        "counts",
+        "lanes",
+        "chunk_bytes",
+        "heap_bytes",
+        "repeats",
+        "versions",
+        "environment",
+    )
+    configuration_data = {name: result[name] for name in configuration_fields}
+    configuration_data["source_sha256"] = {name: result[name]["sha256"] for name in identities}
+    configuration = json.dumps(configuration_data, sort_keys=True).encode()
+    store.set(f"config/{args.rank}", configuration)
+    store.set(f"device/{args.rank}", str(args.device))
+    devices = []
+    for peer in range(args.world_size):
+        if store.get(f"config/{peer}") != configuration:
+            raise RuntimeError(f"AllGather configuration mismatch with PE {peer}")
+        devices.append(int(store.get(f"device/{peer}")))
+    if len(set(devices)) != args.world_size:
+        raise RuntimeError(f"PEs require distinct devices, got {devices}")
+    result["pe_devices"] = devices
+    return store
+
+
+def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Path) -> None:
+    import torch_npu
+
+    torch.set_num_threads(1)
+    torch.npu.set_device(args.device)
+    device = torch.device(f"npu:{args.device}")
+    result["versions"] = {"torch": torch.__version__, "torch_npu": torch_npu.__version__}
+    result["native_library"] = _file_identity(args.native_library)
+    result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
+    torch.ops.load_library(str(args.native_library))
+    if not callable(torch.ops.xllm_ops.npu_all_gather.default):
+        raise RuntimeError("Native current-stream HCCL AllGather registration is not callable")
+    if result["native_library"] != _file_identity(args.native_library):
+        raise RuntimeError("HCCL native library identity changed during loading")
+    _save(result_path, result, "bootstrap")
+    store = _bootstrap_store(args, result, ("worker", "native_library"))
+    if dist.is_initialized():
+        raise RuntimeError("Test requires an uninitialized HCCL process")
+    dist.init_process_group(
+        backend="hccl",
+        init_method=(args.artifact_dir / "hccl.store").as_uri(),
+        world_size=args.world_size,
+        rank=args.rank,
+        timeout=timedelta(seconds=120),
+    )
+    group = dist.new_group(ranks=list(range(args.world_size)), backend="hccl", timeout=timedelta(seconds=120))
+    warm = torch.ones(1, dtype=torch.float32, device=device)
+    dist.all_reduce(warm, group=group)
+    torch.npu.synchronize()
+    comm = group._get_backend(device).get_hccl_comm(device.index)
+    if not comm:
+        raise RuntimeError(f"No HCCL communicator on {device}")
+    result["bootstrap"] = "HCCL/ProcessGroup"
+    result["hccl_comm"] = hex(comm)
+    result["group_name"] = group.group_name
+    result["pg_owner"] = "torch.distributed.new_group(ranks=all_PEs, backend='hccl')"
+    _rendezvous(store, args.rank, args.world_size, "initialized")
+    for count in args.counts:
+        _run_case(args, store, result, result_path, count, None, None, None, comm)
+    _save(result_path, result, "close/drain")
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, "drained")
+    dist.destroy_process_group(group)
+    dist.destroy_process_group()
+    _rendezvous(store, args.rank, args.world_size, "closed")
+    result["status"] = "PASS"
+    _save(result_path, result, "complete")
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=("shmem", "hccl"), default="shmem")
+    parser.add_argument("--timing-samples", type=int, default=0)
+    parser.add_argument("--timing-warmup", type=int, default=20)
+    parser.add_argument("--comparison-id")
+    parser.add_argument("--round-id", type=int)
+    parser.add_argument("--stage-index", type=int)
+    parser.add_argument("--row-width", type=int)
+    parser.add_argument("--native-library", type=Path)
+    parser.add_argument("--native-build-revision")
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--world-size", type=int, choices=(2, 4, 8, 16), required=True)
     parser.add_argument("--device", type=int, required=True)
@@ -582,6 +839,45 @@ def _main() -> None:
     parser.add_argument("--heap-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--repeats", type=int, default=16)
     args = parser.parse_args()
+    if args.timing_samples < 0:
+        parser.error("timing-samples must be nonnegative")
+    if args.timing_samples:
+        if args.timing_samples < 2 or args.timing_warmup < 2:
+            parser.error("Gather-only timing requires at least two warmup and measured samples")
+        if (
+            args.compile_only
+            or args.stress_batch
+            or args.skew_phase != "none"
+            or args.skew_iterations != 0
+            or args.graph_replays is not None
+            or args.alternate_count is not None
+        ):
+            parser.error("Timing excludes compile-only, retained-batch and skew instrumentation")
+        if args.comparison_id is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.comparison_id) is None:
+            parser.error("comparison-id must be a nonempty 1..128 character alphanumeric/underscore/dot/hyphen ID")
+        if args.round_id is None or args.round_id < 0 or args.stage_index is None or args.stage_index < 0:
+            parser.error("Timing requires nonnegative round-id and stage-index")
+        if args.row_width is not None and (args.row_width <= 0 or any(count % args.row_width for count in args.counts)):
+            parser.error("row-width must be positive and divide every count")
+    elif args.timing_warmup != 20 or any(
+        value is not None
+        for value in (args.comparison_id, args.round_id, args.stage_index, args.row_width, args.native_build_revision)
+    ):
+        parser.error("Timing metadata requires positive timing-samples")
+    if args.backend == "hccl":
+        if not args.timing_samples:
+            parser.error("The HCCL backend is only available for matched gather-only measurement")
+        if args.native_library is None or not args.native_library.is_absolute() or not args.native_library.is_file():
+            parser.error("HCCL requires native-library as an existing absolute file")
+        args.native_library = args.native_library.resolve()
+        if args.native_build_revision is None or re.fullmatch(r"[0-9a-f]{40}", args.native_build_revision) is None:
+            parser.error("HCCL requires the full native-build-revision caller assertion")
+        if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV" or any(
+            not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
+        ):
+            parser.error("HCCL requires explicit AIV expansion and host/NPU socket port ranges")
+    elif args.native_library is not None or args.native_build_revision is not None:
+        parser.error("SHMEM must not load an HCCL native library")
     if not 0 <= args.rank < args.world_size or args.device < 0:
         parser.error("Require 0 <= rank < world-size and a nonnegative explicit device")
     if args.stress_batch and args.compile_only:
@@ -622,6 +918,14 @@ def _main() -> None:
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
     result: dict[str, Any] = {
+        "backend": args.backend,
+        "timing_samples": args.timing_samples,
+        "timing_warmup": args.timing_warmup,
+        "comparison_id": args.comparison_id,
+        "round_id": args.round_id,
+        "stage_index": args.stage_index,
+        "row_width": args.row_width,
+        "native_build_revision": args.native_build_revision,
         "rank": args.rank,
         "world_size": args.world_size,
         "device": args.device,
@@ -644,7 +948,18 @@ def _main() -> None:
         "cases": [],
         "environment": {
             name: os.environ.get(name)
-            for name in ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_HOME_PATH", "TL_ROOT", "SHMEM_HOME_PATH")
+            for name in (
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "ASCEND_HOME_PATH",
+                "TL_ROOT",
+                "SHMEM_HOME_PATH",
+                "HCCL_OP_EXPANSION_MODE",
+                "HCCL_HOST_SOCKET_PORT_RANGE",
+                "HCCL_NPU_SOCKET_PORT_RANGE",
+                "HCCL_IF_IP",
+                "HCCL_ALGO",
+                "TORCH_HCCL_ZERO_COPY",
+            )
         },
     }
     # Refuse an earlier attempt's rank result or rendezvous namespace.
@@ -653,6 +968,9 @@ def _main() -> None:
     _save(result_path, result, "imports")
     if args.compile_only:
         _compile_only(args, result, result_path)
+        return
+    if args.backend == "hccl":
+        _run_hccl(args, result, result_path)
         return
     # Native initialization resets its log level; the environment overrides it.
     # File logging preserves diagnostics if native failure also crashes at exit.
@@ -685,42 +1003,11 @@ def _main() -> None:
     result["tilelang_python"] = _file_identity(tilelang.__file__)
     result["tilelang_native"] = _file_identity(tilelang._LIB_PATH)
     _save(result_path, result, "bootstrap")
-    store = dist.FileStore(str(args.artifact_dir / "bootstrap.store"), args.world_size)
-    store.set_timeout(timedelta(seconds=120))
-    if store.add(f"participant/{args.rank}", 1) != 1:
-        raise RuntimeError("FileStore namespace already used by this rank")
-    configuration_fields = (
-        "world_size",
-        "mode",
-        "stress_batch",
-        "skew_phase",
-        "skew_iterations",
-        "graph_replays",
-        "alternate_count",
-        "dtype",
-        "counts",
-        "lanes",
-        "chunk_bytes",
-        "heap_bytes",
-        "repeats",
-        "versions",
+    store = _bootstrap_store(
+        args,
+        result,
+        ("worker", "kernel", "shmem_python", "shmem_native", "tilelang_python", "tilelang_native"),
     )
-    configuration_data = {name: result[name] for name in configuration_fields}
-    configuration_data["source_sha256"] = {
-        name: result[name]["sha256"]
-        for name in ("worker", "kernel", "shmem_python", "shmem_native", "tilelang_python", "tilelang_native")
-    }
-    configuration = json.dumps(configuration_data, sort_keys=True).encode()
-    store.set(f"config/{args.rank}", configuration)
-    store.set(f"device/{args.rank}", str(args.device))
-    devices = []
-    for peer in range(args.world_size):
-        if store.get(f"config/{peer}") != configuration:
-            raise RuntimeError(f"AllGather configuration mismatch with PE {peer}")
-        devices.append(int(store.get(f"device/{peer}")))
-    if len(set(devices)) != args.world_size:
-        raise RuntimeError(f"PEs require distinct devices, got {devices}")
-    result["pe_devices"] = devices
     if shmem.aclshmemx_init_status() != shmem.InitStatus.NOT_INITIALIZED:
         raise RuntimeError("Test requires an uninitialized SHMEM process")
     # Use the selected SHMEM version's official config-store TCP/MTE bootstrap.
@@ -800,5 +1087,5 @@ if __name__ == "__main__":
     try:
         _main()
     except Exception:
-        logger.exception("SHMEM AllGather worker failed; inspect its saved phase and original traceback")
+        logger.exception("AllGather worker failed; inspect its saved phase and original traceback")
         raise
