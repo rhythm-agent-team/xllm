@@ -68,8 +68,11 @@ def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch
     identity = rank + 16 * (iteration + 2)
     # Signed markers and their +1 consumer results are exact in BF16. For the
     # initial 16 repeats, position zero distinguishes all supported PE/call pairs.
-    # The odd stride distinguishes positions within each 512-element period.
-    values = (identity + (2 * iteration + 1) * positions) % 512 - 256
+    # The odd column stride and row marker expose both intra-row errors and
+    # whole-row shifts; no scalar pattern claims global position uniqueness.
+    rows = positions // 512
+    columns = positions % 512
+    values = (identity + (2 * iteration + 1) * columns + 31 * rows) % 512 - 256
     return values.to(dtype)
 
 
