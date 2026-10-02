@@ -45,8 +45,15 @@ def build_shmem_all_gather_kernel(
     lanes: int,
     chunk_bytes: int,
     dtype: str,
+    *,
+    skew_phase: str = "none",
+    skew_iterations: int = 0,
 ) -> tvm.tir.PrimFunc:
-    """Return one kernel; every PE must use identical count and specialization."""
+    """Return one kernel; every PE must use identical count and specialization.
+
+    Optional test-only skew delays PE1/lane0 consuming PE0 using bounded local
+    copies. It is disabled by default and must not be used for performance data.
+    """
     if dtype not in SUPPORTED_DTYPES:
         raise ValueError(f"Unsupported SHMEM AllGather dtype: {dtype}")
     if world_size not in (2, 4, 8, 16):
@@ -59,10 +66,31 @@ def build_shmem_all_gather_kernel(
         raise ValueError(f"SHMEM chunk_bytes must be a positive multiple of 128, got {chunk_bytes}")
     if chunk_bytes > 64 * 1024:
         raise ValueError("SHMEM payload exceeds the initial 64 KiB per-lane UB budget")
+    if skew_phase not in ("none", "read", "ack"):
+        raise ValueError(f"Unsupported SHMEM AllGather skew phase: {skew_phase}")
+    if (skew_phase == "none" and skew_iterations != 0) or (skew_phase != "none" and not 0 < skew_iterations <= 32768):
+        raise ValueError("Skew requires 1..32768 iterations; disabled skew requires zero iterations")
     chunk_elements = chunk_bytes // SUPPORTED_DTYPES[dtype]
     rounds = (count + lanes * chunk_elements - 1) // (lanes * chunk_elements)
     window_elements = world_size * lanes * chunk_elements
     control_elements = 2 * world_size * lanes * SIGNAL_STRIDE
+    scratch_band_elements = max(1, skew_iterations) * SIGNAL_STRIDE
+    scratch_elements = 2 * scratch_band_elements
+    skew_before_read = skew_phase == "read"
+    skew_before_ack = skew_phase == "ack"
+
+    @T.macro
+    def copy_skew_tiles(
+        scratch: T.Tensor((scratch_elements,), "int32"),
+        skew_ub: T.Tensor((SIGNAL_STRIDE,), "int32"),
+    ) -> None:
+        for step in T.serial(skew_iterations):
+            begin = step * SIGNAL_STRIDE
+            T.copy(scratch[begin : begin + SIGNAL_STRIDE], skew_ub)
+            T.barrier_all()
+            sink_begin = scratch_band_elements + begin
+            T.copy(skew_ub, scratch[sink_begin : sink_begin + SIGNAL_STRIDE])
+            T.barrier_all()
 
     @T.prim_func
     def shmem_all_gather(
@@ -71,10 +99,12 @@ def build_shmem_all_gather_kernel(
         receive: T.Tensor((window_elements,), dtype),
         controls: T.Tensor((control_elements,), "int32"),
         epochs: T.Tensor((lanes * SIGNAL_STRIDE,), "int32"),
+        scratch: T.Tensor((scratch_elements,), "int32"),
         rank: T.int32,
     ):
         with T.Kernel(lanes // 2, is_npu=True) as (core, subcore):
             payload = T.alloc_ub((chunk_elements,), dtype)
+            skew_ub = T.alloc_ub((SIGNAL_STRIDE,), "int32")
             publication = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             probe = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             epoch = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
@@ -127,12 +157,18 @@ def build_shmem_all_gather_kernel(
                             T.copy(controls[(peer * lanes + lane) * SIGNAL_STRIDE], probe)
                             T.barrier_all()
                             observed[0] = probe[0]
+                        if skew_before_read:
+                            if rank == 1 and lane == 0 and peer == 0 and chunk == 0:
+                                copy_skew_tiles(scratch, skew_ub)
                         if length > 0:
                             start = (peer * lanes + lane) * chunk_elements
                             T.copy(receive[start], payload)
                             T.barrier_all()
                             T.copy(payload, output[peer, offset])
                             T.barrier_all()
+                        if skew_before_ack:
+                            if rank == 1 and lane == 0 and peer == 0 and chunk == rounds - 1:
+                                copy_skew_tiles(scratch, skew_ub)
                         T.shmem_ub_put_nbi(
                             publication,
                             controls,

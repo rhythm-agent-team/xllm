@@ -92,6 +92,31 @@ def _check_guards(storage: torch.Tensor, count: int, guard_elements: int) -> Non
     assert torch.all(actual[guard_elements + count :] == _GUARD_VALUE), "Tail padding or trailing guard changed"
 
 
+def _prepare_scratch(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    band_elements = max(1, args.skew_iterations) * 32
+    elements = 2 * band_elements
+    storage, scratch, guard = _guarded(elements, torch.int32, device)
+    initial = torch.full((elements,), -1, dtype=torch.int32)
+    initial[:band_elements] = torch.arange(band_elements, dtype=torch.int32) + 1
+    expected = initial.clone()
+    if args.skew_phase != "none" and args.rank == 1:
+        expected[band_elements:] = initial[:band_elements]
+    scratch.copy_(initial)
+    return {
+        "storage": storage,
+        "tensor": scratch,
+        "guard": guard,
+        "elements": elements,
+        "initial": initial,
+        "expected": expected,
+    }
+
+
+def _check_scratch(scratch: dict[str, Any]) -> None:
+    torch.testing.assert_close(scratch["tensor"].cpu(), scratch["expected"], rtol=0, atol=0)
+    _check_guards(scratch["storage"], scratch["elements"], scratch["guard"])
+
+
 def _check_state(
     controls: torch.Tensor, epochs: torch.Tensor, expected: torch.Tensor, lanes: int, world_size: int
 ) -> None:
@@ -120,7 +145,13 @@ def _compile_only(args: argparse.Namespace, result: dict[str, Any], result_path:
     for count in args.counts:
         _save(result_path, result, f"count-{count}/lower")
         function = kernel_module.build_shmem_all_gather_kernel(
-            count, args.world_size, args.lanes, args.chunk_bytes, args.dtype
+            count,
+            args.world_size,
+            args.lanes,
+            args.chunk_bytes,
+            args.dtype,
+            skew_phase=args.skew_phase,
+            skew_iterations=args.skew_iterations,
         )
         with tilelang.tvm.transform.PassContext(opt_level=3, config=kernel_module.SHMEM_PASS_CONFIGS):
             lowered = tilelang.lower(function, target="ascendc", platform="A3")
@@ -149,10 +180,19 @@ def _run_case(
     device = torch.device(f"npu:{args.device}")
     source_storage, source, source_guard = _guarded(count, dtype, device)
     output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
-    consumed = torch.empty_like(output)
+    consumer_storage, consumed, consumer_guard = _guarded(args.world_size * count, dtype, device)
+    scratch = _prepare_scratch(args, device)
     _save(result_path, result, f"count-{count}/compile")
     kernel = tilelang.compile(
-        build_shmem_all_gather_kernel(count, args.world_size, args.lanes, args.chunk_bytes, args.dtype),
+        build_shmem_all_gather_kernel(
+            count,
+            args.world_size,
+            args.lanes,
+            args.chunk_bytes,
+            args.dtype,
+            skew_phase=args.skew_phase,
+            skew_iterations=args.skew_iterations,
+        ),
         out_idx=None,
         target="ascendc",
         platform="A3",
@@ -176,7 +216,7 @@ def _run_case(
     )
 
     def _submit() -> None:
-        kernel(source, output.view(args.world_size, count), receive, controls, epochs, args.rank)
+        kernel(source, output.view(args.world_size, count), receive, controls, epochs, scratch["tensor"], args.rank)
         # The consumer is on the same current stream immediately after gather.
         torch.add(output, 1, out=consumed)
 
@@ -185,6 +225,7 @@ def _run_case(
         source.copy_(local)
         output.fill_(float("nan"))
         consumed.fill_(float("nan"))
+        scratch["tensor"].copy_(scratch["initial"])
         return local
 
     def _check(iteration: int, local: torch.Tensor, previous_epochs: torch.Tensor) -> None:
@@ -195,6 +236,8 @@ def _run_case(
         torch.testing.assert_close(consumed.cpu(), expected + 1, rtol=0, atol=0)
         _check_guards(source_storage, count, source_guard)
         _check_guards(output_storage, args.world_size * count, output_guard)
+        _check_guards(consumer_storage, args.world_size * count, consumer_guard)
+        _check_scratch(scratch)
         _check_state(controls, epochs, (previous_epochs + rounds) % 2, args.lanes, args.world_size)
         case["checked_iterations"].append(iteration)
         # Keep the next invocation from changing controls during another PE's
@@ -263,7 +306,15 @@ def _run_batch(
     _save(result_path, result, "batch/compile")
     for count in args.counts:
         kernel = tilelang.compile(
-            build_shmem_all_gather_kernel(count, args.world_size, args.lanes, args.chunk_bytes, args.dtype),
+            build_shmem_all_gather_kernel(
+                count,
+                args.world_size,
+                args.lanes,
+                args.chunk_bytes,
+                args.dtype,
+                skew_phase=args.skew_phase,
+                skew_iterations=args.skew_iterations,
+            ),
             out_idx=None,
             target="ascendc",
             platform="A3",
@@ -282,19 +333,20 @@ def _run_batch(
 
     _save(result_path, result, "batch/prepare")
     calls = []
-    total_rounds = 0
     round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
-    for call_id, count in enumerate(args.counts * args.repeats):
+    batch_counts = args.counts * args.repeats
+    retained_counts = batch_counts + ([] if args.alternate_count is None else [args.alternate_count])
+    for call_id, count in enumerate(retained_counts):
         source_storage, source, source_guard = _guarded(count, dtype, device)
         output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
         consumer_storage, consumer, consumer_guard = _guarded(args.world_size * count, dtype, device)
+        scratch = _prepare_scratch(args, device)
         local = _payload(args.rank, count, call_id, dtype)
         expected = torch.cat([_payload(peer, count, call_id, dtype) for peer in range(args.world_size)])
         source.copy_(local)
         output.fill_(float("nan"))
         consumer.fill_(float("nan"))
         rounds = (count + round_elements - 1) // round_elements
-        total_rounds += rounds
         calls.append(
             {
                 "call_id": call_id,
@@ -312,39 +364,197 @@ def _run_batch(
                 "consumer": consumer,
                 "consumer_storage": consumer_storage,
                 "consumer_guard": consumer_guard,
+                "scratch": scratch,
                 "expected": expected,
             }
         )
+    groups = [calls[: len(batch_counts)]]
+    if args.alternate_count is not None:
+        groups.append(calls[len(batch_counts) :])
+    group_rounds = [sum(call["rounds"] for call in group) for group in groups]
     torch.npu.synchronize()
     starting_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
     assert torch.all((starting_epochs == 0) | (starting_epochs == 1)), "Invalid device epoch"
     result["batch"] = {
-        "counts": [call["count"] for call in calls],
-        "rounds": [call["rounds"] for call in calls],
+        "counts": batch_counts,
+        "rounds": [call["rounds"] for call in groups[0]],
         "starting_epochs": starting_epochs.tolist(),
-        "total_rounds": total_rounds,
+        "total_rounds": group_rounds[0],
         "checked_calls": [],
+        "graph_groups": [[call["count"] for call in group] for group in groups],
+        "group_rounds": group_rounds,
+        "graph_warmups": [],
+        "graph_captures": [],
+        "graph_replays": [],
+        "graphs_reset": False,
     }
     _rendezvous(store, args.rank, args.world_size, "batch/prepared")
-    _save(result_path, result, "batch/submit-and-drain")
-    # Everything is prepared above. No per-call host checks, state reset,
-    # rendezvous, allocation, or logging belongs in this submission loop.
-    for call in calls:
-        call["kernel"](call["source"], call["rank_major_output"], receive, controls, epochs, args.rank)
-        torch.add(call["output"], 1, out=call["consumer"])
-    torch.npu.synchronize()
-    _rendezvous(store, args.rank, args.world_size, "batch/drained")
 
-    _save(result_path, result, "batch/check")
-    for call in calls:
-        torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
-        torch.testing.assert_close(call["output"].cpu(), call["expected"], rtol=0, atol=0)
-        torch.testing.assert_close(call["consumer"].cpu(), call["expected"] + 1, rtol=0, atol=0)
-        _check_guards(call["source_storage"], call["count"], call["source_guard"])
-        _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
-        _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
-        result["batch"]["checked_calls"].append(call["call_id"])
-    _check_state(controls, epochs, (starting_epochs + total_rounds) % 2, args.lanes, args.world_size)
+    def _submit(group: list[dict[str, Any]]) -> None:
+        # No per-call host checks, resets, rendezvous, allocation or logging.
+        for call in group:
+            call["kernel"](
+                call["source"],
+                call["rank_major_output"],
+                receive,
+                controls,
+                epochs,
+                call["scratch"]["tensor"],
+                args.rank,
+            )
+            torch.add(call["output"], 1, out=call["consumer"])
+
+    def _check_outputs(group: list[dict[str, Any]], executed: bool = True) -> None:
+        for call in group:
+            torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
+            if executed:
+                torch.testing.assert_close(call["output"].cpu(), call["expected"], rtol=0, atol=0)
+                torch.testing.assert_close(call["consumer"].cpu(), call["expected"] + 1, rtol=0, atol=0)
+                _check_scratch(call["scratch"])
+            else:
+                assert torch.all(torch.isnan(call["output"].cpu())), "Inactive graph output poison changed"
+                assert torch.all(torch.isnan(call["consumer"].cpu())), "Inactive graph consumer poison changed"
+                torch.testing.assert_close(call["scratch"]["tensor"].cpu(), call["scratch"]["initial"], rtol=0, atol=0)
+            _check_guards(call["source_storage"], call["count"], call["source_guard"])
+            _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
+            _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
+            _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
+
+    def _prepare(group: list[dict[str, Any]], iteration: int) -> None:
+        for call in group:
+            identity = iteration + call["call_id"]
+            call["local"] = _payload(args.rank, call["count"], identity, dtype)
+            call["expected"] = torch.cat(
+                [_payload(peer, call["count"], identity, dtype) for peer in range(args.world_size)]
+            )
+            call["source"].copy_(call["local"])
+            call["output"].fill_(float("nan"))
+            call["consumer"].fill_(float("nan"))
+            call["scratch"]["tensor"].copy_(call["scratch"]["initial"])
+
+    def _check_group(group_id: int, previous: torch.Tensor, phase: str) -> dict[str, Any]:
+        torch.npu.synchronize()
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
+        _check_outputs(groups[group_id])
+        expected_epochs = (previous + group_rounds[group_id]) % 2
+        _check_state(controls, epochs, expected_epochs, args.lanes, args.world_size)
+        observed_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].tolist()
+        record = {
+            "group": group_id,
+            "starting_epochs": previous.tolist(),
+            "ending_epochs": observed_epochs,
+            "checked_calls": [call["call_id"] for call in groups[group_id]],
+        }
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+        return record
+
+    if args.mode == "eager":
+        _save(result_path, result, "batch/submit-and-drain")
+        _submit(groups[0])
+        checked = _check_group(0, starting_epochs, "batch")
+        result["batch"]["checked_calls"] = checked["checked_calls"]
+        _save(result_path, result, "batch/checked")
+        return
+
+    for iteration in (-2, -1):
+        for group_id, group in enumerate(groups):
+            phase = f"batch/warmup-{iteration}/group-{group_id}"
+            _save(result_path, result, phase)
+            previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+            _prepare(group, iteration)
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+            _submit(group)
+            checked = _check_group(group_id, previous, phase)
+            checked["iteration"] = iteration
+            result["batch"]["graph_warmups"].append(checked)
+
+    graphs = []
+    capture_stream = torch.npu.Stream()
+    for group_id, group in enumerate(groups):
+        phase = f"batch/capture/group-{group_id}"
+        _save(result_path, result, phase)
+        _prepare(group, -3)
+        torch.npu.synchronize()
+        before_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+        graph = torch.npu.NPUGraph()
+        graphs.append(graph)
+        with torch.npu.graph(graph, stream=capture_stream):
+            _submit(group)
+        torch.npu.synchronize()
+        # Capture may or may not execute; only observed replay prestate is used.
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/captured")
+        after_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        assert torch.equal(after_capture, before_capture) or torch.equal(
+            after_capture, (before_capture + group_rounds[group_id]) % 2
+        ), "Invalid capture epoch transition"
+        _check_state(controls, epochs, after_capture, args.lanes, args.world_size)
+        for call in group:
+            torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
+            source_band = call["scratch"]["elements"] // 2
+            torch.testing.assert_close(
+                call["scratch"]["tensor"][:source_band].cpu(),
+                call["scratch"]["initial"][:source_band],
+                rtol=0,
+                atol=0,
+            )
+            _check_guards(call["source_storage"], call["count"], call["source_guard"])
+            _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
+            _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
+            _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
+        result["batch"]["graph_captures"].append(
+            {"group": group_id, "starting_epochs": before_capture.tolist(), "ending_epochs": after_capture.tolist()}
+        )
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/observed")
+
+    last_ending = after_capture.tolist()
+    for group in groups:
+        _prepare(group, -4)
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, "batch/poisoned-after-capture")
+    for group in groups:
+        _check_outputs(group, executed=False)
+    retained_groups = set()
+    for iteration in range(args.graph_replays):
+        for group_id, group in enumerate(groups):
+            phase = f"batch/replay-{iteration}/group-{group_id}"
+            _save(result_path, result, phase)
+            previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+            assert previous.tolist() == last_ending, "Protocol state changed between checked operations"
+            assert torch.all((previous == 0) | (previous == 1)), "Invalid replay prestate"
+            _prepare(group, iteration)
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+            with torch.npu.stream(capture_stream):
+                graphs[group_id].replay()
+            checked = _check_group(group_id, previous, phase)
+            inactive_groups = [other_id for other_id in range(len(groups)) if other_id != group_id]
+            for inactive_id in inactive_groups:
+                _check_outputs(groups[inactive_id], executed=inactive_id in retained_groups)
+            checked["checked_inactive_groups"] = inactive_groups
+            checked["iteration"] = iteration
+            result["batch"]["graph_replays"].append(checked)
+            last_ending = checked["ending_epochs"]
+            retained_groups.add(group_id)
+            _rendezvous(store, args.rank, args.world_size, f"{phase}/retained-checked")
+
+    for group_id in range(len(groups)):
+        starts = {
+            tuple(record["starting_epochs"])
+            for record in result["batch"]["graph_replays"]
+            if record["group"] == group_id
+        }
+        assert starts == {(0,) * args.lanes, (1,) * args.lanes}, "Live graphs did not exercise both epoch parities"
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, "batch/graphs-drained")
+    for graph in graphs:
+        graph.reset()
+    graphs.clear()
+    _rendezvous(store, args.rank, args.world_size, "batch/graphs-reset")
+    result["batch"]["graphs_reset"] = True
+    result["batch"]["final_epochs"] = last_ending
+    result["batch"]["checked_calls"] = list(range(len(batch_counts)))
     _save(result_path, result, "batch/checked")
 
 
@@ -356,8 +566,12 @@ def _main() -> None:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--skew-phase", choices=("none", "read", "ack"), default="none")
+    parser.add_argument("--skew-iterations", type=int, default=0)
+    parser.add_argument("--graph-replays", type=int, help="Checked retained graph replay rounds")
+    parser.add_argument("--alternate-count", type=int, help="Second live graph contains one call of this count")
     parser.add_argument(
-        "--stress-batch", action="store_true", help="Retain counts * repeats calls and check after one eager drain"
+        "--stress-batch", action="store_true", help="Retain counts * repeats calls and check after each full drain"
     )
     parser.add_argument(
         "--compile-only", action="store_true", help="Lower DSL only; no SHMEM bootstrap or NPU execution"
@@ -370,8 +584,22 @@ def _main() -> None:
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size or args.device < 0:
         parser.error("Require 0 <= rank < world-size and a nonnegative explicit device")
-    if args.stress_batch and (args.mode != "eager" or args.compile_only):
-        parser.error("Retained batch validation requires eager device execution")
+    if args.stress_batch and args.compile_only:
+        parser.error("Retained batch validation requires device execution")
+    retained_graph = args.stress_batch and args.mode == "graph"
+    if not retained_graph and (args.graph_replays is not None or args.alternate_count is not None):
+        parser.error("Graph replay options require --stress-batch --mode graph")
+    if retained_graph:
+        if args.graph_replays is None:
+            args.graph_replays = 16
+        if args.graph_replays < 2:
+            parser.error("Retained graphs require at least two replay rounds")
+        if args.alternate_count is not None and args.alternate_count not in args.counts:
+            parser.error("Alternate count must belong to --counts")
+    if (args.skew_phase == "none" and args.skew_iterations != 0) or (
+        args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
+    ):
+        parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
     if args.lanes <= 0 or args.lanes % 2 or args.repeats <= 0:
         parser.error("Require positive even lanes and positive repeats")
     if not 0 < args.chunk_bytes <= 64 * 1024 or args.chunk_bytes % 128:
@@ -380,6 +608,13 @@ def _main() -> None:
         not 0 < args.world_size * count <= (1 << 31) - 1 for count in args.counts
     ):
         parser.error("Require distinct positive counts with world-size * count <= INT32_MAX")
+    if retained_graph:
+        round_elements = args.lanes * args.chunk_bytes // (4 if args.dtype == "float32" else 2)
+        total_rounds = sum((count + round_elements - 1) // round_elements for count in args.counts) * args.repeats
+        if args.alternate_count is not None:
+            total_rounds += (args.alternate_count + round_elements - 1) // round_elements
+        if total_rounds % 2 != 1:
+            parser.error("Retained graph sequence must have odd total rounds to exercise both epoch parities")
     required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
     if args.heap_bytes < required_bytes:
         parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")
@@ -392,6 +627,10 @@ def _main() -> None:
         "device": args.device,
         "mode": args.mode,
         "stress_batch": args.stress_batch,
+        "skew_phase": args.skew_phase,
+        "skew_iterations": args.skew_iterations,
+        "graph_replays": args.graph_replays,
+        "alternate_count": args.alternate_count,
         "compile_only": args.compile_only,
         "dtype": args.dtype,
         "counts": args.counts,
@@ -454,6 +693,10 @@ def _main() -> None:
         "world_size",
         "mode",
         "stress_batch",
+        "skew_phase",
+        "skew_iterations",
+        "graph_replays",
+        "alternate_count",
         "dtype",
         "counts",
         "lanes",
