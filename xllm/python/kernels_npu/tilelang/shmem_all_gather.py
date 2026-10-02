@@ -78,8 +78,8 @@ def build_shmem_all_gather_kernel(
             publication = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             probe = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             epoch = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
-            generation = T.alloc_var("int32", init=0)
-            observed = T.alloc_var("int32", init=-1)
+            generation = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
+            observed = T.alloc_ub((SIGNAL_ELEMENTS,), "int32")
             with T.Scope("V"):
                 lane = core * 2 + subcore
                 T.copy(epochs[lane * SIGNAL_STRIDE], epoch)
