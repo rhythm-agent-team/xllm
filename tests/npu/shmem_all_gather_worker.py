@@ -15,8 +15,9 @@
 """One rank of a direct Python TileLang SHMEM AllGather correctness test.
 
 Launch one worker per PE with a fresh shared --artifact-dir and explicit NPU
---device. CPU FileStore coordination and HYBM/TCP bootstrap use no HCCL or MPI. The caller
-must verify device availability and provide matching TileLang/SHMEM packages.
+--device. CPU FileStore coordination and SHMEM TCP/MTE bootstrap use no HCCL or
+MPI. The caller must verify device availability and provide matching TileLang
+and SHMEM packages.
 No xLLM native binary, AOT registration, package installation, or runtime shim
 is used. A failure leaves the original traceback and saved phase; it does not
 enter a cleanup rendezvous that could hide the failure behind a peer timeout.
@@ -64,10 +65,11 @@ def _file_identity(path: str | Path) -> dict[str, str]:
 
 def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch.Tensor:
     positions = torch.arange(count, dtype=torch.int64)
-    rows = positions // 17
-    columns = positions % 17
-    # All markers are exact in BF16; the prime period differs from DMA tiles.
-    values = (31 * rank + 97 * rows + 53 * columns + 71 * iteration) % 251
+    identity = rank + 16 * (iteration + 2)
+    # Signed markers and their +1 consumer results are exact in BF16. For the
+    # initial 16 repeats, position zero distinguishes all supported PE/call pairs.
+    # The odd stride distinguishes positions within each 512-element period.
+    values = (identity + (2 * iteration + 1) * positions) % 512 - 256
     return values.to(dtype)
 
 
@@ -239,6 +241,110 @@ def _run_case(
     _save(result_path, result, f"count-{count}/checked")
 
 
+def _run_batch(
+    args: argparse.Namespace,
+    store: dist.Store,
+    result: dict[str, Any],
+    result_path: Path,
+    receive: torch.Tensor,
+    controls: torch.Tensor,
+    epochs: torch.Tensor,
+) -> None:
+    import tilelang
+
+    from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
+
+    dtype = getattr(torch, args.dtype)
+    device = torch.device(f"npu:{args.device}")
+    kernels = {}
+    _save(result_path, result, "batch/compile")
+    for count in args.counts:
+        kernel = tilelang.compile(
+            build_shmem_all_gather_kernel(count, args.world_size, args.lanes, args.chunk_bytes, args.dtype),
+            out_idx=None,
+            target="ascendc",
+            platform="A3",
+            pass_configs=SHMEM_PASS_CONFIGS,
+        )
+        generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
+        generated_path.write_text(kernel.get_kernel_source(), encoding="utf-8")
+        result["cases"].append(
+            {
+                "count": count,
+                "generated_source": _file_identity(generated_path),
+                "jit_library": _file_identity(kernel.adapter.libpath),
+            }
+        )
+        kernels[count] = kernel
+
+    _save(result_path, result, "batch/prepare")
+    calls = []
+    total_rounds = 0
+    round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
+    for call_id, count in enumerate(args.counts * args.repeats):
+        source_storage, source, source_guard = _guarded(count, dtype, device)
+        output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
+        consumer_storage, consumer, consumer_guard = _guarded(args.world_size * count, dtype, device)
+        local = _payload(args.rank, count, call_id, dtype)
+        expected = torch.cat([_payload(peer, count, call_id, dtype) for peer in range(args.world_size)])
+        source.copy_(local)
+        output.fill_(float("nan"))
+        consumer.fill_(float("nan"))
+        rounds = (count + round_elements - 1) // round_elements
+        total_rounds += rounds
+        calls.append(
+            {
+                "call_id": call_id,
+                "count": count,
+                "rounds": rounds,
+                "kernel": kernels[count],
+                "source": source,
+                "source_storage": source_storage,
+                "source_guard": source_guard,
+                "local": local,
+                "output": output,
+                "rank_major_output": output.view(args.world_size, count),
+                "output_storage": output_storage,
+                "output_guard": output_guard,
+                "consumer": consumer,
+                "consumer_storage": consumer_storage,
+                "consumer_guard": consumer_guard,
+                "expected": expected,
+            }
+        )
+    torch.npu.synchronize()
+    starting_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+    assert torch.all((starting_epochs == 0) | (starting_epochs == 1)), "Invalid device epoch"
+    result["batch"] = {
+        "counts": [call["count"] for call in calls],
+        "rounds": [call["rounds"] for call in calls],
+        "starting_epochs": starting_epochs.tolist(),
+        "total_rounds": total_rounds,
+        "checked_calls": [],
+    }
+    _rendezvous(store, args.rank, args.world_size, "batch/prepared")
+    _save(result_path, result, "batch/submit-and-drain")
+    # Everything is prepared above. No per-call host checks, state reset,
+    # rendezvous, allocation, or logging belongs in this submission loop.
+    for call in calls:
+        call["kernel"](call["source"], call["rank_major_output"], receive, controls, epochs, args.rank)
+        torch.add(call["output"], 1, out=call["consumer"])
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, "batch/drained")
+
+    _save(result_path, result, "batch/check")
+    for call in calls:
+        torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
+        torch.testing.assert_close(call["output"].cpu(), call["expected"], rtol=0, atol=0)
+        torch.testing.assert_close(call["consumer"].cpu(), call["expected"] + 1, rtol=0, atol=0)
+        _check_guards(call["source_storage"], call["count"], call["source_guard"])
+        _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
+        _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
+        result["batch"]["checked_calls"].append(call["call_id"])
+    _check_state(controls, epochs, (starting_epochs + total_rounds) % 2, args.lanes, args.world_size)
+    _save(result_path, result, "batch/checked")
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, required=True)
@@ -247,6 +353,9 @@ def _main() -> None:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument(
+        "--stress-batch", action="store_true", help="Retain counts * repeats calls and check after one eager drain"
+    )
     parser.add_argument(
         "--compile-only", action="store_true", help="Lower DSL only; no SHMEM bootstrap or NPU execution"
     )
@@ -258,6 +367,8 @@ def _main() -> None:
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size or args.device < 0:
         parser.error("Require 0 <= rank < world-size and a nonnegative explicit device")
+    if args.stress_batch and (args.mode != "eager" or args.compile_only):
+        parser.error("Retained batch validation requires eager device execution")
     if args.lanes <= 0 or args.lanes % 2 or args.repeats <= 0:
         parser.error("Require positive even lanes and positive repeats")
     if not 0 < args.chunk_bytes <= 64 * 1024 or args.chunk_bytes % 128:
@@ -277,6 +388,7 @@ def _main() -> None:
         "world_size": args.world_size,
         "device": args.device,
         "mode": args.mode,
+        "stress_batch": args.stress_batch,
         "compile_only": args.compile_only,
         "dtype": args.dtype,
         "counts": args.counts,
@@ -302,16 +414,16 @@ def _main() -> None:
         return
     # Native initialization resets its log level; the environment overrides it.
     # File logging preserves diagnostics if native failure also crashes at exit.
-    os.environ["ACLSHMEM_LOG_LEVEL"] = "DEBUG"
-    os.environ["ACLSHMEM_LOG_TO_STDOUT"] = "0"
-    os.environ["ACLSHMEM_LOG_PATH"] = str(args.artifact_dir)
+    os.environ["SHMEM_LOG_LEVEL"] = "DEBUG"
+    os.environ["SHMEM_LOG_TO_STDOUT"] = "0"
+    os.environ["SHMEM_LOG_PATH"] = str(args.artifact_dir)
     result["environment"].update(
-        {name: os.environ[name] for name in ("ACLSHMEM_LOG_LEVEL", "ACLSHMEM_LOG_TO_STDOUT", "ACLSHMEM_LOG_PATH")}
+        {name: os.environ[name] for name in ("SHMEM_LOG_LEVEL", "SHMEM_LOG_TO_STDOUT", "SHMEM_LOG_PATH")}
     )
     import shmem
-    import shmem._pyshmem as shmem_native
     import tilelang
     import torch_npu
+    from shmem import InitAttr
     from shmem.construct_tensor import construct_tensor_from_ptr
 
     from xllm.python.kernels_npu.tilelang import shmem_all_gather as kernel_module
@@ -327,7 +439,7 @@ def _main() -> None:
     }
     result["kernel"] = _file_identity(kernel_module.__file__)
     result["shmem_python"] = _file_identity(shmem.__file__)
-    result["shmem_native"] = _file_identity(shmem_native.__file__)
+    result["shmem_native"] = _file_identity(sys.modules["shmem._pyshmem"].__file__)
     result["tilelang_python"] = _file_identity(tilelang.__file__)
     result["tilelang_native"] = _file_identity(tilelang._LIB_PATH)
     _save(result_path, result, "bootstrap")
@@ -338,6 +450,7 @@ def _main() -> None:
     configuration_fields = (
         "world_size",
         "mode",
+        "stress_batch",
         "dtype",
         "counts",
         "lanes",
@@ -364,7 +477,7 @@ def _main() -> None:
     result["pe_devices"] = devices
     if shmem.aclshmemx_init_status() != shmem.InitStatus.NOT_INITIALIZED:
         raise RuntimeError("Test requires an uninitialized SHMEM process")
-    # Match the existing TileLang JIT's HYBM device ABI and official TCP example.
+    # Use the selected SHMEM version's official config-store TCP/MTE bootstrap.
     # This is selected before execution, not a retry or a backend fallback.
     listener = None
     if args.rank == 0:
@@ -373,7 +486,7 @@ def _main() -> None:
         listener.listen(args.world_size)
         store.set("tcp_port", str(listener.getsockname()[1]))
     port = int(store.get("tcp_port"))
-    attributes = shmem.InitAttr()
+    attributes = InitAttr()
     attributes.my_rank = args.rank
     attributes.n_ranks = args.world_size
     attributes.local_mem_size = args.heap_bytes
@@ -392,7 +505,7 @@ def _main() -> None:
         result["status"] = "FAIL"
         _save(result_path, result, "bootstrap/native-init-failed")
         raise RuntimeError(f"aclshmem_init failed: {ret}")
-    result["bootstrap"] = "HYBM/TCP/MTE"
+    result["bootstrap"] = "SHMEM/TCP/MTE"
     if shmem.aclshmemx_init_status() != shmem.InitStatus.INITIALIZED:
         raise RuntimeError("SHMEM initialization returned without an initialized domain")
     if shmem.my_pe() != args.rank or shmem.pe_count() != args.world_size:
@@ -417,8 +530,11 @@ def _main() -> None:
     epochs.zero_()
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "initialized")
-    for count in args.counts:
-        _run_case(args, store, result, result_path, count, receive, controls, epochs)
+    if args.stress_batch:
+        _run_batch(args, store, result, result_path, receive, controls, epochs)
+    else:
+        for count in args.counts:
+            _run_case(args, store, result, result_path, count, receive, controls, epochs)
     _save(result_path, result, "close/drain")
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "drained")
@@ -426,9 +542,9 @@ def _main() -> None:
     views.clear()
     for pointer in reversed(allocations):
         shmem.aclshmem_free(pointer)
-    ret = shmem.aclshmem_finialize()
+    ret = shmem.aclshmem_finalize()
     if ret != 0:
-        raise RuntimeError(f"aclshmem_finialize failed: {ret}")
+        raise RuntimeError(f"aclshmem_finalize failed: {ret}")
     _rendezvous(store, args.rank, args.world_size, "closed")
     result["status"] = "PASS"
     _save(result_path, result, "complete")
