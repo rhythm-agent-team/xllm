@@ -931,7 +931,11 @@ class TestBindKvCaches:
     def test_bind_idempotent(self: TestBindKvCaches, mock_create: MagicMock) -> None:
         backend = StubAttentionBackend()
         mock_create.return_value = backend
-        executor = ModelExecutor(_FakeModel(num_layers=2), {"python_graph_backend": "aclgraph"}, max_seqs_per_batch=4)
+        executor = ModelExecutor(
+            _FakeModel(num_layers=2),
+            {"python_graph_backend": "aclgraph", "max_position_embeddings": 128},
+            max_seqs_per_batch=4,
+        )
         first = [LayerCache(torch.ones(1), torch.full((1,), 2.0)) for _ in range(2)]
         second = [LayerCache(torch.full((1,), 3.0), torch.full((1,), 4.0)) for _ in range(2)]
         with patch.object(backend, "bind_kv_caches", wraps=backend.bind_kv_caches) as bind:
