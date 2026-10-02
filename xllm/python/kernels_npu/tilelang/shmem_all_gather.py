@@ -67,7 +67,7 @@ def build_shmem_all_gather_kernel(
     @T.prim_func
     def shmem_all_gather(
         source: T.Tensor((count,), dtype),
-        output: T.Tensor((world_size * count,), dtype),
+        output: T.Tensor((world_size, count), dtype),
         receive: T.Tensor((window_elements,), dtype),
         controls: T.Tensor((control_elements,), "int32"),
         epochs: T.Tensor((lanes * SIGNAL_STRIDE,), "int32"),
@@ -94,7 +94,7 @@ def build_shmem_all_gather_kernel(
                         publication[element] = generation[0]
                     T.barrier_all()
                     if length > 0:
-                        T.copy(source[offset : offset + length], payload[0:length])
+                        T.copy(source[offset], payload)
                         T.barrier_all()
                         for peer in T.serial(world_size):
                             T.shmem_ub_put_nbi(
@@ -124,10 +124,9 @@ def build_shmem_all_gather_kernel(
                             observed[0] = probe[0]
                         if length > 0:
                             start = (peer * lanes + lane) * chunk_elements
-                            T.copy(receive[start : start + length], payload[0:length])
+                            T.copy(receive[start], payload)
                             T.barrier_all()
-                            destination = peer * count + offset
-                            T.copy(payload[0:length], output[destination : destination + length])
+                            T.copy(payload, output[peer, offset])
                             T.barrier_all()
                         T.shmem_ub_put_nbi(
                             publication,

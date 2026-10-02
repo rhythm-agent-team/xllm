@@ -15,7 +15,7 @@
 """One rank of a direct Python TileLang SHMEM AllGather correctness test.
 
 Launch one worker per PE with a fresh shared --artifact-dir and explicit NPU
---device. Bootstrap and close use a CPU FileStore, not HCCL or MPI. The caller
+--device. CPU FileStore coordination and HYBM/TCP bootstrap use no HCCL or MPI. The caller
 must verify device availability and provide matching TileLang/SHMEM packages.
 No xLLM native binary, AOT registration, package installation, or runtime shim
 is used. A failure leaves the original traceback and saved phase; it does not
@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -170,7 +171,7 @@ def _run_case(
     )
 
     def _submit() -> None:
-        kernel(source, output, receive, controls, epochs, args.rank)
+        kernel(source, output.view(args.world_size, count), receive, controls, epochs, args.rank)
         # The consumer is on the same current stream immediately after gather.
         torch.add(output, 1, out=consumed)
 
@@ -355,25 +356,30 @@ def _main() -> None:
     result["pe_devices"] = devices
     if shmem.aclshmemx_init_status() != shmem.InitStatus.NOT_INITIALIZED:
         raise RuntimeError("Test requires an uninitialized SHMEM process")
+    # Match the existing TileLang JIT's HYBM device ABI and official TCP example.
+    # This is selected before execution, not a retry or a backend fallback.
+    listener = None
     if args.rank == 0:
-        unique_id = shmem.aclshmem_get_unique_id()
-        if not isinstance(unique_id, bytes) or len(unique_id) < 4:
-            raise RuntimeError("SHMEM returned an invalid UniqueID")
-        version = int.from_bytes(unique_id[:4], byteorder=sys.byteorder)
-        if version != (1 << 16) + len(unique_id):
-            raise RuntimeError(
-                f"SHMEM UniqueID version/encoded-size mismatch: version={version}, length={len(unique_id)}"
-            )
-        store.set("unique_id", unique_id)
-    unique_id = store.get("unique_id")
-    version = int.from_bytes(unique_id[:4], byteorder=sys.byteorder)
-    if len(unique_id) < 4 or version != (1 << 16) + len(unique_id):
-        raise RuntimeError("FileStore UniqueID version/size mismatch")
-    result["unique_id_bytes"] = len(unique_id)
-    result["unique_id_sha256"] = hashlib.sha256(unique_id).hexdigest()
-    ret = shmem.aclshmem_init_using_unique_id(args.rank, args.world_size, args.heap_bytes, unique_id)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(args.world_size)
+        store.set("tcp_port", str(listener.getsockname()[1]))
+    port = int(store.get("tcp_port"))
+    attributes = shmem.InitAttr()
+    attributes.my_rank = args.rank
+    attributes.n_ranks = args.world_size
+    attributes.local_mem_size = args.heap_bytes
+    attributes.ip_port = f"tcp://127.0.0.1:{port}"
+    attributes.option_attr.data_op_engine_type = shmem.OpEngineType.MTE
+    if listener is not None:
+        attributes.option_attr.sockFd = listener.fileno()
+    ret = shmem.set_conf_store_tls(False, "")
     if ret != 0:
-        raise RuntimeError(f"aclshmem_init_using_unique_id failed: {ret}")
+        raise RuntimeError(f"set_conf_store_tls failed: {ret}")
+    ret = shmem.aclshmem_init(attributes)
+    if ret != 0:
+        raise RuntimeError(f"aclshmem_init failed: {ret}")
+    result["bootstrap"] = "HYBM/TCP/MTE"
     if shmem.aclshmemx_init_status() != shmem.InitStatus.INITIALIZED:
         raise RuntimeError("SHMEM initialization returned without an initialized domain")
     if shmem.my_pe() != args.rank or shmem.pe_count() != args.world_size:
@@ -410,6 +416,8 @@ def _main() -> None:
     ret = shmem.aclshmem_finialize()
     if ret != 0:
         raise RuntimeError(f"aclshmem_finialize failed: {ret}")
+    if listener is not None:
+        listener.detach()  # The official TCP store owns and closes the passed FD.
     _rendezvous(store, args.rank, args.world_size, "closed")
     result["status"] = "PASS"
     _save(result_path, result, "complete")
