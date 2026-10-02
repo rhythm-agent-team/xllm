@@ -25,8 +25,6 @@ and its Vector scope. It does not claim to be a pure AIV kernel. No compiler
 extension, extern kernel, AOT registry, or xLLM native wrapper is required.
 """
 
-from __future__ import annotations
-
 import tilelang.language as T
 from tilelang import tvm
 
