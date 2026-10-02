@@ -15,10 +15,8 @@
 
 import json
 import signal
-from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,56 +25,38 @@ from xllm.pybind import embedding, llm, utils, vlm
 from xllm.pybind.args import ArgumentParser
 
 
-def test_offline_cli_defaults_and_accepts_context_parallel_size() -> None:
+def test_context_parallel_cli() -> None:
     parser = ArgumentParser().parser
     assert parser.parse_args([]).cp_size == 1
     assert parser.parse_args(["--cp_size", "4"]).cp_size == 4
-
-
-def test_offline_cli_rejects_removed_spelling() -> None:
     with pytest.raises(SystemExit) as error:
-        ArgumentParser().parser.parse_args(["--enable_prefill_sp"])
+        parser.parse_args(["--enable_prefill_sp"])
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize(
-    "api_module,constructor,master_name,model_type,backend",
-    [
-        (llm, llm.LLM, "LLMMaster", "qwen3", "llm"),
-        (embedding, embedding.Embedding, "LLMMaster", "qwen3", "llm"),
-        (vlm, vlm.VLM, "VLMMaster", "qwen2_vl", "vlm"),
-    ],
-    ids=["llm", "embedding", "vlm"],
-)
-@pytest.mark.parametrize("cp_size", [None, 4], ids=["default", "explicit"])
-def test_python_constructors_forward_context_parallel_size(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    api_module: ModuleType,
-    constructor: Callable[..., Any],
-    master_name: str,
-    model_type: str,
-    backend: str,
-    cp_size: int | None,
+@pytest.mark.parametrize("api_module,api_name", [(llm, "LLM"), (embedding, "Embedding"), (vlm, "VLM")])
+def test_constructor_context_parallel_options(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_module: ModuleType, api_name: str
 ) -> None:
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}), encoding="utf-8")
+    is_vlm = api_module is vlm
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen2_vl" if is_vlm else "qwen3"}), encoding="utf-8"
+    )
     master = MagicMock()
-    monkeypatch.setattr(api_module, master_name, master)
+    monkeypatch.setattr(api_module, "VLMMaster" if is_vlm else "LLMMaster", master)
     monkeypatch.setattr(signal, "signal", MagicMock())
     monkeypatch.setattr(utils, "get_free_port", lambda: 26001)
-    monkeypatch.setattr(utils.xllm_export, "get_model_backend", lambda _model_type: backend)
+    monkeypatch.setattr(utils.xllm_export, "get_model_backend", lambda _: "vlm" if is_vlm else "llm")
     monkeypatch.setattr(utils.xllm_export, "configure_cpp_chat_template", MagicMock())
-
-    kwargs = {} if cp_size is None else {"cp_size": cp_size}
-    instance = constructor(model=str(tmp_path), **kwargs)
-
-    master.assert_called_once()
-    options = master.call_args.args[0]
-    assert isinstance(options, api_module.Options)
-    assert options.model_path == str(tmp_path)
-    assert options.cp_size == (1 if cp_size is None else 4)
-    assert instance.master is master.return_value
-
+    constructor = getattr(api_module, api_name)
+    for kwargs, expected in (({}, 1), ({"cp_size": 4}, 4)):
+        master.reset_mock()
+        instance = constructor(model=str(tmp_path), **kwargs)
+        master.assert_called_once()
+        options = master.call_args.args[0]
+        assert isinstance(options, api_module.Options)
+        assert (options.model_path, options.cp_size) == (str(tmp_path), expected)
+        assert instance.master is master.return_value
     master.reset_mock()
     with pytest.raises(TypeError, match="Unexpected keyword arguments: enable_prefill_sp"):
         constructor(model=str(tmp_path), enable_prefill_sp=True)
