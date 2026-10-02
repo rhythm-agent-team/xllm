@@ -490,7 +490,7 @@ def _run_batch(
             after_capture, (before_capture + group_rounds[group_id]) % 2
         ), "Invalid capture epoch transition"
         _check_state(controls, epochs, after_capture, args.lanes, args.world_size)
-        for call in group:
+        for call in calls:
             torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
             source_band = call["scratch"]["elements"] // 2
             torch.testing.assert_close(
