@@ -372,7 +372,8 @@ def _main() -> None:
     attributes.ip_port = f"tcp://127.0.0.1:{port}"
     attributes.option_attr.data_op_engine_type = shmem.OpEngineType.MTE
     if listener is not None:
-        attributes.option_attr.sockFd = listener.fileno()
+        # Transfer ownership before native init; its error cleanup may close FD.
+        attributes.option_attr.sockFd = listener.detach()
     ret = shmem.set_conf_store_tls(False, "")
     if ret != 0:
         raise RuntimeError(f"set_conf_store_tls failed: {ret}")
@@ -416,8 +417,6 @@ def _main() -> None:
     ret = shmem.aclshmem_finialize()
     if ret != 0:
         raise RuntimeError(f"aclshmem_finialize failed: {ret}")
-    if listener is not None:
-        listener.detach()  # The official TCP store owns and closes the passed FD.
     _rendezvous(store, args.rank, args.world_size, "closed")
     result["status"] = "PASS"
     _save(result_path, result, "complete")
