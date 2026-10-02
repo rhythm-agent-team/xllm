@@ -141,9 +141,7 @@ def bisheng_include_dirs() -> list[str]:
         f"{npu_home_path}/compiler/tikcpp/tikcfw/interface",
         f"{tl_root}/3rdparty/catlass/include",
         f"{tl_root}/3rdparty/shmem/include",
-        f"{tl_root}/3rdparty/shmem/src",
         f"{tl_root}/3rdparty/shmem/src/device",
-        f"{tl_root}/3rdparty/shmem/src/device_simt",
         f"{tl_root}/src",
     ]
 
