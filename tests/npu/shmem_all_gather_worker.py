@@ -261,8 +261,10 @@ def _main() -> None:
         parser.error("Require positive even lanes and positive repeats")
     if not 0 < args.chunk_bytes <= 64 * 1024 or args.chunk_bytes % 128:
         parser.error("Require chunk-bytes <= 64 KiB and a positive multiple of 128")
-    if len(set(args.counts)) != len(args.counts) or any(not 0 < count <= (1 << 31) - 1 for count in args.counts):
-        parser.error("Require distinct positive counts <= INT32_MAX")
+    if len(set(args.counts)) != len(args.counts) or any(
+        not 0 < args.world_size * count <= (1 << 31) - 1 for count in args.counts
+    ):
+        parser.error("Require distinct positive counts with world-size * count <= INT32_MAX")
     required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
     if args.heap_bytes < required_bytes:
         parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")

@@ -51,8 +51,8 @@ def build_shmem_all_gather_kernel(
         raise ValueError(f"Unsupported SHMEM AllGather dtype: {dtype}")
     if world_size not in (2, 4, 8, 16):
         raise ValueError(f"Unsupported SHMEM PE count: {world_size}")
-    if count <= 0 or count > (1 << 31) - 1:
-        raise ValueError(f"SHMEM input count must be in [1, INT32_MAX], got {count}")
+    if count <= 0 or world_size * count > (1 << 31) - 1:
+        raise ValueError(f"Existing TileLang copies require 0 < world_size * count <= INT32_MAX, got {count}")
     if lanes <= 0 or lanes % 2:
         raise ValueError(f"Existing MIX launch requires a positive even lane count, got {lanes}")
     if chunk_bytes <= 0 or chunk_bytes % 128:
@@ -126,7 +126,7 @@ def build_shmem_all_gather_kernel(
                             start = (peer * lanes + lane) * chunk_elements
                             T.copy(receive[start : start + length], payload[0:length])
                             T.barrier_all()
-                            destination = peer * T.int64(count) + offset
+                            destination = peer * count + offset
                             T.copy(payload[0:length], output[destination : destination + length])
                             T.barrier_all()
                         T.shmem_ub_put_nbi(
