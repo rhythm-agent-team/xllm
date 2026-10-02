@@ -1769,10 +1769,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             actual_seq_q = self._mla_actual_seq_q
         if actual_seq_kv is None:
             actual_seq_kv = self._mla_actual_seq_kv
-        out = get_execution_buffer(
-            ("SFA_OUTPUT", layer_id) + tuple(q_latent.shape),
-            lambda: torch.empty_like(q_latent),
-        )
+        out = torch.empty_like(q_latent)
         return kernels.sparse_flash_attention_out(
             q_latent,
             nope_cache,

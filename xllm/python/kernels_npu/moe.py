@@ -93,24 +93,14 @@ def _graph_gmm2_output(
     act_i8: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Return a stable graph buffer for the routed down projection."""
-    from xllm.python.model_executor.forward_context import (
-        get_execution_buffer,
-        get_forward_context,
-    )
+    """Allocate the routed down projection output for this forward."""
+    from xllm.python.model_executor.forward_context import get_forward_context
 
     if get_forward_context().execution_state is None:
         return None
 
     output_shape = (act_i8.shape[0], weight.shape[-1])
-    return get_execution_buffer(
-        ("MOE_GMM2_OUTPUT", int(weight.data_ptr()), *output_shape, torch.bfloat16),
-        lambda: torch.empty(
-            output_shape,
-            dtype=torch.bfloat16,
-            device=act_i8.device,
-        ),
-    )
+    return torch.empty(output_shape, dtype=torch.bfloat16, device=act_i8.device)
 
 
 def _grouped_matmul_gmm2(
@@ -123,7 +113,7 @@ def _grouped_matmul_gmm2(
     group_list_type: int = 0,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run GMM2, optionally writing into a graph-owned output buffer."""
+    """Run GMM2, optionally writing into the caller's output buffer."""
     if weight_scale.dtype != torch.bfloat16:
         weight_scale = weight_scale.to(torch.bfloat16)
     if output is None:
