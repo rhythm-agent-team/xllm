@@ -33,6 +33,7 @@ set(ASCEND_KERNEL_LAUNCH_ONLY ON)
 include("${ASCENDC_CMAKE_PATH}")
 ascendc_library(aclshmem_all_gather_device STATIC all_gather_kernel.cpp)
 ascendc_include_directories(aclshmem_all_gather_device PRIVATE
+  "${ASCEND_CANN_PACKAGE_PATH}/include"
   "${ACLSHMEM_ROOT}/include"
   "${ACLSHMEM_ROOT}/src"
   "${ACLSHMEM_ROOT}/src/device"
