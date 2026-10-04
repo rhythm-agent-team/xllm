@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One rank of direct AllGather correctness and optional gather-only timing.
+"""One rank of direct AllGather correctness and optional msprof capture.
 
 The default TileLang SHMEM path uses CPU FileStore coordination and official
-TCP/MTE bootstrap, without HCCL, MPI or an xLLM native library. Matched timing
+TCP/MTE bootstrap, without HCCL, MPI or an xLLM native library. Matched profiling
 may explicitly select the existing current-stream native HCCL AllGather instead.
 The caller must verify device availability, package/native identities and prior
 required correctness evidence before requesting measurement.
@@ -29,12 +29,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import socket
 import sys
-import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -224,7 +222,7 @@ def _run_case(
     rounds = (count + args.lanes * args.chunk_bytes // source.element_size() - 1) // (
         args.lanes * args.chunk_bytes // source.element_size()
     )
-    stream = torch.npu.Stream() if args.timing_samples else torch.npu.current_stream()
+    stream = torch.npu.Stream() if args.profile_samples else torch.npu.current_stream()
 
     def _gather() -> None:
         if args.backend == "shmem":
@@ -293,7 +291,7 @@ def _run_case(
     for iteration in (-2, -1):
         previous_epochs = _previous_epochs()
         local = _prepare(iteration)
-        if args.timing_samples:
+        if args.profile_samples:
             torch.npu.synchronize()
             _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/prepared")
         with torch.npu.stream(stream):
@@ -309,7 +307,7 @@ def _run_case(
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/capture")
         _save(result_path, result, f"count-{count}/capture")
         graph = torch.npu.NPUGraph()
-        capture_stream = stream if args.timing_samples else torch.npu.Stream()
+        capture_stream = stream if args.profile_samples else torch.npu.Stream()
         with torch.npu.graph(graph, stream=capture_stream):
             _submit()
         torch.npu.synchronize()
@@ -324,7 +322,7 @@ def _run_case(
         _save(result_path, result, f"count-{count}/iteration-{iteration}")
         previous_epochs = _previous_epochs()
         local = _prepare(iteration)
-        if args.timing_samples or graph is not None:
+        if args.profile_samples or graph is not None:
             torch.npu.synchronize()
             _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/prepared")
         with torch.npu.stream(capture_stream if graph is not None else stream):
@@ -341,14 +339,18 @@ def _run_case(
         del graph
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
     _save(result_path, result, f"count-{count}/checked")
-    if not args.timing_samples:
+    if not args.profile_samples:
         return
 
-    timing: dict[str, Any] = {
+    import torch_npu
+
+    profile_dir = args.artifact_dir / f"profile-rank-{args.rank}-count-{count}"
+    profile: dict[str, Any] = {
         "backend": args.backend,
         "mode": args.mode,
         "scope": "gather_only",
-        "host_completion_scope": "gather_plus_consumer_drain",
+        "duration_source": "msprof_device_trace",
+        "device_association": "UNVERIFIED",
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
@@ -357,87 +359,76 @@ def _run_case(
         "warmup_samples": [],
         "samples": [],
         "warmup_excluded": True,
-        "consumer_timed": False,
+        "consumer_in_gather_range": False,
         "graph_reset": False if args.mode == "graph" else None,
         "stream_ptr": hex(stream.npu_stream),
         "stream_ptr_is_trace_stream_id": False,
+        "directory": str(profile_dir),
     }
-    case["timing"] = timing
-    _save(result_path, result, f"count-{count}/timing/prepare")
-    events = [
-        (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
-        for _ in range(args.timing_warmup + args.timing_samples)
-    ]
-    # Materialize all event handles outside measurement, including measured pairs.
-    with torch.npu.stream(stream):
-        for start, end in events:
-            start.record()
-            end.record()
-    torch.npu.synchronize()
-    timing_graph = None
+    case["profile"] = profile
+    _save(result_path, result, f"count-{count}/profile/prepare")
+    profile_graph = None
     if args.mode == "graph":
         local = _prepare(args.repeats)
         torch.npu.synchronize()
         previous_epochs = _previous_epochs()
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/capture-prepared")
-        timing_graph = torch.npu.NPUGraph()
-        with torch.npu.graph(timing_graph, stream=stream):
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/capture-prepared")
+        profile_graph = torch.npu.NPUGraph()
+        with torch.npu.graph(profile_graph, stream=stream):
             _gather()
         torch.npu.synchronize()
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/captured")
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/captured")
         _check_capture(local, previous_epochs)
         assert torch.all(torch.isnan(consumed.cpu())), "Gather-only capture changed consumer poison"
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/capture-observed")
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/capture-observed")
 
-    for ordinal, (start, end) in enumerate(events):
-        sample_index = ordinal - args.timing_warmup
+    profiler = torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_dir)),
+        experimental_config=torch_npu.profiler._ExperimentalConfig(
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        ),
+    )
+    for ordinal in range(args.profile_warmup + args.profile_samples):
+        sample_index = ordinal - args.profile_warmup
         iteration = args.repeats + ordinal + 1
-        phase = f"count-{count}/timing/sample-{sample_index}"
+        phase = f"count-{count}/profile/sample-{sample_index}"
         _save(result_path, result, phase)
         previous_epochs = _previous_epochs()
         local = _prepare(iteration)
         torch.npu.synchronize()
         _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-        start_wall_ns = time.time_ns()
+        if sample_index == 0:
+            profiler.start()
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+        gather_range = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
         with torch.npu.stream(stream):
-            start.record()
-            submit_start = time.monotonic_ns()
-            if timing_graph is None:
-                _gather()
-            else:
-                timing_graph.replay()
-            submit_end = time.monotonic_ns()
-            end.record()
-            # Consumer dependencies are checked, but its work is outside the events.
+            # CPU ranges label calls; only the associated device trace gives duration.
+            with torch.profiler.record_function(gather_range):
+                if profile_graph is None:
+                    _gather()
+                else:
+                    profile_graph.replay()
             torch.add(output, 1, out=consumed)
         torch.npu.synchronize()
-        completion = time.monotonic_ns()
-        elapsed_ms = float(start.elapsed_time(end))
-        if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
-            raise RuntimeError(f"Invalid device interval: {elapsed_ms} ms")
         _check_outputs(iteration, local, previous_epochs)
         _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
-        records = timing["warmup_samples"] if sample_index < 0 else timing["samples"]
-        records.append(
-            {
-                "sample_index": sample_index,
-                "input_iteration": iteration,
-                "start_wall_ns": start_wall_ns,
-                "submit_start_monotonic_ns": submit_start,
-                "submit_end_monotonic_ns": submit_end,
-                "completion_monotonic_ns": completion,
-                "device_elapsed_ms": elapsed_ms,
-            }
-        )
+        records = profile["warmup_samples"] if sample_index < 0 else profile["samples"]
+        records.append({"sample_index": sample_index, "input_iteration": iteration, "gather_range": gather_range})
         _save(result_path, result, f"{phase}/checked")
     torch.npu.synchronize()
-    _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/drained")
-    if timing_graph is not None:
-        timing_graph.reset()
-        timing["graph_reset"] = True
-        del timing_graph
-    _rendezvous(store, args.rank, args.world_size, f"count-{count}/timing/closed")
-    _save(result_path, result, f"count-{count}/timing/complete")
+    _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/drained")
+    profiler.stop()
+    traces = sorted(profile_dir.rglob("trace_view.json"))
+    if not traces:
+        raise RuntimeError(f"Profiler did not export a device trace: {profile_dir}")
+    profile["traces"] = [_file_identity(path) for path in traces]
+    if profile_graph is not None:
+        profile_graph.reset()
+        profile["graph_reset"] = True
+        del profile_graph
+    _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/closed")
+    _save(result_path, result, f"count-{count}/profile/complete")
 
 
 def _run_batch(
@@ -718,8 +709,8 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         raise RuntimeError("FileStore namespace already used by this rank")
     configuration_fields = (
         "backend",
-        "timing_samples",
-        "timing_warmup",
+        "profile_samples",
+        "profile_warmup",
         "comparison_id",
         "round_id",
         "stage_index",
@@ -809,8 +800,8 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("shmem", "hccl"), default="shmem")
-    parser.add_argument("--timing-samples", type=int, default=0)
-    parser.add_argument("--timing-warmup", type=int, default=20)
+    parser.add_argument("--profile-samples", type=int, default=0)
+    parser.add_argument("--profile-warmup", type=int, default=20)
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -839,11 +830,11 @@ def _main() -> None:
     parser.add_argument("--heap-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--repeats", type=int, default=16)
     args = parser.parse_args()
-    if args.timing_samples < 0:
-        parser.error("timing-samples must be nonnegative")
-    if args.timing_samples:
-        if args.timing_samples < 2 or args.timing_warmup < 2:
-            parser.error("Gather-only timing requires at least two warmup and measured samples")
+    if args.profile_samples < 0:
+        parser.error("profile-samples must be nonnegative")
+    if args.profile_samples:
+        if args.profile_samples < 2 or args.profile_warmup < 2:
+            parser.error("Gather-only profiling requires at least two warmup and measured samples")
         if (
             args.compile_only
             or args.stress_batch
@@ -852,20 +843,20 @@ def _main() -> None:
             or args.graph_replays is not None
             or args.alternate_count is not None
         ):
-            parser.error("Timing excludes compile-only, retained-batch and skew instrumentation")
+            parser.error("Profiling excludes compile-only, retained-batch and skew instrumentation")
         if args.comparison_id is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.comparison_id) is None:
             parser.error("comparison-id must be a nonempty 1..128 character alphanumeric/underscore/dot/hyphen ID")
         if args.round_id is None or args.round_id < 0 or args.stage_index is None or args.stage_index < 0:
-            parser.error("Timing requires nonnegative round-id and stage-index")
+            parser.error("Profiling requires nonnegative round-id and stage-index")
         if args.row_width is not None and (args.row_width <= 0 or any(count % args.row_width for count in args.counts)):
             parser.error("row-width must be positive and divide every count")
-    elif args.timing_warmup != 20 or any(
+    elif args.profile_warmup != 20 or any(
         value is not None
         for value in (args.comparison_id, args.round_id, args.stage_index, args.row_width, args.native_build_revision)
     ):
-        parser.error("Timing metadata requires positive timing-samples")
+        parser.error("Profiling metadata requires positive profile-samples")
     if args.backend == "hccl":
-        if not args.timing_samples:
+        if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
         if args.native_library is None or not args.native_library.is_absolute() or not args.native_library.is_file():
             parser.error("HCCL requires native-library as an existing absolute file")
@@ -919,8 +910,8 @@ def _main() -> None:
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
     result: dict[str, Any] = {
         "backend": args.backend,
-        "timing_samples": args.timing_samples,
-        "timing_warmup": args.timing_warmup,
+        "profile_samples": args.profile_samples,
+        "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
