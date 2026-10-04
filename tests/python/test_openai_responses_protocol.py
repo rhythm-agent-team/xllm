@@ -571,16 +571,34 @@ def _check_functions(settings: _Settings) -> None:
         _record(settings, "sdk-tools-accumulator", {"events": helper_events, "final": final})
         _assert_accumulator(helper_events, final)
         calls = _assert_weather_calls(final)
-        history = [{"role": "user", "content": _prompt(settings, "tool")}, *final["output"]]
+        # Accumulator models add client-only parsed fields, not Responses input fields.
+        history = [
+            {"role": "user", "content": _prompt(settings, "tool")},
+            *[
+                item.model_dump(
+                    mode="json",
+                    exclude_unset=True,
+                    exclude={"parsed_arguments": True, "content": {"__all__": {"parsed"}}},
+                )
+                for item in response.output
+            ],
+        ]
+        sdk_history = [
+            history[0],
+            *[
+                item if item.type == "function_call" else replay
+                for item, replay in zip(response.output, history[1:], strict=True)
+            ],
+        ]
         for call in calls:
             # This is a client-supplied result, not execution of a server-side tool.
-            history.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call["call_id"],
-                    "output": json.dumps({"city": "Paris", "condition": "sunny"}),
-                }
-            )
+            result = {
+                "type": "function_call_output",
+                "call_id": call["call_id"],
+                "output": json.dumps({"city": "Paris", "condition": "sunny"}),
+            }
+            history.append(result)
+            sdk_history.append(result)
         followup = _payload(settings, "tool", input=history, tools=_TOOLS, tool_choice="none")
         for streaming in (False, True):
             raw = _post_raw(
@@ -588,7 +606,7 @@ def _check_functions(settings: _Settings) -> None:
             )
             assert _output_text(raw).strip()
             assert not any(item["type"] == "function_call" for item in raw["output"])
-        response = sdk.responses.create(**followup, stream=False)
+        response = sdk.responses.create(**{**followup, "input": sdk_history}, stream=False)
         _record(settings, "sdk-function-history", _dump(response))
         _assert_response(_dump(response), sdk=True)
         assert response.output_text.strip()
