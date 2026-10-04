@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "qwen3_coder_detector.h"
+#include "function_call/qwen3_coder_detector.h"
 
 #include <algorithm>
 #include <cctype>
@@ -261,7 +261,7 @@ nlohmann::json Qwen3CoderDetector::convert_param_value(
 void Qwen3CoderDetector::parse_parameters(const std::string& params_text,
                                           const std::string& func_name,
                                           const std::vector<JsonTool>& tools,
-                                          nlohmann::json* parsed_params) const {
+                                          nlohmann::json* parsed_params) {
   if (parsed_params == nullptr) {
     return;
   }
@@ -271,6 +271,17 @@ void Qwen3CoderDetector::parse_parameters(const std::string& params_text,
 
   while (pos < params_text.length()) {
     size_t param_start = params_text.find(parameter_prefix_, pos);
+    if (strict_errors_ &&
+        !trim_ascii_whitespace(
+             params_text.substr(pos,
+                                param_start == std::string::npos
+                                    ? std::string::npos
+                                    : param_start - pos))
+             .empty()) {
+      error_status_ = Status(StatusCode::UNKNOWN,
+                             "Model generated malformed function parameters.");
+      return;
+    }
     if (param_start == std::string::npos) {
       break;
     }
@@ -278,6 +289,10 @@ void Qwen3CoderDetector::parse_parameters(const std::string& params_text,
     size_t name_start = param_start + parameter_prefix_.length();
     size_t name_end = params_text.find('>', name_start);
     if (name_end == std::string::npos) {
+      if (strict_errors_) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated an unfinished parameter name.");
+      }
       break;
     }
 
@@ -303,6 +318,12 @@ void Qwen3CoderDetector::parse_parameters(const std::string& params_text,
       end_token_len = 0;
     }
 
+    if (strict_errors_ && end_token_len != parameter_end_token_.length()) {
+      error_status_ =
+          Status(StatusCode::UNKNOWN,
+                 "Model generated an unfinished function parameter.");
+      return;
+    }
     if (end_pos == std::string::npos) {
       break;
     }
@@ -311,6 +332,13 @@ void Qwen3CoderDetector::parse_parameters(const std::string& params_text,
         params_text.substr(name_start, name_end - name_start);
     std::string raw_value =
         params_text.substr(value_start, end_pos - value_start);
+    if (strict_errors_ &&
+        (param_name.empty() || parsed_params->contains(param_name))) {
+      error_status_ =
+          Status(StatusCode::UNKNOWN,
+                 "Model generated an empty or duplicate parameter.");
+      return;
+    }
 
     if (!raw_value.empty() && raw_value.front() == '\n') {
       raw_value.erase(raw_value.begin());
@@ -330,7 +358,7 @@ void Qwen3CoderDetector::parse_tool_call_content(
     const std::string& tool_content,
     const std::vector<JsonTool>& tools,
     int32_t* tool_idx,
-    std::vector<ToolCallItem>* calls) const {
+    std::vector<ToolCallItem>* calls) {
   if (tool_idx == nullptr || calls == nullptr) {
     return;
   }
@@ -338,6 +366,17 @@ void Qwen3CoderDetector::parse_tool_call_content(
   size_t pos = 0;
   while (pos < tool_content.length()) {
     size_t function_start = tool_content.find(tool_call_prefix_, pos);
+    if (strict_errors_ &&
+        !trim_ascii_whitespace(
+             tool_content.substr(pos,
+                                 function_start == std::string::npos
+                                     ? std::string::npos
+                                     : function_start - pos))
+             .empty()) {
+      error_status_ = Status(StatusCode::UNKNOWN,
+                             "Model generated malformed function content.");
+      return;
+    }
     if (function_start == std::string::npos) {
       break;
     }
@@ -345,6 +384,10 @@ void Qwen3CoderDetector::parse_tool_call_content(
     size_t name_start = function_start + tool_call_prefix_.length();
     size_t name_end = tool_content.find('>', name_start);
     if (name_end == std::string::npos) {
+      if (strict_errors_) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated an unfinished function name.");
+      }
       break;
     }
 
@@ -353,6 +396,17 @@ void Qwen3CoderDetector::parse_tool_call_content(
 
     size_t params_start = name_end + 1;
     size_t function_end = tool_content.find(function_end_token_, params_start);
+    if (strict_errors_ && function_end == std::string::npos) {
+      error_status_ = Status(StatusCode::UNKNOWN,
+                             "Model generated an unfinished function call.");
+      return;
+    }
+    if (strict_errors_ && !get_tool_indices(tools).contains(func_name)) {
+      error_status_ =
+          Status(StatusCode::UNKNOWN,
+                 "Model generated an undefined function: " + func_name);
+      return;
+    }
 
     std::string params_text;
     if (function_end == std::string::npos) {
@@ -366,6 +420,9 @@ void Qwen3CoderDetector::parse_tool_call_content(
 
     nlohmann::json parsed_params = nlohmann::json::object();
     parse_parameters(params_text, func_name, tools, &parsed_params);
+    if (!error_status_.ok()) {
+      return;
+    }
 
     calls->emplace_back(*tool_idx, func_name, parsed_params.dump());
     (*tool_idx)++;
@@ -379,6 +436,44 @@ void Qwen3CoderDetector::parse_tool_call_content(
 StreamingParseResult Qwen3CoderDetector::detect_and_parse(
     const std::string& text,
     const std::vector<JsonTool>& tools) {
+  if (strict_errors_) {
+    StreamingParseResult result;
+    size_t position = 0;
+    int32_t index = 0;
+    while (position < text.size()) {
+      const size_t begin = text.find(tool_call_start_token_, position);
+      if (begin == std::string::npos) {
+        result.normal_text += text.substr(position);
+        break;
+      }
+      result.normal_text += text.substr(position, begin - position);
+      const size_t content = begin + tool_call_start_token_.size();
+      const size_t end = text.find(tool_call_end_token_, content);
+      if (end == std::string::npos) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated an unfinished function call.");
+        return {};
+      }
+      const size_t previous_calls = result.calls.size();
+      parse_tool_call_content(
+          text.substr(content, end - content), tools, &index, &result.calls);
+      if (!error_status_.ok()) {
+        return {};
+      }
+      if (result.calls.size() == previous_calls) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated an empty function call.");
+        return {};
+      }
+      position = end + tool_call_end_token_.size();
+    }
+    if (result.normal_text.find(tool_call_prefix_) != std::string::npos) {
+      error_status_ = Status(StatusCode::UNKNOWN,
+                             "Model generated a function without its wrapper.");
+      return {};
+    }
+    return result;
+  }
   const bool has_tool_call_token =
       !tool_call_start_token_.empty() &&
       text.find(tool_call_start_token_) != std::string::npos;
@@ -432,6 +527,10 @@ StreamingParseResult Qwen3CoderDetector::detect_and_parse(
 StreamingParseResult Qwen3CoderDetector::parse_streaming_increment(
     const std::string& new_text,
     const std::vector<JsonTool>& tools) {
+  if (strict_errors_) {
+    return parse_streaming_framed(
+        new_text, tools, tool_call_start_token_, tool_call_end_token_);
+  }
   buffer_ += new_text;
   if (buffer_.empty()) {
     return StreamingParseResult();

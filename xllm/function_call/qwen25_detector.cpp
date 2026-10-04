@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "qwen25_detector.h"
+#include "function_call/qwen25_detector.h"
 
 #include <algorithm>
 #include <iostream>
@@ -34,7 +34,8 @@ Qwen25Detector::Qwen25Detector() : BaseFormatDetector() {
 }
 
 bool Qwen25Detector::has_tool_call(const std::string& text) {
-  return text.find(bot_token_) != std::string::npos;
+  return text.find(strict_errors_ ? "<tool_call>" : bot_token_) !=
+         std::string::npos;
 }
 
 std::string_view Qwen25Detector::trim_whitespace(std::string_view str) const {
@@ -56,17 +57,19 @@ std::vector<std::pair<size_t, size_t>> Qwen25Detector::find_tool_call_ranges(
   ranges.reserve(4);
 
   size_t search_pos = 0;
-  const size_t bot_token_len = bot_token_.length();
-  const size_t eot_token_len = eot_token_.length();
+  const std::string begin_token = strict_errors_ ? "<tool_call>" : bot_token_;
+  const std::string end_token = strict_errors_ ? "</tool_call>" : eot_token_;
+  const size_t bot_token_len = begin_token.length();
+  const size_t eot_token_len = end_token.length();
 
   while (search_pos < text.length()) {
-    size_t start_pos = text.find(bot_token_, search_pos);
+    size_t start_pos = text.find(begin_token, search_pos);
     if (start_pos == std::string::npos) {
       break;
     }
 
     size_t content_start = start_pos + bot_token_len;
-    size_t end_pos = text.find(eot_token_, content_start);
+    size_t end_pos = text.find(end_token, content_start);
     if (end_pos == std::string::npos) {
       break;
     }
@@ -81,20 +84,44 @@ std::vector<std::pair<size_t, size_t>> Qwen25Detector::find_tool_call_ranges(
 StreamingParseResult Qwen25Detector::detect_and_parse(
     const std::string& text,
     const std::vector<JsonTool>& tools) {
-  size_t bot_token_pos = text.find(bot_token_);
+  const std::string begin_token = strict_errors_ ? "<tool_call>" : bot_token_;
+  const std::string end_token = strict_errors_ ? "</tool_call>" : eot_token_;
+  size_t bot_token_pos = text.find(begin_token);
 
   std::string normal_text;
   if (bot_token_pos != std::string::npos) {
     std::string_view normal_text_view(text.data(), bot_token_pos);
     std::string_view trimmed = trim_whitespace(normal_text_view);
-    normal_text = std::string(trimmed);
+    normal_text =
+        strict_errors_ ? std::string(normal_text_view) : std::string(trimmed);
   } else {
     std::string_view trimmed = trim_whitespace(text);
-    normal_text = std::string(trimmed);
+    normal_text = strict_errors_ ? text : std::string(trimmed);
     return StreamingParseResult(normal_text);
   }
 
   auto tool_call_ranges = find_tool_call_ranges(text);
+  const size_t parsed_end =
+      tool_call_ranges.empty()
+          ? 0
+          : tool_call_ranges.back().second + end_token.size();
+  if (strict_errors_ &&
+      text.find(begin_token, parsed_end) != std::string::npos) {
+    error_status_ = Status(StatusCode::UNKNOWN,
+                           "Model generated an unfinished function call.");
+    return {};
+  }
+
+  if (strict_errors_) {
+    normal_text.clear();
+    size_t last_end = 0;
+    for (const auto& range : tool_call_ranges) {
+      const size_t start = range.first - begin_token.size();
+      normal_text += text.substr(last_end, start - last_end);
+      last_end = range.second + end_token.size();
+    }
+    normal_text += text.substr(last_end);
+  }
 
   std::vector<ToolCallItem> calls;
   calls.reserve(tool_call_ranges.size());
@@ -105,6 +132,11 @@ StreamingParseResult Qwen25Detector::detect_and_parse(
     std::string_view trimmed_content = trim_whitespace(content_view);
 
     if (trimmed_content.empty()) {
+      if (strict_errors_) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated an empty function call.");
+        return {};
+      }
       continue;
     }
 
@@ -120,6 +152,10 @@ StreamingParseResult Qwen25Detector::detect_and_parse(
       LOG(ERROR) << "Failed to parse JSON part: "
                  << std::string(trimmed_content)
                  << ", JSON parse error: " << e.what();
+      if (strict_errors_) {
+        error_status_ = Status(StatusCode::UNKNOWN,
+                               "Model generated malformed function arguments.");
+      }
       continue;
     }
   }
@@ -130,6 +166,10 @@ StreamingParseResult Qwen25Detector::detect_and_parse(
 StreamingParseResult Qwen25Detector::parse_streaming_increment(
     const std::string& new_text,
     const std::vector<JsonTool>& tools) {
+  if (strict_errors_) {
+    return parse_streaming_framed(
+        new_text, tools, "<tool_call>", "</tool_call>");
+  }
   // Streaming incremental parsing for Qwen 2.5/3 tool calls.
   // Uses base class implementation with buffering to handle partial end tokens.
   StreamingParseResult result =
@@ -169,6 +209,13 @@ StreamingParseResult Qwen25Detector::parse_streaming_increment(
     }
   }
 
+  return result;
+}
+
+StreamingParseResult Qwen25Detector::finish_stream() {
+  auto result = BaseFormatDetector::finish_stream();
+  result.normal_text.insert(0, normal_text_buffer_);
+  normal_text_buffer_.clear();
   return result;
 }
 

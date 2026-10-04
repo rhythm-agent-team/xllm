@@ -106,6 +106,10 @@ struct RequestParams {
 
   bool streaming = false;
 
+  // Responses requires token-aligned reasoning and prompt-cache accounting.
+  bool responses_usage = false;
+  std::string responses_reasoning_parser;
+
   // number of tokens to generate. truncated to model's max context length.
   uint32_t max_tokens = 5120;
 

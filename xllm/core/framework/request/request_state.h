@@ -148,6 +148,10 @@ class RequestState final {
 
   bool stream = false;
 
+  bool responses_usage = false;
+  bool force_reasoning = false;
+  std::optional<ReasoningTokenMetadata> reasoning_token_metadata;
+
   // max tokens for a seq
   size_t seq_capacity;
 

@@ -20,8 +20,8 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
-#include "base_format_detector.h"
-#include "core_types.h"
+#include "function_call/base_format_detector.h"
+#include "function_call/core_types.h"
 
 namespace xllm {
 namespace function_call {
@@ -29,7 +29,8 @@ namespace function_call {
 class FunctionCallParser {
  public:
   FunctionCallParser(const std::vector<JsonTool>& tools,
-                     const std::string& tool_call_parser);
+                     const std::string& tool_call_parser,
+                     bool strict_errors = false);
 
   ~FunctionCallParser() = default;
 
@@ -44,6 +45,10 @@ class FunctionCallParser {
   // Streaming incremental parsing method
   StreamingParseResult parse_streaming_increment(const std::string& new_text);
 
+  std::pair<Status, StreamingParseResult> finish_stream(
+      bool incomplete = false);
+  const Status& error_status() const { return detector_->error_status(); }
+
   // StructuralTagResponseFormat get_structure_tag();
 
   // std::tuple<std::string, std::any> get_structure_constraint(const
@@ -51,14 +56,26 @@ class FunctionCallParser {
 
   BaseFormatDetector* get_detector() const { return detector_.get(); }
 
+  static std::pair<Status, std::string> resolve_parser(
+      const std::string& parser,
+      const std::string& model_type,
+      bool strict_errors = false);
+
   static std::string get_parser_auto(const std::string& parser,
                                      const std::string& model_type);
 
  private:
   std::unique_ptr<BaseFormatDetector> create_detector(
       const std::string& tool_call_parser);
+  void record_stream_result(const StreamingParseResult& result);
+
   std::unique_ptr<BaseFormatDetector> detector_;
   std::vector<JsonTool> tools_;
+  std::string parser_format_;
+  bool strict_errors_ = false;
+  std::string stream_text_;
+  std::string emitted_text_;
+  std::vector<ToolCallItem> emitted_calls_;
 };
 
 namespace utils {

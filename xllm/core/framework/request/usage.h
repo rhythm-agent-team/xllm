@@ -20,6 +20,11 @@ limitations under the License.
 
 namespace xllm {
 
+struct ReasoningTokenMetadata {
+  int32_t start_token_id = -1;
+  int32_t end_token_id = -1;
+};
+
 struct Usage {
   // the number of tokens in the prompt.
   int32_t num_prompt_tokens = 0;
@@ -32,6 +37,12 @@ struct Usage {
 
   // the number of prompt tokens served from prefix cache.
   int32_t num_cached_tokens = 0;
+
+  // Retained generated tokens inside the model's reasoning delimiters.
+  int32_t num_reasoning_tokens = 0;
+
+  // Input-token positions newly published in the reusable prompt cache.
+  int32_t num_cache_write_tokens = 0;
 };
 
 }  // namespace xllm

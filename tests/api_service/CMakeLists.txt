@@ -242,6 +242,33 @@ if(XLLM_ENABLE_SDK_TESTS)
 endif()
 
 cc_test(
+  NAME openai_responses_request_test
+  NO_NPU_RUNTIME
+  SRCS openai_responses_request_test.cpp
+  DEPS api_service GTest::gtest_main nlohmann_json::nlohmann_json
+  ENVIRONMENT "${_api_json_test_env}"
+)
+
+cc_test(
+  NAME openai_responses_output_test
+  NO_NPU_RUNTIME
+  SRCS openai_responses_output_test.cpp
+  DEPS api_service GTest::gtest_main nlohmann_json::nlohmann_json
+  ENVIRONMENT "${_api_json_test_env}"
+)
+
+cc_test(
+  NAME openai_responses_http_test
+  NO_NPU_RUNTIME
+  SRCS openai_responses_http_test.cpp
+  DEPS api_service GTest::gtest_main nlohmann_json::nlohmann_json
+  ENVIRONMENT "${_api_json_test_env}"
+)
+target_compile_definitions(openai_responses_http_test PRIVATE
+  PYTHON3_EXECUTABLE="${Python3_EXECUTABLE}"
+  XLLM_RESPONSES_SDK_CLIENT_PATH="${PROJECT_SOURCE_DIR}/tests/python/test_openai_responses.py")
+
+cc_test(
   NAME
     anthropic_request_utils_test
   SRCS

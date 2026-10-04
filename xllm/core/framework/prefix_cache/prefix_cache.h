@@ -85,13 +85,15 @@ class PrefixCache {
   // compute path seeds the chain in O(1) from blocks[existed_shared_blocks_num
   // - 1]'s stamped hash. When `block_hashes` covers all inserted blocks it is
   // consumed as-is; otherwise the chain is computed on the fly. Returns the
-  // token span of the walked range. LinearStatePrefixCache overrides this to
-  // tolerate SWA slid-out placeholders.
+  // token span of the walked range. If provided, inserted_blocks receives only
+  // newly published block indexes, not dedup hits. LinearStatePrefixCache
+  // overrides this to tolerate SWA slid-out placeholders.
   virtual size_t insert(const Slice<int32_t>& token_ids,
                         std::vector<Block>& blocks,
                         size_t existed_shared_blocks_num = 0,
                         const MMData& mm_data = MMData(),
-                        const Slice<XXH3Key>& block_hashes = {});
+                        const Slice<XXH3Key>& block_hashes = {},
+                        std::vector<size_t>* inserted_blocks = nullptr);
 
   // Insert already-hashed blocks (hash stamped by the caller).
   virtual size_t insert(Slice<Block>& blocks);

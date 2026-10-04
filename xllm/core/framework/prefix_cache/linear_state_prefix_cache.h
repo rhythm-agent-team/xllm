@@ -53,7 +53,8 @@ class LinearStatePrefixCache final : public PrefixCache {
                 std::vector<Block>& blocks,
                 size_t existed_shared_blocks_num = 0,
                 const MMData& mm_data = MMData(),
-                const Slice<XXH3Key>& block_hashes = {}) override;
+                const Slice<XXH3Key>& block_hashes = {},
+                std::vector<size_t>* inserted_blocks = nullptr) override;
 };
 
 }  // namespace xllm

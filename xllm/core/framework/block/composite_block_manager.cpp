@@ -82,6 +82,27 @@ std::unique_ptr<BlockManager> maybe_concurrent(
   return leaf;
 }
 
+void cache_sequence_blocks(Sequence* seq,
+                           BlockManager& leaf,
+                           const Slice<int32_t>& tokens,
+                           std::vector<Block>& blocks,
+                           size_t publish_begin) {
+  std::vector<size_t> inserted_blocks;
+  if (seq->responses_usage()) {
+    CHECK(leaf.block_type() == BlockType::KV)
+        << "Responses cache-write accounting requires a flat KV cache";
+  }
+  leaf.cache(tokens,
+             blocks,
+             publish_begin,
+             seq->mm_data(),
+             seq->block_hashes(),
+             seq->responses_usage() ? &inserted_blocks : nullptr);
+  for (size_t index : inserted_blocks) {
+    seq->record_cache_write_block(index * leaf.block_size(), leaf.block_size());
+  }
+}
+
 // Xtensor VMM manager or flat free-list BlockManagerImpl. Xtensor has no
 // prefix cache.
 std::unique_ptr<BlockManager> make_kv_leaf(const BlockManager::Options& kv_opts,
@@ -407,11 +428,8 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
     }
     seq->update_block_hashes(static_cast<uint32_t>(block_size),
                              leaf.options().hasher_type());
-    leaf.cache(seq->tokens().slice(0, token_end),
-               *blocks,
-               cached,
-               seq->mm_data(),
-               seq->block_hashes());
+    cache_sequence_blocks(
+        seq, leaf, seq->tokens().slice(0, token_end), *blocks, cached);
     kv.set_num_cached_blocks(type, token_end / block_size);
   }
 }
@@ -815,11 +833,8 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq) {
       const size_t publish_end =
           std::min(cached_tokens.size() / block_size, blocks->size());
       const size_t publish_begin = kv_state.num_cached_blocks(BlockType::KV);
-      kv_leaf.cache(cached_tokens,
-                    *blocks,
-                    publish_begin,
-                    seq->mm_data(),
-                    seq->block_hashes());
+      cache_sequence_blocks(
+          seq, kv_leaf, cached_tokens, *blocks, publish_begin);
       kv_state.set_num_cached_blocks(BlockType::KV,
                                      std::max(publish_begin, publish_end));
       break;
@@ -857,11 +872,11 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
                                  kv_leaf.options().hasher_type());
         std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::KV);
         CHECK_GE(blocks->size(), publish_begin);
-        kv_leaf.cache(seq->tokens().slice(0, available_tokens_num),
-                      *blocks,
-                      publish_begin,
-                      seq->mm_data(),
-                      seq->block_hashes());
+        cache_sequence_blocks(seq,
+                              kv_leaf,
+                              seq->tokens().slice(0, available_tokens_num),
+                              *blocks,
+                              publish_begin);
         kv_state.set_num_cached_blocks(BlockType::KV,
                                        available_tokens_num / block_size);
       }
@@ -950,7 +965,8 @@ void CompositeBlockManager::cache(const Slice<int32_t>& /*token_ids*/,
                                   std::vector<Block>& /*blocks*/,
                                   size_t /*existed_shared_blocks_num*/,
                                   const MMData& /*mm_data*/,
-                                  const Slice<XXH3Key>& /*block_hashes*/) {
+                                  const Slice<XXH3Key>& /*block_hashes*/,
+                                  std::vector<size_t>* /*inserted_blocks*/) {
   NOT_IMPLEMENTED();
 }
 

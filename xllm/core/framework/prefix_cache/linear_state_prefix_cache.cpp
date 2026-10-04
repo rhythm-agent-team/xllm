@@ -109,7 +109,8 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
                                       std::vector<Block>& blocks,
                                       size_t existed_shared_blocks_num,
                                       const MMData& mm_data,
-                                      const Slice<XXH3Key>& block_hashes) {
+                                      const Slice<XXH3Key>& block_hashes,
+                                      std::vector<size_t>* inserted_blocks) {
   const int64_t now = absl::ToUnixMicros(absl::Now());
   // align tokens to block boundary
   const size_t n_blocks =
@@ -179,6 +180,9 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
       node_list.push_front(new_node);
 
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
+      if (inserted_blocks != nullptr) {
+        inserted_blocks->emplace_back(block_idx);
+      }
 
       num_blocks_++;
     }

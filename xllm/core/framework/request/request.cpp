@@ -62,6 +62,9 @@ void Request::create_sequences_group() {
   sequence_params.n = state_.n;
   sequence_params.best_of = state_.best_of;
   sequence_params.streaming = state_.stream;
+  sequence_params.responses_usage = state_.responses_usage;
+  sequence_params.force_reasoning = state_.force_reasoning;
+  sequence_params.reasoning_token_metadata = state_.reasoning_token_metadata;
   sequence_params.enable_schedule_overlap = state_.enable_schedule_overlap;
   sequence_params.is_graph_warmup = state_.is_graph_warmup;
   sequence_params.rec_type = state_.rec_type;
@@ -208,6 +211,18 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
   CHECK_LE(num_prefix_cache_tokens_,
            static_cast<size_t>(std::numeric_limits<int32_t>::max()));
   usage.num_cached_tokens = static_cast<int32_t>(num_prefix_cache_tokens_);
+  if (state_.responses_usage) {
+    CHECK_EQ(sequences().size(), 1u);
+    const Sequence& sequence = *sequences().front();
+    const size_t reasoning_tokens = sequence.num_reasoning_tokens();
+    const size_t cache_write_tokens = sequence.num_cache_write_tokens();
+    CHECK_LE(reasoning_tokens,
+             static_cast<size_t>(std::numeric_limits<int32_t>::max()));
+    CHECK_LE(cache_write_tokens,
+             static_cast<size_t>(std::numeric_limits<int32_t>::max()));
+    usage.num_reasoning_tokens = static_cast<int32_t>(reasoning_tokens);
+    usage.num_cache_write_tokens = static_cast<int32_t>(cache_write_tokens);
+  }
   usage.num_total_tokens = usage.num_prompt_tokens + usage.num_generated_tokens;
 
   RequestOutput output;
@@ -215,6 +230,9 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
   output.service_request_id = service_request_id_;
   output.target_xservice_addr = source_xservice_addr_;
   output.usage = usage;
+  if (state_.responses_usage) {
+    output.force_reasoning = state_.force_reasoning;
+  }
   output.finished = finished();
   output.cancelled = cancelled();
   const std::optional<Status> request_error = error_status();

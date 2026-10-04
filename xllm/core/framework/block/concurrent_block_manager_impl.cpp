@@ -72,10 +72,15 @@ void ConcurrentBlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                                        std::vector<Block>& blocks,
                                        size_t existed_shared_blocks_num,
                                        const MMData& mm_data,
-                                       const Slice<XXH3Key>& block_hashes) {
+                                       const Slice<XXH3Key>& block_hashes,
+                                       std::vector<size_t>* inserted_blocks) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  inner_->cache(
-      token_ids, blocks, existed_shared_blocks_num, mm_data, block_hashes);
+  inner_->cache(token_ids,
+                blocks,
+                existed_shared_blocks_num,
+                mm_data,
+                block_hashes,
+                inserted_blocks);
 }
 
 void ConcurrentBlockManagerImpl::cache(const std::vector<Block>& blocks) {

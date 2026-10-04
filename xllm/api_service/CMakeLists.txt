@@ -9,6 +9,10 @@ cc_library(
     openai_json.h
     openai_http.h
     openai_batch.h
+    responses_request.h
+    responses_output.h
+    responses_call.h
+    responses_service_impl.h
     api_service.h
     api_service_impl.h
     call.h
@@ -45,6 +49,10 @@ cc_library(
   SRCS
     openai_request.cpp
     openai_json.cpp
+    responses_request.cpp
+    responses_output.cpp
+    responses_call.cpp
+    responses_service_impl.cpp
     api_service.cpp
     chat_json_parser.cpp
     chat_request_decoder.cpp

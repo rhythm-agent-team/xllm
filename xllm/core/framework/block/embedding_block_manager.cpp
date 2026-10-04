@@ -96,7 +96,8 @@ void EmbeddingBlockManager::cache(const Slice<int32_t>& /*token_ids*/,
                                   std::vector<Block>& /*blocks*/,
                                   size_t /*existed_shared_blocks_num*/,
                                   const MMData& /*mm_data*/,
-                                  const Slice<XXH3Key>& /*block_hashes*/) {
+                                  const Slice<XXH3Key>& /*block_hashes*/,
+                                  std::vector<size_t>* /*inserted_blocks*/) {
   NOT_IMPLEMENTED();
 }
 

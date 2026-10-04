@@ -189,6 +189,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
+      cache_write_ranges_(other.cache_write_ranges_),
       block_hashes_by_stride_(other.block_hashes_by_stride_),
       hash_block_size_(other.hash_block_size_),
       linear_state_hashes_(other.linear_state_hashes_),
@@ -502,6 +503,63 @@ size_t Sequence::num_valid_generated_tokens() const {
   const size_t valid_tokens = num_valid_tokens();
   return valid_tokens > num_prompt_tokens_ ? valid_tokens - num_prompt_tokens_
                                            : 0;
+}
+
+size_t Sequence::num_reasoning_tokens() const {
+  if (!sequence_params_.reasoning_token_metadata.has_value()) {
+    return 0;
+  }
+  const ReasoningTokenMetadata& markers =
+      sequence_params_.reasoning_token_metadata.value();
+  bool in_reasoning = sequence_params_.force_reasoning;
+  bool seen_start = false;
+  size_t count = 0;
+  const size_t end = num_valid_tokens();
+  for (size_t offset = num_prompt_tokens_; offset < end; ++offset) {
+    const int32_t token_id = tokens_[offset];
+    if (token_id < 0) {
+      continue;
+    }
+    if (!seen_start && token_id == markers.start_token_id) {
+      seen_start = true;
+      in_reasoning = true;
+      continue;
+    }
+    if (in_reasoning && token_id == markers.end_token_id) {
+      in_reasoning = false;
+      seen_start = true;
+      continue;
+    }
+    count += in_reasoning ? 1 : 0;
+  }
+  return count;
+}
+
+void Sequence::record_cache_write_block(size_t begin, size_t block_size) {
+  if (!sequence_params_.responses_usage || begin >= num_prompt_tokens_) {
+    return;
+  }
+  size_t end = begin + std::min(block_size, num_prompt_tokens_ - begin);
+  auto first = cache_write_ranges_.begin();
+  while (first != cache_write_ranges_.end() && first->second < begin) {
+    ++first;
+  }
+  auto last = first;
+  while (last != cache_write_ranges_.end() && last->first <= end) {
+    begin = std::min(begin, last->first);
+    end = std::max(end, last->second);
+    ++last;
+  }
+  first = cache_write_ranges_.erase(first, last);
+  cache_write_ranges_.emplace(first, begin, end);
+}
+
+size_t Sequence::num_cache_write_tokens() const {
+  size_t count = 0;
+  for (const auto& [begin, end] : cache_write_ranges_) {
+    count += end - begin;
+  }
+  return count;
 }
 
 std::optional<SequenceOutput> Sequence::generate_streaming_output(
