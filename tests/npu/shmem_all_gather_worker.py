@@ -402,6 +402,7 @@ def _run_case(
         "mode": args.mode,
         "scope": "gather_only",
         "duration_source": "msprof_device_trace",
+        "evidence_version": 1,
         "device_association": "UNVERIFIED",
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
@@ -439,6 +440,7 @@ def _run_case(
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_dir)),
         experimental_config=torch_npu.profiler._ExperimentalConfig(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
         ),
     )
     if args.mode == "eager":
@@ -538,6 +540,14 @@ def _run_case(
     if not traces:
         raise RuntimeError(f"Profiler did not export a device trace: {profile_dir}")
     profile["traces"] = [_file_identity(path) for path in traces]
+    databases = sorted(profile_dir.rglob(f"ASCEND_PROFILER_OUTPUT/ascend_pytorch_profiler_{args.rank}.db"))
+    if len(databases) != 1:
+        raise RuntimeError(f"Expected one finalized rank-{args.rank} profiler database, found {databases}")
+    completion = databases[0].parent / "analyse.done"
+    if not completion.is_file():
+        raise RuntimeError(f"Profiler database export did not complete: {completion}")
+    profile["databases"] = [_file_identity(path) for path in databases]
+    profile["export_complete"] = _file_identity(completion)
     if profile_graph is not None:
         profile_graph.reset()
         profile["graph_reset"] = True
