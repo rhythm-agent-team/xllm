@@ -846,6 +846,8 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "environment",
     )
     configuration_data = {name: result[name] for name in configuration_fields}
+    if args.backend == "hccl":
+        configuration_data["hccl_config"] = result["hccl_config"]
     configuration_data["source_sha256"] = {name: result[name]["sha256"] for name in identities}
     configuration = json.dumps(configuration_data, sort_keys=True).encode()
     store.set(f"config/{args.rank}", configuration)
@@ -869,6 +871,9 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
     device = torch.device(f"npu:{args.device}")
     result["versions"] = {"torch": torch.__version__, "torch_npu": torch_npu.__version__}
     _load_native(args, result)
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": args.hccl_op_expansion_mode}
+    result["hccl_config"] = dict(options.hccl_config)
     _save(result_path, result, "bootstrap")
     store = _bootstrap_store(args, result, ("worker", "native_library"))
     if dist.is_initialized():
@@ -880,10 +885,6 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
         rank=args.rank,
         timeout=timedelta(seconds=120),
     )
-    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    options.hccl_config = {"hccl_op_expansion_mode": 3}
-    result["hccl_config"] = dict(options.hccl_config)
-    _save(result_path, result, "bootstrap/hccl-config")
     group = dist.new_group(
         ranks=list(range(args.world_size)),
         backend="hccl",
@@ -916,6 +917,7 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl"), default="shmem")
+    parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(3, 4), help="HCCL AIV (3) or AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
     parser.add_argument("--profile-warmup", type=int, default=20)
     parser.add_argument("--comparison-id")
@@ -987,7 +989,11 @@ def _main() -> None:
         args.kernel_source = args.kernel_source.resolve()
     elif args.kernel_source is not None:
         parser.error("kernel-source is only valid for the standalone Ascend C backend")
+    if args.backend != "hccl" and args.hccl_op_expansion_mode is not None:
+        parser.error("hccl-op-expansion-mode requires the HCCL backend")
     if args.backend == "hccl":
+        if args.hccl_op_expansion_mode is None:
+            args.hccl_op_expansion_mode = 3
         if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
         if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV" or any(
