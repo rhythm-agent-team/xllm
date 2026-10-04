@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -407,6 +408,7 @@ def _run_case(
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
+        "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
         "row_width": args.row_width,
         "rows": None if args.row_width is None else count // args.row_width,
         "warmup_samples": [],
@@ -484,6 +486,8 @@ def _run_case(
             if name == "samples":
                 profiler.start()
                 _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+                if args.rank == 0 and args.profile_rank0_delay_ms is not None and args.profile_rank0_delay_ms > 0:
+                    time.sleep(args.profile_rank0_delay_ms / 1000)
             with torch.npu.stream(stream):
                 for call in group:
                     buffers = call["buffers"]
@@ -823,6 +827,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "backend",
         "profile_samples",
         "profile_warmup",
+        "profile_rank0_delay_ms",
         "comparison_id",
         "round_id",
         "stage_index",
@@ -920,6 +925,9 @@ def _main() -> None:
     parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(3, 4), help="HCCL AIV (3) or AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
     parser.add_argument("--profile-warmup", type=int, default=20)
+    parser.add_argument(
+        "--profile-rank0-delay-ms", type=int, help="Diagnostic-only rank-0 batch delay; explicit 0 is a control"
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -951,6 +959,13 @@ def _main() -> None:
     args = parser.parse_args()
     if args.profile_samples < 0:
         parser.error("profile-samples must be nonnegative")
+    if args.profile_rank0_delay_ms is not None and (
+        args.profile_rank0_delay_ms < 0
+        or not args.profile_samples
+        or args.backend not in ("hccl", "ascendc")
+        or args.mode != "eager"
+    ):
+        parser.error("profile-rank0-delay-ms requires nonnegative delay and eager HCCL/Ascend C gather-only profiling")
     if args.profile_samples:
         if args.profile_samples < 2 or args.profile_warmup < 2:
             parser.error("Gather-only profiling requires at least two warmup and measured samples")
@@ -1050,6 +1065,7 @@ def _main() -> None:
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
+        "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
         "row_width": args.row_width,
         "native_build_revision": args.native_build_revision,
         "native_build_revision_owner": {"ascendc": "workspace_source", "hccl": "xllm_source"}.get(args.backend),
