@@ -40,9 +40,9 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/openai_http.h"
-#include "api_service/responses_call.h"
-#include "api_service/responses_output.h"
-#include "api_service/responses_request.h"
+#include "api_service/openai_responses_call.h"
+#include "api_service/openai_responses_output.h"
+#include "api_service/openai_responses_request.h"
 #include "core/common/rate_limiter.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/request/request.h"
@@ -349,7 +349,7 @@ std::vector<Json> sse_events(const std::string& body) {
   return events;
 }
 
-class OpenAIResponsesHttpTest : public testing::Test {
+class OpenAIResponsesProtocolTest : public testing::Test {
  protected:
   void SetUp() override {
     previous_limit_ = ServiceConfig::get_instance().max_concurrent_requests();
@@ -508,12 +508,13 @@ class OpenAIResponsesHttpTest : public testing::Test {
   int32_t previous_limit_ = 0;
 };
 
-TEST_F(OpenAIResponsesHttpTest, CompletedJsonAndNamedSseUseResponseObjects) {
+TEST_F(OpenAIResponsesProtocolTest,
+       CompletedJsonAndNamedSseUseResponseObjects) {
   check_success(false);
   check_success(true);
 }
 
-TEST_F(OpenAIResponsesHttpTest, OnlyPluralPostRouteIsRegistered) {
+TEST_F(OpenAIResponsesProtocolTest, OnlyPluralPostRouteIsRegistered) {
   brpc::Controller wrong_route;
   request_raw(request_body(false).dump(), wrong_route, "/v1/response");
   EXPECT_EQ(wrong_route.http_response().status_code(), 404);
@@ -527,7 +528,7 @@ TEST_F(OpenAIResponsesHttpTest, OnlyPluralPostRouteIsRegistered) {
   EXPECT_EQ(service_.rate_limiter().get_num_concurrent_requests(), 0);
 }
 
-TEST_F(OpenAIResponsesHttpTest, ValidationAndPreflightFailuresStayJson) {
+TEST_F(OpenAIResponsesProtocolTest, ValidationAndPreflightFailuresStayJson) {
   for (const bool stream : {false, true}) {
     for (const auto& patch : {Json{{"store", true}},
                               Json{{"previous_response_id", "resp_old"}},
@@ -562,7 +563,7 @@ TEST_F(OpenAIResponsesHttpTest, ValidationAndPreflightFailuresStayJson) {
   EXPECT_EQ(malformed.http_response().status_code(), 400);
 }
 
-TEST_F(OpenAIResponsesHttpTest,
+TEST_F(OpenAIResponsesProtocolTest,
        LengthAndLateFailureHaveDistinctTerminalResponses) {
   for (const bool stream : {false, true}) {
     for (const bool failure : {false, true}) {
@@ -608,7 +609,7 @@ TEST_F(OpenAIResponsesHttpTest,
   }
 }
 
-TEST_F(OpenAIResponsesHttpTest, RawReasoningIsNotInventedSummary) {
+TEST_F(OpenAIResponsesProtocolTest, RawReasoningIsNotInventedSummary) {
   for (const bool stream : {false, true}) {
     brpc::Controller controller;
     request(request_body(stream, "__responses_fixture_reasoning__"),
@@ -635,7 +636,7 @@ TEST_F(OpenAIResponsesHttpTest, RawReasoningIsNotInventedSummary) {
   }
 }
 
-TEST_F(OpenAIResponsesHttpTest,
+TEST_F(OpenAIResponsesProtocolTest,
        RealAdmissionRejectsBothModesBeforeHeadersAndRecovers) {
   butil::fd_guard held(
       open_socket(request_body(true, "__responses_fixture_hold_before__")));
@@ -672,7 +673,7 @@ TEST_F(OpenAIResponsesHttpTest,
   check_success(true);
 }
 
-TEST_F(OpenAIResponsesHttpTest,
+TEST_F(OpenAIResponsesProtocolTest,
        SocketDisconnectBeforeAndAfterFirstByteReleasesOnce) {
   for (const auto& [stream, selector] :
        {std::pair{false, "__responses_fixture_hold_before__"},
@@ -708,7 +709,7 @@ TEST_F(OpenAIResponsesHttpTest,
   }
 }
 
-TEST_F(OpenAIResponsesHttpTest, SleepingIs503NotAdmission429) {
+TEST_F(OpenAIResponsesProtocolTest, SleepingIs503NotAdmission429) {
   ASSERT_TRUE(service_.rate_limiter().try_set_sleeping());
   for (const bool stream : {false, true}) {
     brpc::Controller controller;
@@ -724,7 +725,7 @@ TEST_F(OpenAIResponsesHttpTest, SleepingIs503NotAdmission429) {
   check_success(true);
 }
 
-TEST_F(OpenAIResponsesHttpTest, DISABLED_OfficialPythonSdkContract) {
+TEST_F(OpenAIResponsesProtocolTest, DISABLED_OfficialSdkCompatibility) {
   std::string interpreter(PYTHON3_EXECUTABLE);
   std::string script(XLLM_RESPONSES_SDK_CLIENT_PATH);
   std::string base_url =

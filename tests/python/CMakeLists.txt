@@ -40,7 +40,7 @@ foreach(test_source IN LISTS test_sources)
 endforeach()
 
 # Responses SDK validation needs an explicitly configured external endpoint.
-set_tests_properties(python_tests.openai_responses PROPERTIES DISABLED TRUE)
+set_tests_properties(python_tests.openai_responses_protocol PROPERTIES DISABLED TRUE)
 
 # Distributed NZ tests are standalone torchrun entrypoints; pytest skips them.
 foreach(nz_test IN ITEMS all_gather_nz_bytes bitwise_nz_bytes matmul_nz_bytes)

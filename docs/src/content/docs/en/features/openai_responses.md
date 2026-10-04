@@ -209,20 +209,20 @@ Pre-output failures use the shared OpenAI error envelope with `message`, `type`,
 
 ## Validation entry points
 
-Dedicated native targets cover request conversion, output/SSE serialization, and real brpc transport: `openai_responses_request_test`, `openai_responses_output_test`, and `openai_responses_http_test`. Its official SDK case is excluded from ordinary runs with the standard `DISABLED_` prefix. Explicitly run `OpenAIResponsesHttpTest.DISABLED_OfficialPythonSdkContract` with `--gtest_also_run_disabled_tests`; it uses CMake's selected `Python3_EXECUTABLE`, which must already have `openai` and `httpx` installed. Missing packages fail explicit validation; the test does not install them or switch interpreters.
+Dedicated native targets cover request conversion, output/SSE serialization, and real brpc transport: `openai_responses_request_test`, `openai_responses_output_test`, and `openai_responses_protocol_test`. Its official SDK case is excluded from ordinary runs with the standard `DISABLED_` prefix and shares the `XLLM_ENABLE_SDK_TESTS` CMake option (default `OFF`) with the other protocols. Explicitly run `OpenAIResponsesProtocolTest.DISABLED_OfficialSdkCompatibility` with `--gtest_also_run_disabled_tests`; it uses CMake's selected `Python3_EXECUTABLE`, which must already have `openai` and `httpx` installed. Missing packages fail explicit validation; the test does not install them or switch interpreters.
 
 The Python SDK CTest target is also disabled in ordinary runs. Run pytest explicitly from the checkout root inside the required container, using the normal native initialization in `tests/python/conftest.py`:
 
 ```bash
 XLLM_RESPONSES_BASE_URL=http://127.0.0.1:9977/v1 \
 XLLM_RESPONSES_MODEL=loaded-model \
-python -m pytest tests/python/test_openai_responses.py
+python -m pytest tests/python/test_openai_responses_protocol.py
 ```
 
 The same module provides an HTTP-only client for an existing externally owned service:
 
 ```bash
-python tests/python/test_openai_responses.py \
+python tests/python/test_openai_responses_protocol.py \
   --base-url http://127.0.0.1:9977/v1 --model loaded-model \
   --limit-one --evidence-dir /path/to/fresh-results
 ```

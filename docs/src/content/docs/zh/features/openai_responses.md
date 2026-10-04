@@ -209,20 +209,20 @@ print(answer.output_text)
 
 ## 验证入口
 
-专用原生目标覆盖请求转换、输出/SSE 序列化和真实 brpc 传输：`openai_responses_request_test`、`openai_responses_output_test`、`openai_responses_http_test`。官方 SDK 用例通过标准 `DISABLED_` 前缀排除在普通运行之外；显式使用 `--gtest_also_run_disabled_tests` 运行 `OpenAIResponsesHttpTest.DISABLED_OfficialPythonSdkContract`。该用例使用 CMake 已选定的 `Python3_EXECUTABLE`，要求预先安装 `openai`、`httpx`。缺少包时显式验证失败，不自动安装或切换解释器。
+专用原生目标覆盖请求转换、输出/SSE 序列化和真实 brpc 传输：`openai_responses_request_test`、`openai_responses_output_test`、`openai_responses_protocol_test`。官方 SDK 用例通过标准 `DISABLED_` 前缀排除在普通运行之外，并与其他协议共用默认 `OFF` 的 `XLLM_ENABLE_SDK_TESTS` CMake 选项；显式使用 `--gtest_also_run_disabled_tests` 运行 `OpenAIResponsesProtocolTest.DISABLED_OfficialSdkCompatibility`。该用例使用 CMake 已选定的 `Python3_EXECUTABLE`，要求预先安装 `openai`、`httpx`。缺少包时显式验证失败，不自动安装或切换解释器。
 
 Python SDK 的 CTest 目标同样默认禁用。应在所需容器内、checkout 根目录显式运行 pytest，原生初始化由 `tests/python/conftest.py` 统一负责：
 
 ```bash
 XLLM_RESPONSES_BASE_URL=http://127.0.0.1:9977/v1 \
 XLLM_RESPONSES_MODEL=loaded-model \
-python -m pytest tests/python/test_openai_responses.py
+python -m pytest tests/python/test_openai_responses_protocol.py
 ```
 
 同一模块还提供面向已启动、由外部拥有生命周期的服务的纯 HTTP 客户端：
 
 ```bash
-python tests/python/test_openai_responses.py \
+python tests/python/test_openai_responses_protocol.py \
   --base-url http://127.0.0.1:9977/v1 --model loaded-model \
   --limit-one --evidence-dir /path/to/fresh-results
 ```

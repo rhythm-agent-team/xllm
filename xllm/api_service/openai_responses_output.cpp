@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "api_service/responses_output.h"
+#include "api_service/openai_responses_output.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>

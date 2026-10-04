@@ -21,12 +21,12 @@ limitations under the License.
 #include <vector>
 
 #include "anthropic_service_impl.h"
-#include "api_service/responses_service_impl.h"
+#include "api_service/openai_chat_completion_service_impl.h"
+#include "api_service/openai_embeddings_service_impl.h"
+#include "api_service/openai_responses_service_impl.h"
+#include "api_service/openai_text_completion_service_impl.h"
 #include "audio_generation_service_impl.h"
-#include "chat_service_impl.h"
-#include "completion_service_impl.h"
 #include "core/distributed_runtime/master_manager.h"
-#include "embedding_service_impl.h"
 #include "image_generation_service_impl.h"
 #include "models_service_impl.h"
 #include "qwen3_rerank_service_impl.h"

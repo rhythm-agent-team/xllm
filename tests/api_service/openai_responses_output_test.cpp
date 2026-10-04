@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "api_service/openai_responses_output.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -20,7 +22,6 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "api_service/responses_output.h"
 #include "core/framework/request/finish_reason.h"
 #include "function_call/function_call_parser.h"
 

@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "api_service/responses_service_impl.h"
+#include "api_service/openai_responses_service_impl.h"
 
-#include "api_service/responses_output.h"
+#include "api_service/openai_responses_output.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/config/service_config.h"
 #include "core/util/scope_guard.h"

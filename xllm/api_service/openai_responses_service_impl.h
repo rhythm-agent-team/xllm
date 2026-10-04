@@ -17,8 +17,8 @@ limitations under the License.
 
 #include <memory>
 
-#include "api_service/responses_call.h"
-#include "api_service/responses_request.h"
+#include "api_service/openai_responses_call.h"
+#include "api_service/openai_responses_request.h"
 #include "core/distributed_runtime/master_manager.h"
 
 namespace xllm {

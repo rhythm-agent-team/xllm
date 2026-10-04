@@ -29,7 +29,7 @@ limitations under the License.
 
 #include "api_service/anthropic_request_utils.h"
 #include "api_service/chat_json_parser.h"
-#include "api_service/chat_request_decoder.h"
+#include "api_service/openai_chat_completion_request_decoder.h"
 #include "api_service/openai_http.h"
 #include "api_service/openai_request.h"
 #include "api_service/request_id.h"

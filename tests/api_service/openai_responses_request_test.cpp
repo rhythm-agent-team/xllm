@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "api_service/openai_responses_request.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -20,8 +22,6 @@ limitations under the License.
 #include <string>
 #include <variant>
 #include <vector>
-
-#include "api_service/responses_request.h"
 
 namespace xllm::api_service {
 namespace {

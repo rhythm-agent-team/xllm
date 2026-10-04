@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "api_service/responses_call.h"
+#include "api_service/openai_responses_call.h"
 
 #include <brpc/callback.h>
 #include <glog/logging.h>
