@@ -4,6 +4,11 @@ add_subdirectory(tilelang)
 
 add_subdirectory(xllm_ops)
 
+option(XLLM_ENABLE_ACLSHMEM_ALL_GATHER "Build the public ACLSHMEM Ascend C AllGather" OFF)
+if(XLLM_ENABLE_ACLSHMEM_ALL_GATHER)
+  add_subdirectory(aclshmem_all_gather)
+endif()
+
 # Keep this adapter's cache separate from torch_npu's incompatible TLS cache.
 set_source_files_properties(atb_matmul_ein_sum.cpp PROPERTIES
   COMPILE_OPTIONS "-fvisibility=hidden"
@@ -54,3 +59,10 @@ cc_library(
     opapi
     platform_npu
 )
+
+if(XLLM_ENABLE_ACLSHMEM_ALL_GATHER)
+  target_sources(npu_kernels PRIVATE aclshmem_all_gather/all_gather.cpp)
+  target_link_libraries(npu_kernels PRIVATE aclshmem_all_gather_device)
+  add_dependencies(npu_kernels aclshmem_all_gather_device)
+  target_compile_definitions(npu_kernels PRIVATE XLLM_ENABLE_ACLSHMEM_ALL_GATHER=1)
+endif()

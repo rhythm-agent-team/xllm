@@ -14,8 +14,8 @@
 
 """One rank of direct AllGather correctness and optional msprof capture.
 
-The default TileLang SHMEM path uses CPU FileStore coordination and official
-TCP/MTE bootstrap, without HCCL, MPI or an xLLM native library. Matched profiling
+TileLang and native Ascend C use CPU FileStore coordination and official
+SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. Matched profiling
 may explicitly select the existing current-stream native HCCL AllGather instead.
 The caller must verify device availability, package/native identities and prior
 required correctness evidence before requesting measurement.
@@ -45,6 +45,7 @@ from scripts.logger import logger
 
 _GUARD_BYTES = 128
 _GUARD_VALUE = -123
+_SKEW_PHASES = {"none": 0, "read": 1, "ack": 2}
 
 
 def _save(result_path: Path, result: dict[str, Any], phase: str) -> None:
@@ -164,6 +165,71 @@ def _compile_only(args: argparse.Namespace, result: dict[str, Any], result_path:
     _save(result_path, result, "lowered-only/no-device-execution")
 
 
+def _compile_tilelang(args: argparse.Namespace, count: int) -> tuple[Any, dict[str, Any]]:
+    import tilelang
+
+    from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
+
+    kernel = tilelang.compile(
+        build_shmem_all_gather_kernel(
+            count,
+            args.world_size,
+            args.lanes,
+            args.chunk_bytes,
+            args.dtype,
+            skew_phase=args.skew_phase,
+            skew_iterations=args.skew_iterations,
+        ),
+        out_idx=None,
+        target="ascendc",
+        platform="A3",
+        pass_configs=SHMEM_PASS_CONFIGS,
+    )
+    generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
+    generated_path.write_text(kernel.get_kernel_source(), encoding="utf-8")
+    return kernel, {
+        "generated_source": _file_identity(generated_path),
+        "jit_library": _file_identity(kernel.adapter.libpath),
+    }
+
+
+def _load_native(args: argparse.Namespace, result: dict[str, Any]) -> None:
+    result["native_library"] = _file_identity(args.native_library)
+    result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
+    torch.ops.load_library(str(args.native_library))
+    name = "npu_aclshmem_all_gather" if args.backend == "ascendc" else "npu_all_gather"
+    operator = getattr(torch.ops.xllm_ops, name, None)
+    if operator is None or not callable(operator.default):
+        raise RuntimeError(f"Native {args.backend} AllGather registration {name} is not callable")
+    if result["native_library"] != _file_identity(args.native_library):
+        raise RuntimeError(f"{args.backend} native library identity changed during loading")
+
+
+def _gather_ascendc(
+    args: argparse.Namespace,
+    source: torch.Tensor,
+    output: torch.Tensor,
+    receive: torch.Tensor,
+    controls: torch.Tensor,
+    epochs: torch.Tensor,
+    scratch: torch.Tensor,
+) -> None:
+    torch.ops.xllm_ops.npu_aclshmem_all_gather(
+        source,
+        output,
+        receive,
+        controls,
+        epochs,
+        scratch,
+        args.rank,
+        args.world_size,
+        args.lanes,
+        args.chunk_bytes,
+        _SKEW_PHASES[args.skew_phase],
+        args.skew_iterations,
+    )
+
+
 def _run_case(
     args: argparse.Namespace,
     store: dist.Store,
@@ -185,36 +251,15 @@ def _run_case(
     result["cases"].append(case)
     scratch = None
     kernel = None
-    if args.backend == "shmem":
-        import tilelang
-
-        from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
-
+    if args.backend in ("shmem", "ascendc"):
         if receive is None or controls is None or epochs is None:
             raise RuntimeError("SHMEM AllGather requires its initialized symmetric buffers")
         scratch = _prepare_scratch(args, device)
+    if args.backend == "shmem":
         _save(result_path, result, f"count-{count}/compile")
-        kernel = tilelang.compile(
-            build_shmem_all_gather_kernel(
-                count,
-                args.world_size,
-                args.lanes,
-                args.chunk_bytes,
-                args.dtype,
-                skew_phase=args.skew_phase,
-                skew_iterations=args.skew_iterations,
-            ),
-            out_idx=None,
-            target="ascendc",
-            platform="A3",
-            pass_configs=SHMEM_PASS_CONFIGS,
-        )
-        generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
-        generated_path.write_text(kernel.get_kernel_source(), encoding="utf-8")
-        case.update(
-            {"generated_source": _file_identity(generated_path), "jit_library": _file_identity(kernel.adapter.libpath)}
-        )
-    elif not comm:
+        kernel, identity = _compile_tilelang(args, count)
+        case.update(identity)
+    elif args.backend == "hccl" and not comm:
         raise RuntimeError("HCCL AllGather requires a valid initialized communicator")
     ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
     _save(result_path, result, ready_phase)
@@ -231,6 +276,8 @@ def _run_case(
     ) -> None:
         if args.backend == "shmem":
             kernel(source_tensor, rank_major, receive, controls, epochs, scratch["tensor"], args.rank)
+        elif args.backend == "ascendc":
+            _gather_ascendc(args, source_tensor, output_tensor, receive, controls, epochs, scratch["tensor"])
         else:
             torch.ops.xllm_ops.npu_all_gather(source_tensor, output_tensor, comm)
 
@@ -507,40 +554,18 @@ def _run_batch(
     controls: torch.Tensor,
     epochs: torch.Tensor,
 ) -> None:
-    import tilelang
-
-    from xllm.python.kernels_npu.tilelang.shmem_all_gather import SHMEM_PASS_CONFIGS, build_shmem_all_gather_kernel
-
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
     kernels = {}
-    _save(result_path, result, "batch/compile")
+    if args.backend == "shmem":
+        _save(result_path, result, "batch/compile")
     for count in args.counts:
-        kernel = tilelang.compile(
-            build_shmem_all_gather_kernel(
-                count,
-                args.world_size,
-                args.lanes,
-                args.chunk_bytes,
-                args.dtype,
-                skew_phase=args.skew_phase,
-                skew_iterations=args.skew_iterations,
-            ),
-            out_idx=None,
-            target="ascendc",
-            platform="A3",
-            pass_configs=SHMEM_PASS_CONFIGS,
-        )
-        generated_path = args.artifact_dir / f"rank-{args.rank}-count-{count}.cpp"
-        generated_path.write_text(kernel.get_kernel_source(), encoding="utf-8")
-        result["cases"].append(
-            {
-                "count": count,
-                "generated_source": _file_identity(generated_path),
-                "jit_library": _file_identity(kernel.adapter.libpath),
-            }
-        )
-        kernels[count] = kernel
+        case = {"count": count}
+        if args.backend == "shmem":
+            kernel, identity = _compile_tilelang(args, count)
+            case.update(identity)
+            kernels[count] = kernel
+        result["cases"].append(case)
 
     _save(result_path, result, "batch/prepare")
     calls = []
@@ -563,7 +588,7 @@ def _run_batch(
                 "call_id": call_id,
                 "count": count,
                 "rounds": rounds,
-                "kernel": kernels[count],
+                "kernel": kernels[count] if args.backend == "shmem" else None,
                 "source": source,
                 "source_storage": source_storage,
                 "source_guard": source_guard,
@@ -604,15 +629,20 @@ def _run_batch(
     def _submit(group: list[dict[str, Any]]) -> None:
         # No per-call host checks, resets, rendezvous, allocation or logging.
         for call in group:
-            call["kernel"](
-                call["source"],
-                call["rank_major_output"],
-                receive,
-                controls,
-                epochs,
-                call["scratch"]["tensor"],
-                args.rank,
-            )
+            if args.backend == "shmem":
+                call["kernel"](
+                    call["source"],
+                    call["rank_major_output"],
+                    receive,
+                    controls,
+                    epochs,
+                    call["scratch"]["tensor"],
+                    args.rank,
+                )
+            else:
+                _gather_ascendc(
+                    args, call["source"], call["output"], receive, controls, epochs, call["scratch"]["tensor"]
+                )
             torch.add(call["output"], 1, out=call["consumer"])
 
     def _check_outputs(group: list[dict[str, Any]], executed: bool = True) -> None:
@@ -822,13 +852,7 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     result["versions"] = {"torch": torch.__version__, "torch_npu": torch_npu.__version__}
-    result["native_library"] = _file_identity(args.native_library)
-    result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
-    torch.ops.load_library(str(args.native_library))
-    if not callable(torch.ops.xllm_ops.npu_all_gather.default):
-        raise RuntimeError("Native current-stream HCCL AllGather registration is not callable")
-    if result["native_library"] != _file_identity(args.native_library):
-        raise RuntimeError("HCCL native library identity changed during loading")
+    _load_native(args, result)
     _save(result_path, result, "bootstrap")
     store = _bootstrap_store(args, result, ("worker", "native_library"))
     if dist.is_initialized():
@@ -866,7 +890,7 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("shmem", "hccl"), default="shmem")
+    parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl"), default="shmem")
     parser.add_argument("--profile-samples", type=int, default=0)
     parser.add_argument("--profile-warmup", type=int, default=20)
     parser.add_argument("--comparison-id")
@@ -918,24 +942,26 @@ def _main() -> None:
         if args.row_width is not None and (args.row_width <= 0 or any(count % args.row_width for count in args.counts)):
             parser.error("row-width must be positive and divide every count")
     elif args.profile_warmup != 20 or any(
-        value is not None
-        for value in (args.comparison_id, args.round_id, args.stage_index, args.row_width, args.native_build_revision)
+        value is not None for value in (args.comparison_id, args.round_id, args.stage_index, args.row_width)
     ):
         parser.error("Profiling metadata requires positive profile-samples")
+    if args.compile_only and args.backend != "shmem":
+        parser.error("compile-only is available only for the TileLang SHMEM backend")
+    if args.backend in ("hccl", "ascendc"):
+        if args.native_library is None or not args.native_library.is_absolute() or not args.native_library.is_file():
+            parser.error(f"{args.backend} requires native-library as an existing absolute file")
+        args.native_library = args.native_library.resolve()
+        if args.native_build_revision is None or re.fullmatch(r"[0-9a-f]{40}", args.native_build_revision) is None:
+            parser.error(f"{args.backend} requires the full native-build-revision caller assertion")
+    elif args.native_library is not None or args.native_build_revision is not None:
+        parser.error("TileLang SHMEM must not load a native library")
     if args.backend == "hccl":
         if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
-        if args.native_library is None or not args.native_library.is_absolute() or not args.native_library.is_file():
-            parser.error("HCCL requires native-library as an existing absolute file")
-        args.native_library = args.native_library.resolve()
-        if args.native_build_revision is None or re.fullmatch(r"[0-9a-f]{40}", args.native_build_revision) is None:
-            parser.error("HCCL requires the full native-build-revision caller assertion")
         if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV" or any(
             not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
         ):
             parser.error("HCCL requires explicit AIV expansion and host/NPU socket port ranges")
-    elif args.native_library is not None or args.native_build_revision is not None:
-        parser.error("SHMEM must not load an HCCL native library")
     if not 0 <= args.rank < args.world_size or args.device < 0:
         parser.error("Require 0 <= rank < world-size and a nonnegative explicit device")
     if args.stress_batch and args.compile_only:
@@ -954,8 +980,12 @@ def _main() -> None:
         args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
     ):
         parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
-    if args.lanes <= 0 or args.lanes % 2 or args.repeats <= 0:
-        parser.error("Require positive even lanes and positive repeats")
+    if args.repeats <= 0 or args.lanes <= 0:
+        parser.error("Require positive repeats and positive lanes")
+    if args.backend == "ascendc" and args.lanes > 48:
+        parser.error("Ascend C supports lanes in 1..48; native launch also checks hardware capacity")
+    if args.backend != "ascendc" and args.lanes % 2:
+        parser.error("TileLang MIX and matched HCCL configuration require even lanes")
     if not 0 < args.chunk_bytes <= 64 * 1024 or args.chunk_bytes % 128:
         parser.error("Require chunk-bytes <= 64 KiB and a positive multiple of 128")
     if len(set(args.counts)) != len(args.counts) or any(
@@ -1039,33 +1069,36 @@ def _main() -> None:
         {name: os.environ[name] for name in ("SHMEM_LOG_LEVEL", "SHMEM_LOG_TO_STDOUT", "SHMEM_LOG_PATH")}
     )
     import shmem
-    import tilelang
     import torch_npu
     from shmem import InitAttr
     from shmem.construct_tensor import construct_tensor_from_ptr
-
-    from xllm.python.kernels_npu.tilelang import shmem_all_gather as kernel_module
 
     torch.set_num_threads(1)
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     dtype = getattr(torch, args.dtype)
-    result["versions"] = {
-        "torch": torch.__version__,
-        "torch_npu": torch_npu.__version__,
-        "tilelang": tilelang.__version__,
-    }
-    result["kernel"] = _file_identity(kernel_module.__file__)
+    result["versions"] = {"torch": torch.__version__, "torch_npu": torch_npu.__version__}
     result["shmem_python"] = _file_identity(shmem.__file__)
     result["shmem_native"] = _file_identity(sys.modules["shmem._pyshmem"].__file__)
-    result["tilelang_python"] = _file_identity(tilelang.__file__)
-    result["tilelang_native"] = _file_identity(tilelang._LIB_PATH)
+    identities = ("worker", "kernel", "shmem_python", "shmem_native")
+    if args.backend == "ascendc":
+        result["kernel"] = _file_identity(
+            Path(__file__).resolve().parents[2] / "xllm/core/kernels/npu/aclshmem_all_gather/all_gather_kernel.cpp"
+        )
+        _load_native(args, result)
+        identities += ("native_library",)
+    else:
+        import tilelang
+
+        from xllm.python.kernels_npu.tilelang import shmem_all_gather as kernel_module
+
+        result["versions"]["tilelang"] = tilelang.__version__
+        result["kernel"] = _file_identity(kernel_module.__file__)
+        result["tilelang_python"] = _file_identity(tilelang.__file__)
+        result["tilelang_native"] = _file_identity(tilelang._LIB_PATH)
+        identities += ("tilelang_python", "tilelang_native")
     _save(result_path, result, "bootstrap")
-    store = _bootstrap_store(
-        args,
-        result,
-        ("worker", "kernel", "shmem_python", "shmem_native", "tilelang_python", "tilelang_native"),
-    )
+    store = _bootstrap_store(args, result, identities)
     if shmem.aclshmemx_init_status() != shmem.InitStatus.NOT_INITIALIZED:
         raise RuntimeError("Test requires an uninitialized SHMEM process")
     # Use the selected SHMEM version's official config-store TCP/MTE bootstrap.

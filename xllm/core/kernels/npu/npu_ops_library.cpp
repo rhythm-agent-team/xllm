@@ -30,6 +30,9 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#ifdef XLLM_ENABLE_ACLSHMEM_ALL_GATHER
+#include "core/kernels/npu/aclshmem_all_gather/all_gather.h"
+#endif
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/util/tensor_helper.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -682,6 +685,13 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def("npu_all_reduce(Tensor(a!) x, int comm) -> ()");
   m.def("npu_all_gather(Tensor input, Tensor(a!) output, int comm) -> ()");
   m.def("npu_reduce_scatter(Tensor input, Tensor(a!) output, int comm) -> ()");
+#ifdef XLLM_ENABLE_ACLSHMEM_ALL_GATHER
+  m.def(
+      "npu_aclshmem_all_gather(Tensor input, Tensor(a!) output, "
+      "Tensor(b!) receive, Tensor(c!) controls, Tensor(d!) epochs, "
+      "Tensor(e!) scratch, int rank, int world_size, int lanes, "
+      "int chunk_bytes, int skew_phase, int skew_iterations) -> ()");
+#endif
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -744,6 +754,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::all_gather_on_current_stream));
   m.impl("npu_reduce_scatter",
          TORCH_FN(xllm::kernel::npu::reduce_scatter_on_current_stream));
+#ifdef XLLM_ENABLE_ACLSHMEM_ALL_GATHER
+  m.impl("npu_aclshmem_all_gather",
+         TORCH_FN(xllm::kernel::npu::aclshmem_all_gather_on_current_stream));
+#endif
 }
 
 // build_cp_context is pure host index math with no Tensor input, so the
