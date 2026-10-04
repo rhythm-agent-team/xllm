@@ -224,11 +224,15 @@ def _run_case(
     )
     stream = torch.npu.Stream() if args.profile_samples else torch.npu.current_stream()
 
-    def _gather() -> None:
+    def _gather(
+        source_tensor: torch.Tensor = source,
+        output_tensor: torch.Tensor = output,
+        rank_major: torch.Tensor = rank_major_output,
+    ) -> None:
         if args.backend == "shmem":
-            kernel(source, rank_major_output, receive, controls, epochs, scratch["tensor"], args.rank)
+            kernel(source_tensor, rank_major, receive, controls, epochs, scratch["tensor"], args.rank)
         else:
-            torch.ops.xllm_ops.npu_all_gather(source, output, comm)
+            torch.ops.xllm_ops.npu_all_gather(source_tensor, output_tensor, comm)
 
     def _submit() -> None:
         _gather()
@@ -389,36 +393,99 @@ def _run_case(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         ),
     )
-    for ordinal in range(args.profile_warmup + args.profile_samples):
-        sample_index = ordinal - args.profile_warmup
-        iteration = args.repeats + ordinal + 1
-        phase = f"count-{count}/profile/sample-{sample_index}"
-        _save(result_path, result, phase)
-        previous_epochs = _previous_epochs()
-        local = _prepare(iteration)
-        torch.npu.synchronize()
-        _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-        if sample_index == 0:
-            profiler.start()
-            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
-        gather_range = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
-        with torch.npu.stream(stream):
-            # CPU ranges label calls; only the associated device trace gives duration.
-            with torch.profiler.record_function(gather_range):
-                if profile_graph is None:
-                    _gather()
-                else:
+    if args.mode == "eager":
+        profile["submission_pattern"] = "retained_continuous"
+        calls = []
+        for ordinal in range(args.profile_warmup + args.profile_samples):
+            sample_index = ordinal - args.profile_warmup
+            iteration = args.repeats + ordinal + 1
+            buffers = {
+                "source": _guarded(count, dtype, device),
+                "output": _guarded(args.world_size * count, dtype, device),
+                "consumer": _guarded(args.world_size * count, dtype, device),
+            }
+            local = _payload(args.rank, count, iteration, dtype)
+            expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
+            buffers["source"][1].copy_(local)
+            buffers["output"][1].fill_(float("nan"))
+            buffers["consumer"][1].fill_(float("nan"))
+            calls.append(
+                {
+                    "buffers": buffers,
+                    "rank_major": buffers["output"][1].view(args.world_size, count),
+                    "local": local,
+                    "expected": expected,
+                    "record": {
+                        "sample_index": sample_index,
+                        "input_iteration": iteration,
+                        "gather_range": f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}",
+                    },
+                }
+            )
+
+        for name, group in (
+            ("warmup_samples", calls[: args.profile_warmup]),
+            ("samples", calls[args.profile_warmup :]),
+        ):
+            torch.npu.synchronize()
+            starting_epochs = _previous_epochs()
+            _save(result_path, result, f"count-{count}/profile/{name}/prepared")
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/prepared")
+            if name == "samples":
+                profiler.start()
+                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+            with torch.npu.stream(stream):
+                for call in group:
+                    buffers = call["buffers"]
+                    with torch.profiler.record_function(call["record"]["gather_range"]):
+                        _gather(buffers["source"][1], buffers["output"][1], call["rank_major"])
+                    torch.add(buffers["output"][1], 1, out=buffers["consumer"][1])
+            torch.npu.synchronize()
+            if name == "samples":
+                profiler.stop()
+            for call in group:
+                for key, expected in (
+                    ("source", call["local"]),
+                    ("output", call["expected"]),
+                    ("consumer", call["expected"] + 1),
+                ):
+                    storage, tensor, guard = call["buffers"][key]
+                    torch.testing.assert_close(tensor.cpu(), expected, rtol=0, atol=0)
+                    _check_guards(storage, tensor.numel(), guard)
+            if scratch is not None:
+                _check_scratch(scratch)
+                _check_state(controls, epochs, (starting_epochs + len(group) * rounds) % 2, args.lanes, args.world_size)
+            profile[name] = [call["record"] for call in group]
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/checked")
+            _save(result_path, result, f"count-{count}/profile/{name}/checked")
+    else:
+        profile["submission_pattern"] = "checked_single_graph_replay"
+        for ordinal in range(args.profile_warmup + args.profile_samples):
+            sample_index = ordinal - args.profile_warmup
+            iteration = args.repeats + ordinal + 1
+            phase = f"count-{count}/profile/sample-{sample_index}"
+            _save(result_path, result, phase)
+            previous_epochs = _previous_epochs()
+            local = _prepare(iteration)
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+            if sample_index == 0:
+                profiler.start()
+                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+            gather_range = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
+            with torch.npu.stream(stream):
+                with torch.profiler.record_function(gather_range):
                     profile_graph.replay()
-            torch.add(output, 1, out=consumed)
+                torch.add(output, 1, out=consumed)
+            torch.npu.synchronize()
+            _check_outputs(iteration, local, previous_epochs)
+            _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+            records = profile["warmup_samples"] if sample_index < 0 else profile["samples"]
+            records.append({"sample_index": sample_index, "input_iteration": iteration, "gather_range": gather_range})
+            _save(result_path, result, f"{phase}/checked")
         torch.npu.synchronize()
-        _check_outputs(iteration, local, previous_epochs)
-        _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
-        records = profile["warmup_samples"] if sample_index < 0 else profile["samples"]
-        records.append({"sample_index": sample_index, "input_iteration": iteration, "gather_range": gather_range})
-        _save(result_path, result, f"{phase}/checked")
-    torch.npu.synchronize()
+        profiler.stop()
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/drained")
-    profiler.stop()
     traces = sorted(profile_dir.rglob("trace_view.json"))
     if not traces:
         raise RuntimeError(f"Profiler did not export a device trace: {profile_dir}")
