@@ -197,8 +197,9 @@ def _load_native(args: argparse.Namespace, result: dict[str, Any]) -> None:
     result["native_library"] = _file_identity(args.native_library)
     result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
     torch.ops.load_library(str(args.native_library))
-    name = "npu_aclshmem_all_gather" if args.backend == "ascendc" else "npu_all_gather"
-    operator = getattr(torch.ops.xllm_ops, name, None)
+    namespace = torch.ops.aclshmem_ops if args.backend == "ascendc" else torch.ops.xllm_ops
+    name = "all_gather" if args.backend == "ascendc" else "npu_all_gather"
+    operator = getattr(namespace, name, None)
     if operator is None or not callable(operator.default):
         raise RuntimeError(f"Native {args.backend} AllGather registration {name} is not callable")
     if result["native_library"] != _file_identity(args.native_library):
@@ -214,7 +215,7 @@ def _gather_ascendc(
     epochs: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
-    torch.ops.xllm_ops.npu_aclshmem_all_gather(
+    torch.ops.aclshmem_ops.all_gather(
         source,
         output,
         receive,
@@ -813,6 +814,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "stage_index",
         "row_width",
         "native_build_revision",
+        "native_build_revision_owner",
         "world_size",
         "mode",
         "stress_batch",
@@ -899,6 +901,7 @@ def _main() -> None:
     parser.add_argument("--row-width", type=int)
     parser.add_argument("--native-library", type=Path)
     parser.add_argument("--native-build-revision")
+    parser.add_argument("--kernel-source", type=Path, help="Standalone Ascend C kernel source identity")
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--world-size", type=int, choices=(2, 4, 8, 16), required=True)
     parser.add_argument("--device", type=int, required=True)
@@ -955,6 +958,12 @@ def _main() -> None:
             parser.error(f"{args.backend} requires the full native-build-revision caller assertion")
     elif args.native_library is not None or args.native_build_revision is not None:
         parser.error("TileLang SHMEM must not load a native library")
+    if args.backend == "ascendc":
+        if args.kernel_source is None or not args.kernel_source.is_absolute() or not args.kernel_source.is_file():
+            parser.error("Ascend C requires kernel-source as an existing absolute file")
+        args.kernel_source = args.kernel_source.resolve()
+    elif args.kernel_source is not None:
+        parser.error("kernel-source is only valid for the standalone Ascend C backend")
     if args.backend == "hccl":
         if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
@@ -1014,6 +1023,7 @@ def _main() -> None:
         "stage_index": args.stage_index,
         "row_width": args.row_width,
         "native_build_revision": args.native_build_revision,
+        "native_build_revision_owner": {"ascendc": "workspace_source", "hccl": "xllm_source"}.get(args.backend),
         "rank": args.rank,
         "world_size": args.world_size,
         "device": args.device,
@@ -1082,9 +1092,7 @@ def _main() -> None:
     result["shmem_native"] = _file_identity(sys.modules["shmem._pyshmem"].__file__)
     identities = ("worker", "kernel", "shmem_python", "shmem_native")
     if args.backend == "ascendc":
-        result["kernel"] = _file_identity(
-            Path(__file__).resolve().parents[2] / "xllm/core/kernels/npu/aclshmem_all_gather/all_gather_kernel.cpp"
-        )
+        result["kernel"] = _file_identity(args.kernel_source)
         _load_native(args, result)
         identities += ("native_library",)
     else:
