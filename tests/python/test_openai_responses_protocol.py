@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -205,11 +206,19 @@ def _output_text(response: dict[str, Any]) -> str:
     )
 
 
-def _assert_response(response: dict[str, Any], status: str = "completed") -> None:
+def _assert_response(response: dict[str, Any], status: str = "completed", *, sdk: bool = False) -> None:
     assert set(response) >= _RESPONSE_FIELDS, _RESPONSE_FIELDS - set(response)
     assert response["object"] == "response" and "choices" not in response
     assert response["id"].startswith("resp_") and len(response["id"]) > 5
-    _nonnegative_integer(response["created_at"])
+    for field in ("created_at", "completed_at"):
+        timestamp = response[field]
+        if field == "completed_at" and status != "completed":
+            assert timestamp is None
+        elif sdk and type(timestamp) is float:
+            # SDK Response models declare timestamps as float; raw JSON remains integer.
+            assert math.isfinite(timestamp) and timestamp >= 0 and timestamp.is_integer(), timestamp
+        else:
+            _nonnegative_integer(timestamp)
     assert response["status"] == status
     assert response["store"] is False and response["background"] is False
     assert response["previous_response_id"] is None
@@ -255,7 +264,7 @@ def _assert_response(response: dict[str, Any], status: str = "completed") -> Non
             raise AssertionError(f"Unsupported output item: {item['type']}")
 
 
-def _assert_events(events: list[dict[str, Any]], status: str = "completed") -> dict[str, Any]:
+def _assert_events(events: list[dict[str, Any]], status: str = "completed", *, sdk: bool = False) -> dict[str, Any]:
     assert [event["type"] for event in events[:2]] == ["response.created", "response.in_progress"]
     assert [event["sequence_number"] for event in events] == list(range(len(events)))
     assert all(type(event["sequence_number"]) is int and "choices" not in event for event in events)
@@ -345,7 +354,7 @@ def _assert_events(events: list[dict[str, Any]], status: str = "completed") -> d
         else:
             raise AssertionError(f"Unexpected SSE event: {kind}")
     final = terminals[0]["response"]
-    _assert_response(final, status)
+    _assert_response(final, status, sdk=sdk)
     assert final["id"] == initial["id"] and final["model"] == initial["model"]
     assert len(final["output"]) == len(items)
     for index, item in enumerate(final["output"]):
@@ -363,7 +372,7 @@ def _assert_events(events: list[dict[str, Any]], status: str = "completed") -> d
 def _assert_accumulator(events: list[dict[str, Any]], final: dict[str, Any]) -> None:
     # SDK helpers may enrich or synthesize events. Wire ordering is checked
     # independently by raw SSE and responses.create(stream=True).
-    _assert_response(final)
+    _assert_response(final, sdk=True)
     terminals = [event for event in events if event["type"] in _TERMINALS]
     assert len(terminals) == 1 and terminals[0]["type"] == "response.completed"
     assert final == terminals[0]["response"]
@@ -459,7 +468,7 @@ def _check_text(settings: _Settings) -> None:
         response = sdk.responses.create(**_payload(settings, "text"), stream=False)
         parsed = _dump(response)
         _record(settings, "sdk-create-text", parsed)
-        _assert_response(parsed)
+        _assert_response(parsed, sdk=True)
         _assert_text_result(settings, parsed)
         assert response.output_text == _output_text(parsed)
         history = [
@@ -469,7 +478,7 @@ def _check_text(settings: _Settings) -> None:
         ]
         followup = sdk.responses.create(**_payload(settings, "text", input=history))
         _record(settings, "sdk-text-history", _dump(followup))
-        _assert_response(_dump(followup))
+        _assert_response(_dump(followup), sdk=True)
         assert followup.output_text.strip()
 
 
@@ -488,12 +497,12 @@ def _check_json_object(settings: _Settings) -> None:
                 with sdk.responses.create(**request) as stream:
                     events = [_dump(event) for event in stream]
                 _record(settings, "sdk-json-object-stream", events)
-                parsed = _assert_events(events)
+                parsed = _assert_events(events, sdk=True)
             else:
                 response = sdk.responses.create(**request)
                 parsed = _dump(response)
                 _record(settings, "sdk-json-object", parsed)
-                _assert_response(parsed)
+                _assert_response(parsed, sdk=True)
                 assert response.output_text == _output_text(parsed)
             for result in (raw, parsed):
                 assert result["text"]["format"] == {"type": "json_object"}
@@ -507,7 +516,7 @@ def _check_stream(settings: _Settings) -> None:
         with sdk.responses.create(**_payload(settings, "text"), stream=True) as stream:
             events = [_dump(event) for event in stream]
         _record(settings, "sdk-create-stream-text", events)
-        _assert_text_result(settings, _assert_events(events))
+        _assert_text_result(settings, _assert_events(events, sdk=True))
         with sdk.responses.stream(**_payload(settings, "text")) as stream:
             helper_events = [_dump(event) for event in stream]
             final = stream.get_final_response()
@@ -525,11 +534,11 @@ def _check_stream(settings: _Settings) -> None:
                 with sdk.responses.create(**incomplete, stream=True) as stream:
                     events = [_dump(event) for event in stream]
                 _record(settings, "sdk-incomplete-stream", events)
-                _assert_events(events, "incomplete")
+                _assert_events(events, "incomplete", sdk=True)
             else:
                 result = _dump(sdk.responses.create(**incomplete, stream=False))
                 _record(settings, "sdk-incomplete", result)
-                _assert_response(result, "incomplete")
+                _assert_response(result, "incomplete", sdk=True)
 
 
 def _assert_weather_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -549,12 +558,12 @@ def _check_functions(settings: _Settings) -> None:
             _assert_weather_calls(raw)
         result = _dump(sdk.responses.create(**payload, stream=False))
         _record(settings, "sdk-tools", result)
-        _assert_response(result)
+        _assert_response(result, sdk=True)
         _assert_weather_calls(result)
         with sdk.responses.create(**payload, stream=True) as stream:
             events = [_dump(event) for event in stream]
         _record(settings, "sdk-tools-stream", events)
-        _assert_weather_calls(_assert_events(events))
+        _assert_weather_calls(_assert_events(events, sdk=True))
         with sdk.responses.stream(**payload) as stream:
             helper_events = [_dump(event) for event in stream]
             response = stream.get_final_response()
@@ -581,7 +590,7 @@ def _check_functions(settings: _Settings) -> None:
             assert not any(item["type"] == "function_call" for item in raw["output"])
         response = sdk.responses.create(**followup, stream=False)
         _record(settings, "sdk-function-history", _dump(response))
-        _assert_response(_dump(response))
+        _assert_response(_dump(response), sdk=True)
         assert response.output_text.strip()
         if settings.fixture:
             assert response.output_text == "It is sunny in Paris."
@@ -746,11 +755,11 @@ def _check_fixture_outcomes(settings: _Settings) -> None:
                 with sdk.responses.create(**failed_payload) as stream:
                     events = [_dump(event) for event in stream]
                 _record(settings, "sdk-failed-stream", events)
-                _assert_events(events, "failed")
+                _assert_events(events, "failed", sdk=True)
             else:
                 failed = _dump(sdk.responses.create(**failed_payload))
                 _record(settings, "sdk-failed", failed)
-                _assert_response(failed, "failed")
+                _assert_response(failed, "failed", sdk=True)
             early_payload = _payload(settings, "preflight_failed", stream=streaming)
             raw = http_client.post(f"{settings.base_url}/responses", json=early_payload)
             _record(
