@@ -89,13 +89,13 @@ TEST(ResponsesReasoningTest, PartialEndAfterContentDoesNotLeakIntoReasoning) {
 }
 
 TEST(ResponsesReasoningTest, EofFlushesUnfinishedDelimitersLiterallyOnce) {
-  EXPECT_EQ(parse_chunks({"normal<th"}, true, false),
-            std::make_pair(std::string("normal<th"), std::string()));
+  EXPECT_EQ(parse_chunks({"normal<thi"}, true, false),
+            std::make_pair(std::string("normal<thi"), std::string()));
   for (bool stream : {false, true}) {
     EXPECT_EQ(parse_chunks({"why</th"}, stream, true),
               std::make_pair(std::string(), std::string("why</th")));
-    EXPECT_EQ(parse_chunks({"<think>", "why<th"}, stream, false),
-              std::make_pair(std::string(), std::string("why<th")));
+    EXPECT_EQ(parse_chunks({"<think>", "why<thi"}, stream, false),
+              std::make_pair(std::string(), std::string("why<thi")));
   }
 }
 
@@ -105,7 +105,7 @@ TEST(ResponsesReasoningTest,
     for (const std::string& text :
          {std::string("<think> why </think> answer\n"),
           std::string("why</think>answer<think>literal"),
-          std::string("normal<th"),
+          std::string("normal<thi"),
           std::string("why</th")}) {
       SCOPED_TRACE(text);
       SCOPED_TRACE(force);
@@ -134,10 +134,10 @@ TEST(ResponsesReasoningTest, DefaultParserKeepsLegacyNonStreamingWhitespace) {
 
 TEST(ResponsesReasoningTest, DefaultParserKeepsLegacyStreamingWhitespace) {
   ReasoningParser parser("qwen3");
-  const ReasoningResult partial = parser.parse_stream_chunk("<th");
+  const ReasoningResult partial = parser.parse_stream_chunk("<thi");
   EXPECT_FALSE(partial.normal_text.has_value());
   EXPECT_FALSE(partial.reasoning_text.has_value());
-  EXPECT_EQ(parser.parse_stream_chunk("ink> why\n").reasoning_text, " why\n");
+  EXPECT_EQ(parser.parse_stream_chunk("nk> why\n").reasoning_text, " why\n");
   const ReasoningResult end =
       parser.parse_stream_chunk("now </think> answer\n");
   EXPECT_EQ(end.reasoning_text, "now ");
