@@ -549,6 +549,10 @@ def _run_case(
     profile["databases"] = [_file_identity(path) for path in databases]
     profile["export_complete"] = _file_identity(completion)
     if profile_graph is not None:
+        graph_dump = args.artifact_dir / f"profile-graph-rank-{args.rank}-count-{count}.json"
+        profile_graph.debug_dump(str(graph_dump))
+        json.loads(graph_dump.read_text(encoding="utf-8"))
+        profile["graph_dump"] = _file_identity(graph_dump)
         profile_graph.reset()
         profile["graph_reset"] = True
         del profile_graph
@@ -876,7 +880,16 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
         rank=args.rank,
         timeout=timedelta(seconds=120),
     )
-    group = dist.new_group(ranks=list(range(args.world_size)), backend="hccl", timeout=timedelta(seconds=120))
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": 3}
+    result["hccl_config"] = dict(options.hccl_config)
+    _save(result_path, result, "bootstrap/hccl-config")
+    group = dist.new_group(
+        ranks=list(range(args.world_size)),
+        backend="hccl",
+        timeout=timedelta(seconds=120),
+        pg_options=options,
+    )
     warm = torch.ones(1, dtype=torch.float32, device=device)
     dist.all_reduce(warm, group=group)
     torch.npu.synchronize()
