@@ -18,10 +18,11 @@ TileLang and native SHMEM Ascend C use CPU FileStore coordination and official
 SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
 backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
 payload executes in the custom AIV kernel. It currently permits eager numerical
-checks only, not continuous-call or graph qualification. Matched profiling may
-select the existing current-stream native HCCL AllGather instead. The caller must
-verify device availability, package/native identities and prior required
-correctness evidence before requesting measurement.
+checks only, not continuous-call or graph qualification. --mc2-resource-probe
+explicitly selects a separate resource snapshot diagnostic, not an AllGather.
+Matched profiling may select the existing current-stream native HCCL AllGather
+instead. The caller must verify device availability, package/native identities
+and prior required correctness evidence before requesting measurement.
 
 A failure leaves the original traceback and saved phase; it does not enter a
 cleanup rendezvous that could hide the failure behind a peer timeout.
@@ -203,8 +204,9 @@ def _load_native(args: argparse.Namespace, result: dict[str, Any]) -> None:
     result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
     torch.ops.load_library(str(args.native_library))
     if args.backend == "hccl_aiv":
-        if not callable(torch.classes.hccl_aiv_ops.PreparedAllGather):
-            raise RuntimeError("Native hccl_aiv PreparedAllGather class is not callable")
+        name = "PreparedResourceProbe" if args.mc2_resource_probe else "PreparedAllGather"
+        if not callable(getattr(torch.classes.hccl_aiv_ops, name)):
+            raise RuntimeError(f"Native hccl_aiv {name} class is not callable")
     else:
         namespace = torch.ops.aclshmem_ops if args.backend == "ascendc" else torch.ops.xllm_ops
         name = "all_gather" if args.backend == "ascendc" else "npu_all_gather"
@@ -282,7 +284,8 @@ def _run_case(
         if _active_prepared is not None:
             raise RuntimeError("A previous MC2 prepared object was not successfully closed")
         _save(result_path, result, f"count-{count}/prepare")
-        prepared = torch.classes.hccl_aiv_ops.PreparedAllGather(
+        name = "PreparedResourceProbe" if args.mc2_resource_probe else "PreparedAllGather"
+        prepared = getattr(torch.classes.hccl_aiv_ops, name)(
             source, output, hccl_comm_name, args.world_size, args.chunk_bytes
         )
         _active_prepared = prepared
@@ -365,6 +368,44 @@ def _run_case(
                 "Invalid capture epoch transition"
             )
             _check_state(controls, epochs, observed, args.lanes, args.world_size)
+
+    if args.mc2_resource_probe:
+        local = _prepare(0)
+        _save(result_path, result, f"count-{count}/resource-probe")
+        with torch.npu.stream(stream):
+            prepared.run()
+        torch.npu.synchronize()
+        uint64_max = (1 << 64) - 1
+        actual = [
+            [word & uint64_max for word in record] for record in output.cpu().view(torch.int64).reshape(4, 8).tolist()
+        ]
+        case["resource_probe"] = {"actual": actual}
+        # Preserve every returned word before validating any resource predicate.
+        _save(result_path, result, f"count-{count}/resource-probe/observed")
+        for block_idx, record in enumerate(actual):
+            if record[0] != 0x4843434C41495631 or record[2] != ((4 << 32) | block_idx):
+                raise RuntimeError(
+                    f"MC2 resource snapshot has invalid magic/block mapping: block={block_idx}, {record}"
+                )
+            if record[3] != ((2 << 32) | args.rank):
+                raise RuntimeError(f"MC2 resource snapshot rank/size mismatch: block={block_idx}, {record}")
+            if any(record[index] in (0, uint64_max) for index in (1, 5, 6, 7)):
+                raise RuntimeError(
+                    f"MC2 resource snapshot has invalid context/window/peer pointers: block={block_idx}, {record}"
+                )
+            if record[4] == uint64_max or record[4] < 200 * 1024 * 1024:
+                raise RuntimeError(f"MC2 resource snapshot has invalid input window size: block={block_idx}, {record}")
+        torch.testing.assert_close(source.cpu(), local, rtol=0, atol=0)
+        _check_guards_all()
+        case["resource_probe"]["verified"] = True
+        _save(result_path, result, f"count-{count}/close")
+        prepared.close()
+        _active_prepared = None
+        prepared = None
+        case["prepared_closed"] = True
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
+        _save(result_path, result, f"count-{count}/checked")
+        return
 
     _save(result_path, result, f"count-{count}/warmup")
     for iteration in (-2, -1):
@@ -972,6 +1013,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         raise RuntimeError("FileStore namespace already used by this rank")
     configuration_fields = (
         "backend",
+        "mc2_resource_probe",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1115,6 +1157,9 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl", "hccl_aiv"), default="shmem")
+    parser.add_argument(
+        "--mc2-resource-probe", action="store_true", help="hccl_aiv resource snapshot only, not AllGather correctness"
+    )
     parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(4,), help="Matched HCCL AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
     parser.add_argument("--profile-warmup", type=int, help="Logical warmups; aligned profiling requires 0")
@@ -1151,6 +1196,16 @@ def _main() -> None:
     parser.add_argument("--heap-bytes", type=int, help="SHMEM heap bytes (default 64 MiB); not used by hccl_aiv")
     parser.add_argument("--repeats", type=int, default=16)
     args = parser.parse_args()
+    if args.mc2_resource_probe and args.backend != "hccl_aiv":
+        parser.error("mc2-resource-probe requires the hccl_aiv backend")
+    if args.mc2_resource_probe and (
+        args.world_size != 2
+        or args.dtype != "float16"
+        or args.counts != [64]
+        or args.repeats != 1
+        or args.chunk_bytes != 128
+    ):
+        parser.error("mc2-resource-probe requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128")
     if args.backend == "hccl_aiv":
         if (
             args.mode != "eager"
@@ -1294,6 +1349,7 @@ def _main() -> None:
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
     result: dict[str, Any] = {
         "backend": args.backend,
+        "mc2_resource_probe": args.mc2_resource_probe,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
@@ -1349,6 +1405,9 @@ def _main() -> None:
             )
         },
     }
+    if args.mc2_resource_probe:
+        result["purpose"] = "mc2_resource_snapshot_not_all_gather_correctness"
+        result["all_gather_correctness"] = "UNTESTED"
     if args.profile_submission == "alltoall_graph":
         result["prefix_hccl_config"] = {"hccl_op_expansion_mode": 0}
     # Refuse an earlier attempt's rank result or rendezvous namespace.
