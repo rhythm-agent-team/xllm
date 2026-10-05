@@ -17,8 +17,9 @@
 TileLang and native SHMEM Ascend C use CPU FileStore coordination and official
 SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
 backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
-payload executes in the custom AIV kernel. It currently permits eager numerical
-checks only, not continuous-call or graph qualification. --mc2-probe-stage
+payload executes in the custom AIV kernel. Its test entry permits eager numerical
+checks and basic PE2 normal graphs; capture alone is not a numerical pass.
+Retained graphs, profiling, stress and skew remain unsupported. --mc2-probe-stage
 explicitly selects resource, first-barrier or final-zero diagnostics, not
 AllGather qualification.
 Matched profiling may select the existing current-stream native HCCL AllGather
@@ -62,6 +63,7 @@ _MC2_PREPARED_CLASSES = {
 # Retain failed MC2 state until the process boundary reports the original error.
 _active_prepared: Any | None = None
 _active_diagnostic: dict[str, Any] | None = None
+_active_graph: dict[str, Any] | None = None
 
 
 def _save(result_path: Path, result: dict[str, Any], phase: str) -> None:
@@ -265,7 +267,7 @@ def _run_case(
     prefix_group: dist.ProcessGroup | None = None,
     hccl_comm_name: str | None = None,
 ) -> None:
-    global _active_prepared, _active_diagnostic
+    global _active_prepared, _active_diagnostic, _active_graph
 
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
@@ -294,6 +296,8 @@ def _run_case(
             raise RuntimeError("MC2 AIV AllGather requires the initialized HCCL communicator name")
         if _active_prepared is not None:
             raise RuntimeError("A previous MC2 prepared object was not successfully closed")
+        if args.mode == "graph" and _active_graph is not None:
+            raise RuntimeError("A previous MC2 graph was not successfully reset")
         _save(result_path, result, f"count-{count}/prepare")
         name = _MC2_PREPARED_CLASSES[args.mc2_probe_stage]
         if args.mc2_probe_stage == "final-zero":
@@ -646,7 +650,9 @@ def _run_case(
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/capture")
         _save(result_path, result, f"count-{count}/capture")
         graph = torch.npu.NPUGraph()
-        capture_stream = stream if args.profile_samples else torch.npu.Stream()
+        if args.backend == "hccl_aiv":
+            _active_graph = {"graph": graph, "stream": stream, "consumer_storage": consumer_storage}
+        capture_stream = stream if args.profile_samples or args.backend == "hccl_aiv" else torch.npu.Stream()
         with torch.npu.graph(graph, stream=capture_stream):
             _submit()
         torch.npu.synchronize()
@@ -672,7 +678,7 @@ def _run_case(
                 case["graph_replays"] += 1
         _check(iteration, local, previous_epochs)
 
-    if args.backend == "hccl_aiv":
+    if args.backend == "hccl_aiv" and args.mode == "eager":
         iteration = args.repeats
         local = _prepare(iteration)
         torch.npu.synchronize()
@@ -691,6 +697,8 @@ def _run_case(
         torch.npu.synchronize()
     if graph is not None:
         graph.reset()
+        if args.backend == "hccl_aiv":
+            _active_graph = None
         del graph
     if prepared is not None:
         _save(result_path, result, f"count-{count}/close")
@@ -1378,8 +1386,12 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
     result["group_name"] = group.group_name
     result["pg_owner"] = "torch.distributed.new_group(ranks=all_PEs, backend='hccl')"
     _rendezvous(store, args.rank, args.world_size, "initialized")
-    for count in args.counts:
-        _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group, hccl_comm_name)
+    run_stream = (
+        torch.npu.Stream() if args.backend == "hccl_aiv" and args.mode == "graph" else torch.npu.current_stream()
+    )
+    with torch.npu.stream(run_stream):
+        for count in args.counts:
+            _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group, hccl_comm_name)
     _save(result_path, result, "close/drain")
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "drained")
@@ -1456,9 +1468,10 @@ def _main() -> None:
     ):
         parser.error("mc2-probe-stage requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128")
     if args.backend == "hccl_aiv":
+        if args.mode == "graph" and (args.world_size != 2 or args.mc2_probe_stage is not None):
+            parser.error("hccl_aiv graph mode requires PE2 normal AllGather without diagnostics")
         if (
-            args.mode != "eager"
-            or args.stress_batch
+            args.stress_batch
             or args.skew_phase != "none"
             or args.skew_iterations != 0
             or args.graph_replays is not None
@@ -1467,7 +1480,7 @@ def _main() -> None:
             or args.profile_submission is not None
             or args.profile_graph_warmup is not None
         ):
-            parser.error("hccl_aiv currently supports eager numerical checks only, without graph/stress/skew/profiling")
+            parser.error("hccl_aiv supports numerical checks without stress/skew/retained graphs/profiling")
         if args.world_size not in (2, 8, 16):
             parser.error("hccl_aiv requires 2/8/16 ranks")
         if args.lanes is not None or args.heap_bytes is not None:
@@ -1794,10 +1807,10 @@ if __name__ == "__main__":
         _main()
     except Exception:
         logger.exception("AllGather worker failed; inspect its saved phase and original traceback")
-        if _active_prepared is not None:
+        if _active_prepared is not None or _active_graph is not None:
             # No device drain or destructor may replace this failure with a hang
             # or abort. The launcher still owns failure exit and peer cleanup.
-            logger.error("MC2 prepared state retained; exiting without device cleanup after failure")
+            logger.error("MC2 prepared/graph state retained; exiting without device cleanup after failure")
             for handler in logger.handlers:
                 handler.flush()
             sys.stdout.flush()
