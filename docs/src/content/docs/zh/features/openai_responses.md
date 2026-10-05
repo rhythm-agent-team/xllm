@@ -227,4 +227,4 @@ python tests/python/test_openai_responses_protocol.py \
   --expect-reasoning --evidence-dir /path/to/fresh-results
 ```
 
-普通真实模型验证由服务 runner 配置 `max_concurrent_requests=16`，客户端串行请求，不使用 `--fixture` 或 `--limit-one`。`--expect-reasoning` 额外要求真实原始推理文本。准入/断开验证单独执行：`--limit-one` 要求服务 runner 已将 `max_concurrent_requests` 配置为 1；客户端不会修改服务配置或另建 runner。`--fixture` 选择确定性的 brpc fixture 输入并要求执行全部 fixture 用例，包括推理、跨字节 UTF-8、失败、准入拒绝及断开后名额恢复。不使用该选项时请求由真实模型处理，函数调用必须实际产生。Fixture 和真实模型证据分开记录。上述命令是验证入口说明，不代表某个模型或环境已经通过测试。
+普通真实模型验证由服务 runner 配置 `max_concurrent_requests=16`，客户端串行请求，不使用 `--fixture` 或 `--limit-one`。`--expect-reasoning` 额外要求真实原始推理文本。准入/断开验证单独执行：`--limit-one` 要求服务 runner 已将 `max_concurrent_requests` 配置为 1；客户端不会修改服务配置或另建 runner。`--fixture` 选择确定性的 brpc fixture 输入，包括推理、跨字节 UTF-8 和失败；它不启用准入/断开专项，这些检查只由独立、显式的 `--limit-one` 选项启用。不使用该选项时请求由真实模型处理，函数调用必须实际产生。Fixture 和真实模型证据分开记录。上述命令是验证入口说明，不代表某个模型或环境已经通过测试。

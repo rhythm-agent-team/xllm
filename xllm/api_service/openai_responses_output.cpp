@@ -262,7 +262,15 @@ bool ResponsesOutput::parse_normal_text(const std::string& text) {
   if (tool_parser == nullptr) {
     return append_text("message", text);
   }
-  const auto parsed = tool_parser->parse_streaming_increment(text);
+  if (!stream_) {
+    tool_text_ += text;
+    return true;
+  }
+  return append_tool_output(tool_parser->parse_streaming_increment(text));
+}
+
+bool ResponsesOutput::append_tool_output(
+    const function_call::StreamingParseResult& parsed) {
   if (!append_text("message", parsed.normal_text)) {
     return false;
   }
@@ -309,6 +317,31 @@ bool ResponsesOutput::flush_parsers(bool incomplete) {
         !parse_normal_text(remaining.normal_text.value())) {
       return false;
     }
+  }
+  return flush_tools(incomplete);
+}
+
+bool ResponsesOutput::flush_tools(bool incomplete) {
+  auto* tool_parser = parser_->get_tool_call_parser(/*index=*/0);
+  if (tool_parser == nullptr) {
+    return true;
+  }
+  if (!stream_) {
+    std::string text = std::exchange(tool_text_, "");
+    if (!incomplete) {
+      auto [normal_text, calls] = tool_parser->parse_non_stream(text);
+      for (size_t index = 0; index < calls.size(); ++index) {
+        calls[index].tool_index = static_cast<int32_t>(index);
+      }
+      return append_tool_output({std::move(normal_text), std::move(calls)});
+    }
+    if (!append_tool_output(tool_parser->parse_streaming_increment(text))) {
+      return false;
+    }
+  }
+  // Incremental parsers may return the name before already-buffered arguments.
+  if (!append_tool_output(tool_parser->parse_streaming_increment(""))) {
+    return false;
   }
   return incomplete ||
          check_for_unstreamed_tool_args(
@@ -472,6 +505,9 @@ bool ResponsesOutput::set_error(const std::string& message) {
 
 bool ResponsesOutput::fail(StatusCode code, const std::string& message) {
   if (finished_) {
+    return false;
+  }
+  if (!stream_ && !tool_text_.empty() && !flush_tools(/*incomplete=*/true)) {
     return false;
   }
   status_ = Status(code, message);

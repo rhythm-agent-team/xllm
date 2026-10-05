@@ -283,8 +283,7 @@ TEST(OpenAIResponsesOutputTest, ActualTemplateMetadataForcesInitialReasoning) {
   EXPECT_EQ(output.snapshot()["output"][1]["content"][0]["text"], "answer");
 }
 
-TEST(OpenAIResponsesOutputTest,
-     ActualFalseMetadataOverridesThinkingOnlyDefault) {
+TEST(OpenAIResponsesOutputTest, InitialFalseOverridesThinkingDefault) {
   ResponsesOutput output(initial_response(), false, {}, "", "glm5", false, {});
   RequestOutput complete = chunk("answer", true);
   complete.force_reasoning = false;
@@ -335,8 +334,7 @@ TEST(OpenAIResponsesOutputTest, ToolArgumentsAcrossChunksMatchFinalCall) {
   EXPECT_EQ((*found)["arguments"], call["arguments"]);
 }
 
-TEST(OpenAIResponsesOutputTest,
-     GlmToolAndNormalTextWithinOneChunkArePreserved) {
+TEST(OpenAIResponsesOutputTest, GlmToolAndTextWithinOneChunk) {
   ResponsesOutput output(
       initial_response(), false, weather_tool(), "glm47", "", false, {});
   ASSERT_TRUE(
@@ -352,6 +350,76 @@ TEST(OpenAIResponsesOutputTest,
   EXPECT_EQ(call["type"], "function_call");
   EXPECT_EQ(nlohmann::json::parse(call["arguments"].get<std::string>()),
             (nlohmann::json{{"city", "Paris"}}));
+}
+
+TEST(OpenAIResponsesOutputTest, GlmFramesPreserveFunctionArguments) {
+  const std::string frame =
+      "<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+      "</tool_call>";
+  const size_t split = frame.find("Paris") + 3;
+  for (const bool stream : {false, true}) {
+    for (const bool split_frame : {false, true}) {
+      std::vector<nlohmann::json> events;
+      ResponsesOutput output(initial_response(),
+                             stream,
+                             weather_tool(),
+                             "glm5",
+                             "",
+                             false,
+                             [&events](const nlohmann::json& event) {
+                               events.emplace_back(event);
+                               return true;
+                             });
+      if (split_frame) {
+        ASSERT_TRUE(output.append(chunk(frame.substr(0, split))));
+      }
+      ASSERT_TRUE(output.append(chunk(
+          split_frame ? frame.substr(split) : frame, true, "function_call")))
+          << output.status().message();
+      EXPECT_EQ(output.snapshot()["status"], "completed");
+      ASSERT_EQ(output.snapshot()["output"].size(), 1);
+      const auto& call = output.snapshot()["output"][0];
+      EXPECT_EQ(call["type"], "function_call");
+      EXPECT_EQ(call["name"], "weather");
+      EXPECT_EQ(nlohmann::json::parse(call["arguments"].get<std::string>()),
+                (nlohmann::json{{"city", "Paris"}}));
+      EXPECT_NE(call["id"], call["call_id"]);
+      if (stream) {
+        EXPECT_EQ(deltas(events, "response.function_call_arguments.delta"),
+                  call["arguments"].get<std::string>());
+        ASSERT_GE(events.size(), 3);
+        EXPECT_EQ(events[events.size() - 3]["type"],
+                  "response.function_call_arguments.done");
+        EXPECT_EQ(events[events.size() - 3]["arguments"], call["arguments"]);
+        EXPECT_EQ(events.back()["type"], "response.completed");
+        EXPECT_EQ(events.back()["response"], output.snapshot());
+      }
+    }
+  }
+}
+
+TEST(OpenAIResponsesOutputTest, NonStreamFailureKeepsBufferedToolOutput) {
+  for (const bool tool_call : {false, true}) {
+    ResponsesOutput output(
+        initial_response(), false, weather_tool(), "glm5", "", false, {});
+    ASSERT_TRUE(output.append(
+        chunk(tool_call ? "<tool_call>weather<arg_key>city</arg_key>"
+                          "<arg_value>Paris</arg_value></tool_call>"
+                        : "partial")));
+    EXPECT_FALSE(output.fail(StatusCode::UNKNOWN, "execution failed"));
+    EXPECT_EQ(output.snapshot()["status"], "failed");
+    EXPECT_EQ(output.snapshot()["error"]["message"], "execution failed");
+    ASSERT_EQ(output.snapshot()["output"].size(), 1);
+    const auto& item = output.snapshot()["output"][0];
+    EXPECT_EQ(item["status"], "incomplete");
+    if (tool_call) {
+      EXPECT_EQ(item["name"], "weather");
+      EXPECT_EQ(nlohmann::json::parse(item["arguments"].get<std::string>()),
+                (nlohmann::json{{"city", "Paris"}}));
+    } else {
+      EXPECT_EQ(item["content"][0]["text"], "partial");
+    }
+  }
 }
 
 TEST(OpenAIResponsesOutputTest, LiteralPartialMarkerAtEofIsNotDiscarded) {

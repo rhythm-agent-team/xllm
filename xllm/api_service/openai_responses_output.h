@@ -52,9 +52,11 @@ class ResponsesOutput final {
   bool emit(nlohmann::json event);
   bool parse_text(const std::string& text);
   bool parse_normal_text(const std::string& text);
+  bool append_tool_output(const function_call::StreamingParseResult& parsed);
   bool append_text(const std::string& type, const std::string& text);
   bool append_tool(const function_call::ToolCallItem& call);
   bool flush_parsers(bool incomplete);
+  bool flush_tools(bool incomplete);
   bool complete(const std::string& status,
                 const nlohmann::json& incomplete_details);
   bool finalize_items(const std::string& status);
@@ -75,6 +77,7 @@ class ResponsesOutput final {
   std::optional<size_t> text_item_index_;
   std::optional<size_t> reasoning_item_index_;
   std::string utf8_tail_;
+  std::string tool_text_;
   std::string finish_reason_;
   Status status_;
   int64_t sequence_number_ = 0;
