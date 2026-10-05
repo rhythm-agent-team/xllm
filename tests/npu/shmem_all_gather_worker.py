@@ -18,9 +18,9 @@ TileLang and native SHMEM Ascend C use CPU FileStore coordination and official
 SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
 backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
 payload executes in the custom AIV kernel. Its test entry permits eager numerical
-checks, basic PE2 normal graphs and a bounded two-live-graph PE2 entry.
-Capture alone is not a numerical pass; profiling, eager stress and skew remain
-unsupported. --mc2-probe-stage
+checks, basic PE2/8/16 normal graph entries and a bounded two-live-graph PE2 entry.
+Larger-rank entry support is not runtime qualification; capture alone is not a
+numerical pass. Profiling, eager stress and skew remain unsupported. --mc2-probe-stage
 explicitly selects resource, first-barrier or final-zero diagnostics, not
 AllGather qualification.
 Matched profiling may select the existing current-stream native HCCL AllGather
@@ -1611,8 +1611,8 @@ def _main() -> None:
                 "only final-zero also permits PE16 BF16, counts=[1], repeats=2, chunk-bytes=65536 and delay=0"
             )
     if args.backend == "hccl_aiv":
-        if args.mode == "graph" and (args.world_size != 2 or args.mc2_probe_stage is not None):
-            parser.error("hccl_aiv graph mode requires PE2 normal AllGather without diagnostics")
+        if args.mode == "graph" and (args.world_size not in (2, 8, 16) or args.mc2_probe_stage is not None):
+            parser.error("hccl_aiv basic graph entry requires PE2/8/16 normal AllGather without diagnostics")
         if args.stress_batch and (
             args.mode != "graph"
             or args.world_size != 2
