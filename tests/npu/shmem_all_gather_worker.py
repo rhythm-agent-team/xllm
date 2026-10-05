@@ -19,7 +19,8 @@ SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
 backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
 payload executes in the custom AIV kernel. It currently permits eager numerical
 checks only, not continuous-call or graph qualification. --mc2-probe-stage
-explicitly selects a resource or first-barrier diagnostic, not an AllGather.
+explicitly selects resource, first-barrier or final-zero diagnostics, not
+AllGather qualification.
 Matched profiling may select the existing current-stream native HCCL AllGather
 instead. The caller must verify device availability, package/native identities
 and prior required correctness evidence before requesting measurement.
@@ -37,6 +38,7 @@ import os
 import re
 import socket
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -55,9 +57,11 @@ _MC2_PREPARED_CLASSES = {
     "resource": "PreparedResourceProbe",
     "before-barrier": "PreparedBeforeBarrierProbe",
     "after-barrier": "PreparedAfterBarrierProbe",
+    "final-zero": "PreparedFinalZeroProbe",
 }
 # Retain failed MC2 state until the process boundary reports the original error.
 _active_prepared: Any | None = None
+_active_diagnostic: dict[str, Any] | None = None
 
 
 def _save(result_path: Path, result: dict[str, Any], phase: str) -> None:
@@ -261,7 +265,7 @@ def _run_case(
     prefix_group: dist.ProcessGroup | None = None,
     hccl_comm_name: str | None = None,
 ) -> None:
-    global _active_prepared
+    global _active_prepared, _active_diagnostic
 
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
@@ -274,6 +278,7 @@ def _run_case(
     scratch = None
     kernel = None
     prepared = None
+    diagnostic = None
     if args.backend in ("shmem", "ascendc"):
         if receive is None or controls is None or epochs is None:
             raise RuntimeError("SHMEM AllGather requires its initialized symmetric buffers")
@@ -291,10 +296,31 @@ def _run_case(
             raise RuntimeError("A previous MC2 prepared object was not successfully closed")
         _save(result_path, result, f"count-{count}/prepare")
         name = _MC2_PREPARED_CLASSES[args.mc2_probe_stage]
-        prepared = getattr(torch.classes.hccl_aiv_ops, name)(
-            source, output, hccl_comm_name, args.world_size, args.chunk_bytes
-        )
-        _active_prepared = prepared
+        if args.mc2_probe_stage == "final-zero":
+            if _active_diagnostic is not None:
+                raise RuntimeError("A previous MC2 diagnostic owner was not successfully released")
+            diagnostic_storage, diagnostic, diagnostic_guard = _guarded(800, torch.int64, device)
+            prepared = getattr(torch.classes.hccl_aiv_ops, name)(
+                source, output, diagnostic, hccl_comm_name, args.world_size, args.chunk_bytes, args.mc2_delay_iterations
+            )
+            _active_prepared = prepared
+            observer = torch.npu.Stream()
+            cpu_snapshots = [torch.empty(800, dtype=torch.int64, pin_memory=True) for _ in range(2)]
+            initialized = torch.npu.Event(enable_timing=False)
+            pair_done = torch.npu.Event(enable_timing=False)
+            copied = torch.npu.Event(enable_timing=False)
+            _active_diagnostic = {
+                "storage": diagnostic_storage,
+                "diagnostic": diagnostic,
+                "observer": observer,
+                "cpu_snapshots": cpu_snapshots,
+                "events": (initialized, pair_done, copied),
+            }
+        else:
+            prepared = getattr(torch.classes.hccl_aiv_ops, name)(
+                source, output, hccl_comm_name, args.world_size, args.chunk_bytes
+            )
+            _active_prepared = prepared
     ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
     _save(result_path, result, ready_phase)
     _rendezvous(store, args.rank, args.world_size, ready_phase)
@@ -374,6 +400,191 @@ def _run_case(
                 "Invalid capture epoch transition"
             )
             _check_state(controls, epochs, observed, args.lanes, args.world_size)
+
+    if args.mc2_probe_stage == "final-zero":
+        phase = f"count-{count}/mc2-probe/final-zero"
+        probe: dict[str, Any] = {
+            "stage": "final-zero",
+            "delay_iterations": args.mc2_delay_iterations,
+            "actual": [],
+            "verified": False,
+            "pair_completed": False,
+            "observer_visibility_verified": False,
+            "before_pair_submission": False,
+            "after_pair_submission": False,
+            "snapshot_index": -1,
+            "event_pending": {"pair": None, "observer_copy": False},
+            "observations": [],
+            "observed_records": [],
+        }
+        case["mc2_probe"] = probe
+        seen: dict[int, dict[str, Any]] = {}
+
+        def _observe_final_zero_snapshot(buffer: torch.Tensor, pair_pending: bool | None) -> None:
+            actual = buffer.tolist()
+            probe["actual"] = actual
+            probe["snapshot_index"] += 1
+            snapshot_index = probe["snapshot_index"]
+            new_commits = []
+            qualified = []
+            failure = None
+            for record_index in range(96):
+                offset = 32 + record_index * 8
+                record = actual[offset : offset + 8]
+                entry = seen.get(record_index)
+                if record[0] == 0 and entry is None:
+                    continue
+                if record[0] != 0x4843434C465A3031:
+                    failure = f"Invalid MC2 final-zero commit at record {record_index}: {record}"
+                    break
+                if entry is None:
+                    entry = {"record_index": record_index, "first_seen_snapshot_index": snapshot_index}
+                    seen[record_index] = entry
+                    probe["observed_records"].append(entry)
+                    new_commits.append(record_index)
+                    continue
+                if "words" in entry:
+                    if entry["words"] != record:
+                        failure = f"MC2 final-zero immutable record {record_index} changed: {record}"
+                        break
+                    continue
+                # The body is accepted only from a completed copy AFTER seeing commit.
+                call = record_index // 48 + 1
+                block = (record_index % 48) // 12
+                slot = record_index % 12
+                if (record[1], record[2], record[3]) != (call, (args.rank << 32) | block, slot):
+                    failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
+                    break
+                entry.update(
+                    {
+                        "qualified_snapshot_index": snapshot_index,
+                        "words": record,
+                        "call": call,
+                        "rank": args.rank,
+                        "block": block,
+                        "slot": slot,
+                        "peer": record[4] & ((1 << 64) - 1),
+                        "expected": record[5],
+                        "actual": record[6],
+                        "detail": record[7] & ((1 << 64) - 1),
+                    }
+                )
+                qualified.append(record_index)
+                if pair_pending is True:
+                    probe["observer_visibility_verified"] = True
+            if snapshot_index == 0 or new_commits or qualified or failure is not None:
+                probe["observations"].append(
+                    {
+                        "snapshot_index": snapshot_index,
+                        "pair_pending": pair_pending,
+                        "new_commits": new_commits,
+                        "qualified_records": qualified,
+                        "actual": actual,
+                    }
+                )
+                _save(result_path, result, f"{phase}/snapshot-{snapshot_index}")
+            if failure is not None:
+                raise RuntimeError(failure)
+
+        local = _prepare(0)
+        diagnostic.zero_()
+        initialized.record(stream)
+        torch.npu.synchronize()
+        observer.wait_event(initialized)
+        deadline = time.monotonic() + 90
+        with torch.npu.stream(observer):
+            cpu_snapshots[0].copy_(diagnostic, non_blocking=True)
+            copied.record(observer)
+        probe["event_pending"]["observer_copy"] = True
+        _save(result_path, result, f"{phase}/initialize")
+        while not copied.query():
+            if time.monotonic() >= deadline:
+                _save(result_path, result, f"{phase}/timeout")
+                raise RuntimeError(f"MC2 final-zero initialization copy timeout: {probe['event_pending']}")
+            time.sleep(0.05)
+        probe["event_pending"]["observer_copy"] = False
+        _observe_final_zero_snapshot(cpu_snapshots[0], None)
+        if any(probe["actual"]):
+            raise RuntimeError("MC2 final-zero diagnostic initialization is not zero")
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/ready")
+        probe["before_pair_submission"] = True
+        _save(result_path, result, f"{phase}/submit-before")
+        with torch.npu.stream(stream):
+            prepared.run()
+            prepared.run()
+            pair_done.record(stream)
+            torch.add(output, 1, out=consumed)
+        probe["after_pair_submission"] = True
+        _save(result_path, result, f"{phase}/submit-after")
+
+        deadline = time.monotonic() + 90
+        buffer_index = 1
+        copy_pending = False
+        copy_started_after_pair = False
+        completed_after_pair = 0
+        while True:
+            pair_pending = not pair_done.query()
+            if copy_pending:
+                copy_pending = not copied.query()
+                if not copy_pending:
+                    # Query the pair AFTER knowing this independent copy completed.
+                    pair_pending = not pair_done.query()
+                    probe["pair_completed"] = not pair_pending
+                    probe["event_pending"] = {"pair": pair_pending, "observer_copy": False}
+                    _observe_final_zero_snapshot(cpu_snapshots[buffer_index], pair_pending)
+                    if copy_started_after_pair:
+                        completed_after_pair += 1
+                    if completed_after_pair >= 2:
+                        break
+                    buffer_index = 1 - buffer_index
+            probe["pair_completed"] = not pair_pending
+            probe["event_pending"] = {"pair": pair_pending, "observer_copy": copy_pending}
+            if time.monotonic() >= deadline:
+                probe["observations"].append(
+                    {"snapshot_index": probe["snapshot_index"], "reason": "timeout", "actual": probe["actual"]}
+                )
+                _save(result_path, result, f"{phase}/timeout")
+                raise RuntimeError(
+                    f"MC2 final-zero observation timeout; pending={probe['event_pending']}; "
+                    f"snapshot_index={probe['snapshot_index']}; saved_checkpoints={probe['observed_records']}; "
+                    "timeout alone does not establish final-zero deadlock"
+                )
+            if not copy_pending:
+                copy_started_after_pair = not pair_pending
+                with torch.npu.stream(observer):
+                    cpu_snapshots[buffer_index].copy_(diagnostic, non_blocking=True)
+                    copied.record(observer)
+                copy_pending = True
+                probe["event_pending"]["observer_copy"] = True
+            time.sleep(0.05)
+
+        probe["pair_completed"] = True
+        probe["event_pending"] = {"pair": False, "observer_copy": False}
+        probe["observations"].append(
+            {"snapshot_index": probe["snapshot_index"], "reason": "final", "actual": probe["actual"]}
+        )
+        _save(result_path, result, f"{phase}/observed")
+        observer.synchronize()
+        stream.synchronize()
+        _check_outputs(0, local, None)
+        _check_guards(diagnostic_storage, 800, diagnostic_guard)
+        if [probe["actual"][block * 8] for block in range(4)] != [2] * 4:
+            raise RuntimeError(f"MC2 final-zero block counters are not two: {probe['actual'][:32]}")
+        required = [
+            ((call - 1) * 4 + block) * 12 + slot for call in (1, 2) for block in range(4) for slot in (0, 1, 11)
+        ]
+        if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required):
+            raise RuntimeError("MC2 final-zero pair has incomplete ENTRY/FINAL_RESET_VISIBLE/EXIT records")
+        probe["verified"] = True
+        _save(result_path, result, f"count-{count}/close")
+        prepared.close()
+        _active_prepared = None
+        _active_diagnostic = None
+        prepared = None
+        case["prepared_closed"] = True
+        _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
+        _save(result_path, result, f"count-{count}/checked")
+        return
 
     if args.mc2_probe_stage is not None:
         local = _prepare(0)
@@ -1038,6 +1249,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
     configuration_fields = (
         "backend",
         "mc2_probe_stage",
+        "mc2_delay_iterations",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1183,8 +1395,14 @@ def _main() -> None:
     parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl", "hccl_aiv"), default="shmem")
     parser.add_argument(
         "--mc2-probe-stage",
-        choices=("resource", "before-barrier", "after-barrier"),
+        choices=("resource", "before-barrier", "after-barrier", "final-zero"),
         help="hccl_aiv diagnostic only, not AllGather correctness",
+    )
+    parser.add_argument(
+        "--mc2-delay-iterations",
+        type=int,
+        default=None,
+        help="Required final-zero diagnostic delay iterations in 0..100000000",
     )
     parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(4,), help="Matched HCCL AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
@@ -1224,6 +1442,11 @@ def _main() -> None:
     args = parser.parse_args()
     if args.mc2_probe_stage is not None and args.backend != "hccl_aiv":
         parser.error("mc2-probe-stage requires the hccl_aiv backend")
+    if args.mc2_probe_stage == "final-zero":
+        if args.mc2_delay_iterations is None or not 0 <= args.mc2_delay_iterations <= 100000000:
+            parser.error("final-zero requires mc2-delay-iterations in 0..100000000")
+    elif args.mc2_delay_iterations is not None:
+        parser.error("mc2-delay-iterations requires the final-zero diagnostic")
     if args.mc2_probe_stage is not None and (
         args.world_size != 2
         or args.dtype != "float16"
@@ -1376,6 +1599,7 @@ def _main() -> None:
     result: dict[str, Any] = {
         "backend": args.backend,
         "mc2_probe_stage": args.mc2_probe_stage,
+        "mc2_delay_iterations": args.mc2_delay_iterations,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
@@ -1432,7 +1656,11 @@ def _main() -> None:
         },
     }
     if args.mc2_probe_stage is not None:
-        result["purpose"] = "mc2_diagnostic_not_all_gather_correctness"
+        result["purpose"] = (
+            "mc2_final_zero_diagnostic_not_all_gather_qualification"
+            if args.mc2_probe_stage == "final-zero"
+            else "mc2_diagnostic_not_all_gather_correctness"
+        )
         result["all_gather_correctness"] = "UNTESTED"
     if args.profile_submission == "alltoall_graph":
         result["prefix_hccl_config"] = {"hccl_op_expansion_mode": 0}
