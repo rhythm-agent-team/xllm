@@ -33,7 +33,6 @@ import os
 import re
 import socket
 import sys
-import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -409,7 +408,7 @@ def _run_case(
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
-        "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
+        "profile_rank0_delay_ms": None,
         "profile_submission": args.profile_submission,
         "profile_graph_warmup": args.profile_graph_warmup,
         "row_width": args.row_width,
@@ -418,28 +417,13 @@ def _run_case(
         "samples": [],
         "warmup_excluded": True,
         "consumer_in_gather_range": False,
-        "graph_reset": False if args.mode == "graph" or args.profile_submission is not None else None,
+        "graph_reset": False,
         "stream_ptr": hex(stream.npu_stream),
         "stream_ptr_is_trace_stream_id": False,
         "directory": str(profile_dir),
     }
     case["profile"] = profile
     _save(result_path, result, f"count-{count}/profile/prepare")
-    profile_graph = None
-    if args.mode == "graph":
-        local = _prepare(args.repeats)
-        torch.npu.synchronize()
-        previous_epochs = _previous_epochs()
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/capture-prepared")
-        profile_graph = torch.npu.NPUGraph()
-        with torch.npu.graph(profile_graph, stream=stream):
-            _gather()
-        torch.npu.synchronize()
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/captured")
-        _check_capture(local, previous_epochs)
-        assert torch.all(torch.isnan(consumed.cpu())), "Gather-only capture changed consumer poison"
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/capture-observed")
-
     profiler = torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_dir)),
@@ -448,307 +432,229 @@ def _run_case(
             export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
         ),
     )
-    if args.mode == "eager":
-        aligned_graph = args.profile_submission == "alltoall_graph"
-        profile["submission_pattern"] = "alltoall_aligned_graph" if aligned_graph else "retained_continuous"
-        calls = []
-        for ordinal in range(args.profile_warmup + args.profile_samples):
-            sample_index = ordinal - args.profile_warmup
-            iteration = args.repeats + ordinal + 1
-            buffers = {
-                "source": _guarded(count, dtype, device),
-                "output": _guarded(args.world_size * count, dtype, device),
+    profile["submission_pattern"] = "alltoall_aligned_graph"
+    calls = []
+    for sample_index in range(args.profile_samples):
+        iteration = args.repeats + sample_index + 1
+        buffers = {
+            "source": _guarded(count, dtype, device),
+            "output": _guarded(args.world_size * count, dtype, device),
+        }
+        local = _payload(args.rank, count, iteration, dtype)
+        expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
+        buffers["source"][1].copy_(local)
+        buffers["output"][1].fill_(float("nan"))
+        calls.append(
+            {
+                "buffers": buffers,
+                "rank_major": buffers["output"][1].view(args.world_size, count),
+                "local": local,
+                "expected": expected,
+                "record": {"sample_index": sample_index, "input_iteration": iteration},
             }
-            if not aligned_graph:
-                buffers["consumer"] = _guarded(args.world_size * count, dtype, device)
-                buffers["consumer"][1].fill_(float("nan"))
+        )
+
+    def _check_profile_group(executed: bool | None) -> str:
+        observed = set()
+        for call in calls:
+            for key, expected in (("source", call["local"]), ("output", call["expected"])):
+                storage, tensor, guard = call["buffers"][key]
+                actual = tensor.cpu()
+                if key == "output" and torch.all(torch.isnan(actual)):
+                    observed.add("POISONED")
+                else:
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    if key == "output":
+                        observed.add("CORRECT")
+                _check_guards(storage, tensor.numel(), guard)
+        assert len(observed) == 1, "Retained group has partially executed outputs"
+        output_state = observed.pop()
+        if executed is not None:
+            assert output_state == ("CORRECT" if executed else "POISONED"), "Unexpected retained output state"
+        return output_state
+
+    if prefix_group is None:
+        raise RuntimeError("AlltoAll-aligned graph requires its initialized HCCL prefix group")
+    prefix_elements = 32
+    prefix_buffers = {
+        "source": _guarded(args.world_size * prefix_elements, torch.float32, device),
+        "output": _guarded(args.world_size * prefix_elements, torch.float32, device),
+    }
+    prefix_local = torch.empty(0)
+    prefix_expected = torch.empty(0)
+
+    def _prefix_payload(sender: int, destination: int, iteration: int) -> torch.Tensor:
+        marker = ((iteration % 128) * args.world_size + sender) * args.world_size + destination
+        return torch.arange(prefix_elements, dtype=torch.float32) + marker * prefix_elements
+
+    def _prepare_prefix(iteration: int) -> None:
+        nonlocal prefix_local, prefix_expected
+        prefix_local = torch.cat([_prefix_payload(args.rank, peer, iteration) for peer in range(args.world_size)])
+        prefix_expected = torch.cat([_prefix_payload(peer, args.rank, iteration) for peer in range(args.world_size)])
+        prefix_buffers["source"][1].copy_(prefix_local)
+        prefix_buffers["output"][1].fill_(float("nan"))
+
+    def _submit_prefix() -> None:
+        work = dist.all_to_all_single(
+            prefix_buffers["output"][1], prefix_buffers["source"][1], group=prefix_group, async_op=True
+        )
+        # The public wait orders this current stream after the HCCL stream.
+        work.wait()
+
+    def _check_prefix(executed: bool | None) -> str:
+        torch.testing.assert_close(prefix_buffers["source"][1].cpu(), prefix_local, rtol=0, atol=0)
+        actual = prefix_buffers["output"][1].cpu()
+        state = "POISONED" if torch.all(torch.isnan(actual)) else "CORRECT"
+        if state == "CORRECT":
+            torch.testing.assert_close(actual, prefix_expected, rtol=0, atol=0)
+        if executed is not None:
+            assert state == ("CORRECT" if executed else "POISONED"), "Unexpected AlltoAll prefix output"
+        for storage, tensor, guard in prefix_buffers.values():
+            _check_guards(storage, tensor.numel(), guard)
+        return state
+
+    def _prepare_aligned(iteration_offset: int, prefix_iteration: int) -> list[int]:
+        iterations = []
+        for call in calls:
+            iteration = call["record"]["input_iteration"] + iteration_offset
             local = _payload(args.rank, count, iteration, dtype)
-            expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
-            buffers["source"][1].copy_(local)
-            buffers["output"][1].fill_(float("nan"))
-            record: dict[str, Any] = {"sample_index": sample_index, "input_iteration": iteration}
-            if not aligned_graph:
-                record["gather_range"] = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
-            calls.append(
+            assert not torch.equal(local, call["local"]), "Graph input did not change between phases"
+            call["local"] = local
+            call["expected"] = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
+            call["buffers"]["source"][1].copy_(local)
+            call["buffers"]["output"][1].fill_(float("nan"))
+            iterations.append(iteration)
+        _prepare_prefix(prefix_iteration)
+        torch.npu.synchronize()
+        _check_profile_group(executed=False)
+        _check_prefix(executed=False)
+        return iterations
+
+    def _check_aligned(previous: torch.Tensor | None, executed: bool | None) -> dict[str, Any]:
+        output_state = _check_profile_group(executed)
+        prefix_state = _check_prefix(executed)
+        assert output_state != "CORRECT" or prefix_state == "CORRECT", "AllGather executed without its prefix"
+        ending = _previous_epochs()
+        if scratch is not None:
+            _check_scratch(scratch)
+            advanced = len(calls) * rounds if output_state == "CORRECT" else 0
+            _check_state(controls, epochs, (previous + advanced) % 2, args.lanes, args.world_size)
+        return {
+            "outputs": output_state,
+            "prefix_outputs": prefix_state,
+            "starting_epochs": None if previous is None else previous.tolist(),
+            "ending_epochs": None if ending is None else ending.tolist(),
+        }
+
+    _prepare_prefix(-args.profile_graph_warmup - 2)
+    torch.npu.synchronize()
+    phase = f"count-{count}/profile/prefix-bootstrap"
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+    _save(result_path, result, phase)
+    with torch.npu.stream(stream):
+        _submit_prefix()
+    torch.npu.synchronize()
+    _check_prefix(executed=True)
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+    aligned: dict[str, Any] = {
+        "prefix": {
+            "api": "torch.distributed.all_to_all_single",
+            "collective": "all_to_all",
+            "dtype": "float32",
+            "elements_per_peer": prefix_elements,
+            "hccl_op_expansion_mode": 0,
+            "async_op": True,
+            "wait": "current_stream_dependency",
+            "bootstrap_checked": True,
+        },
+        "capture": {},
+        "warmups": [],
+        "warmup_graph_replays": 0,
+        "warmup_allgather_calls": 0,
+        "measured_graph_replays": 0,
+        "measured_prefix_input_iteration": 0,
+        "measured_prefix_checked": False,
+        "checked_samples": [],
+        "starting_epochs": None,
+        "ending_epochs": None,
+        "replay_range": f"all_gather_aligned/rank-{args.rank}/count-{count}/replay-0",
+        "consumer_in_graph": False,
+    }
+    profile["aligned_graph"] = aligned
+    # Disjoint negative phases advance by 65 so even count=1 changes;
+    # the last warmup offset is -1 mod 32 before the measured inputs.
+    last_offset = -(32 * (calls[-1]["record"]["input_iteration"] // 32 + 2) + 1)
+    capture_offset = last_offset - 65 * args.profile_graph_warmup
+    if capture_offset % 32 == 0:
+        capture_offset -= 1
+    capture_iterations = _prepare_aligned(capture_offset, -args.profile_graph_warmup - 1)
+    previous_epochs = _previous_epochs()
+    phase = f"count-{count}/profile/aligned-capture"
+    _save(result_path, result, f"{phase}/prepared")
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+    profile_graph = torch.npu.NPUGraph()
+    with torch.npu.graph(profile_graph, stream=stream):
+        _submit_prefix()
+        for call in calls:
+            _gather(call["buffers"]["source"][1], call["buffers"]["output"][1], call["rank_major"])
+    torch.npu.synchronize()
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
+    aligned["capture"] = {
+        "input_iterations": capture_iterations,
+        "prefix_input_iteration": -args.profile_graph_warmup - 1,
+        **_check_aligned(previous_epochs, executed=None),
+    }
+    _save(result_path, result, f"{phase}/observed")
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/observed")
+    for replay_index in range(args.profile_graph_warmup + 1):
+        measured = replay_index == args.profile_graph_warmup
+        prefix_iteration = replay_index - args.profile_graph_warmup
+        offset = 0 if measured else last_offset - 65 * (args.profile_graph_warmup - 1 - replay_index)
+        input_iterations = _prepare_aligned(offset, prefix_iteration)
+        previous_epochs = _previous_epochs()
+        phase = f"count-{count}/profile/{'measured' if measured else f'graph-warmup-{replay_index}'}"
+        _save(result_path, result, f"{phase}/prepared")
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+        if measured:
+            profiler.start()
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+        with torch.npu.stream(stream):
+            if measured:
+                with torch.profiler.record_function(aligned["replay_range"]):
+                    profile_graph.replay()
+            else:
+                profile_graph.replay()
+        torch.npu.synchronize()
+        if measured:
+            profiler.stop()
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
+        checked = _check_aligned(previous_epochs, executed=True)
+        record = {
+            "replay_index": replay_index,
+            "input_iterations": input_iterations,
+            "prefix_input_iteration": prefix_iteration,
+            "prefix_checked": True,
+            "checked_samples": list(range(len(calls))),
+            "starting_epochs": checked["starting_epochs"],
+            "ending_epochs": checked["ending_epochs"],
+        }
+        if measured:
+            aligned.update(
                 {
-                    "buffers": buffers,
-                    "rank_major": buffers["output"][1].view(args.world_size, count),
-                    "local": local,
-                    "expected": expected,
-                    "record": record,
+                    "measured_graph_replays": 1,
+                    "measured_prefix_checked": True,
+                    "checked_samples": record["checked_samples"],
+                    "starting_epochs": record["starting_epochs"],
+                    "ending_epochs": record["ending_epochs"],
                 }
             )
-
-        def _check_profile_group(group: list[dict[str, Any]], executed: bool | None) -> str:
-            observed = set()
-            for call in group:
-                expectations = {"source": call["local"], "output": call["expected"]}
-                if not aligned_graph:
-                    expectations["consumer"] = call["expected"] + 1
-                for key, expected in expectations.items():
-                    storage, tensor, guard = call["buffers"][key]
-                    actual = tensor.cpu()
-                    if key != "source" and torch.all(torch.isnan(actual)):
-                        observed.add("POISONED")
-                    else:
-                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                        if key != "source":
-                            observed.add("CORRECT")
-                    _check_guards(storage, tensor.numel(), guard)
-            assert len(observed) == 1, "Retained group has partially executed outputs"
-            output_state = observed.pop()
-            if executed is not None:
-                assert output_state == ("CORRECT" if executed else "POISONED"), "Unexpected retained output state"
-            return output_state
-
-        if aligned_graph:
-            if prefix_group is None:
-                raise RuntimeError("AlltoAll-aligned graph requires its initialized HCCL prefix group")
-            prefix_elements = 32
-            prefix_buffers = {
-                "source": _guarded(args.world_size * prefix_elements, torch.float32, device),
-                "output": _guarded(args.world_size * prefix_elements, torch.float32, device),
-            }
-            prefix_local = torch.empty(0)
-            prefix_expected = torch.empty(0)
-
-            def _prefix_payload(sender: int, destination: int, iteration: int) -> torch.Tensor:
-                marker = ((iteration % 128) * args.world_size + sender) * args.world_size + destination
-                return torch.arange(prefix_elements, dtype=torch.float32) + marker * prefix_elements
-
-            def _prepare_prefix(iteration: int) -> None:
-                nonlocal prefix_local, prefix_expected
-                prefix_local = torch.cat(
-                    [_prefix_payload(args.rank, peer, iteration) for peer in range(args.world_size)]
-                )
-                prefix_expected = torch.cat(
-                    [_prefix_payload(peer, args.rank, iteration) for peer in range(args.world_size)]
-                )
-                prefix_buffers["source"][1].copy_(prefix_local)
-                prefix_buffers["output"][1].fill_(float("nan"))
-
-            def _submit_prefix() -> None:
-                work = dist.all_to_all_single(
-                    prefix_buffers["output"][1], prefix_buffers["source"][1], group=prefix_group, async_op=True
-                )
-                # The public wait orders this current stream after the HCCL stream.
-                work.wait()
-
-            def _check_prefix(executed: bool | None) -> str:
-                torch.testing.assert_close(prefix_buffers["source"][1].cpu(), prefix_local, rtol=0, atol=0)
-                actual = prefix_buffers["output"][1].cpu()
-                state = "POISONED" if torch.all(torch.isnan(actual)) else "CORRECT"
-                if state == "CORRECT":
-                    torch.testing.assert_close(actual, prefix_expected, rtol=0, atol=0)
-                if executed is not None:
-                    assert state == ("CORRECT" if executed else "POISONED"), "Unexpected AlltoAll prefix output"
-                for storage, tensor, guard in prefix_buffers.values():
-                    _check_guards(storage, tensor.numel(), guard)
-                return state
-
-            def _prepare_aligned(iteration_offset: int, prefix_iteration: int) -> list[int]:
-                iterations = []
-                for call in calls:
-                    iteration = call["record"]["input_iteration"] + iteration_offset
-                    local = _payload(args.rank, count, iteration, dtype)
-                    assert not torch.equal(local, call["local"]), "Graph input did not change between phases"
-                    call["local"] = local
-                    call["expected"] = torch.cat(
-                        [_payload(peer, count, iteration, dtype) for peer in range(args.world_size)]
-                    )
-                    call["buffers"]["source"][1].copy_(local)
-                    call["buffers"]["output"][1].fill_(float("nan"))
-                    iterations.append(iteration)
-                _prepare_prefix(prefix_iteration)
-                torch.npu.synchronize()
-                _check_profile_group(calls, executed=False)
-                _check_prefix(executed=False)
-                return iterations
-
-            def _check_aligned(previous: torch.Tensor | None, executed: bool | None) -> dict[str, Any]:
-                output_state = _check_profile_group(calls, executed)
-                prefix_state = _check_prefix(executed)
-                assert output_state != "CORRECT" or prefix_state == "CORRECT", "AllGather executed without its prefix"
-                ending = _previous_epochs()
-                if scratch is not None:
-                    _check_scratch(scratch)
-                    advanced = len(calls) * rounds if output_state == "CORRECT" else 0
-                    _check_state(controls, epochs, (previous + advanced) % 2, args.lanes, args.world_size)
-                return {
-                    "outputs": output_state,
-                    "prefix_outputs": prefix_state,
-                    "starting_epochs": None if previous is None else previous.tolist(),
-                    "ending_epochs": None if ending is None else ending.tolist(),
-                }
-
-            _prepare_prefix(-args.profile_graph_warmup - 2)
-            torch.npu.synchronize()
-            phase = f"count-{count}/profile/prefix-bootstrap"
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-            _save(result_path, result, phase)
-            with torch.npu.stream(stream):
-                _submit_prefix()
-            torch.npu.synchronize()
-            _check_prefix(executed=True)
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
-            aligned: dict[str, Any] = {
-                "prefix": {
-                    "api": "torch.distributed.all_to_all_single",
-                    "collective": "all_to_all",
-                    "dtype": "float32",
-                    "elements_per_peer": prefix_elements,
-                    "hccl_op_expansion_mode": 0,
-                    "async_op": True,
-                    "wait": "current_stream_dependency",
-                    "bootstrap_checked": True,
-                },
-                "capture": {},
-                "warmups": [],
-                "warmup_graph_replays": 0,
-                "warmup_allgather_calls": 0,
-                "measured_graph_replays": 0,
-                "measured_prefix_input_iteration": 0,
-                "measured_prefix_checked": False,
-                "checked_samples": [],
-                "starting_epochs": None,
-                "ending_epochs": None,
-                "replay_range": f"all_gather_aligned/rank-{args.rank}/count-{count}/replay-0",
-                "consumer_in_graph": False,
-            }
-            profile["aligned_graph"] = aligned
-            # Disjoint negative phases advance by 65 so even count=1 changes;
-            # the last warmup offset is -1 mod 32 before the measured inputs.
-            last_offset = -(32 * (calls[-1]["record"]["input_iteration"] // 32 + 2) + 1)
-            capture_offset = last_offset - 65 * args.profile_graph_warmup
-            if capture_offset % 32 == 0:
-                capture_offset -= 1
-            capture_iterations = _prepare_aligned(capture_offset, -args.profile_graph_warmup - 1)
-            previous_epochs = _previous_epochs()
-            phase = f"count-{count}/profile/aligned-capture"
-            _save(result_path, result, f"{phase}/prepared")
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-            profile_graph = torch.npu.NPUGraph()
-            with torch.npu.graph(profile_graph, stream=stream):
-                _submit_prefix()
-                for call in calls:
-                    _gather(call["buffers"]["source"][1], call["buffers"]["output"][1], call["rank_major"])
-            torch.npu.synchronize()
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
-            aligned["capture"] = {
-                "input_iterations": capture_iterations,
-                "prefix_input_iteration": -args.profile_graph_warmup - 1,
-                **_check_aligned(previous_epochs, executed=None),
-            }
-            _save(result_path, result, f"{phase}/observed")
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/observed")
-            for replay_index in range(args.profile_graph_warmup + 1):
-                measured = replay_index == args.profile_graph_warmup
-                prefix_iteration = replay_index - args.profile_graph_warmup
-                offset = 0 if measured else last_offset - 65 * (args.profile_graph_warmup - 1 - replay_index)
-                input_iterations = _prepare_aligned(offset, prefix_iteration)
-                previous_epochs = _previous_epochs()
-                phase = f"count-{count}/profile/{'measured' if measured else f'graph-warmup-{replay_index}'}"
-                _save(result_path, result, f"{phase}/prepared")
-                _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-                if measured:
-                    profiler.start()
-                    _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
-                with torch.npu.stream(stream):
-                    if measured:
-                        with torch.profiler.record_function(aligned["replay_range"]):
-                            profile_graph.replay()
-                    else:
-                        profile_graph.replay()
-                torch.npu.synchronize()
-                if measured:
-                    profiler.stop()
-                _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
-                checked = _check_aligned(previous_epochs, executed=True)
-                record = {
-                    "replay_index": replay_index,
-                    "input_iterations": input_iterations,
-                    "prefix_input_iteration": prefix_iteration,
-                    "prefix_checked": True,
-                    "checked_samples": list(range(len(calls))),
-                    "starting_epochs": checked["starting_epochs"],
-                    "ending_epochs": checked["ending_epochs"],
-                }
-                if measured:
-                    aligned.update(
-                        {
-                            "measured_graph_replays": 1,
-                            "measured_prefix_checked": True,
-                            "checked_samples": record["checked_samples"],
-                            "starting_epochs": record["starting_epochs"],
-                            "ending_epochs": record["ending_epochs"],
-                        }
-                    )
-                    profile["samples"] = [call["record"] for call in calls]
-                else:
-                    aligned["warmups"].append(record)
-                    aligned["warmup_graph_replays"] += 1
-                    aligned["warmup_allgather_calls"] += len(calls)
-                _save(result_path, result, f"{phase}/checked")
-                _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+            profile["samples"] = [call["record"] for call in calls]
         else:
-            for name, group in (
-                ("warmup_samples", calls[: args.profile_warmup]),
-                ("samples", calls[args.profile_warmup :]),
-            ):
-                torch.npu.synchronize()
-                starting_epochs = _previous_epochs()
-                _save(result_path, result, f"count-{count}/profile/{name}/prepared")
-                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/prepared")
-                if name == "samples":
-                    profiler.start()
-                    _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
-                    if args.rank == 0 and args.profile_rank0_delay_ms is not None and args.profile_rank0_delay_ms > 0:
-                        time.sleep(args.profile_rank0_delay_ms / 1000)
-                with torch.npu.stream(stream):
-                    for call in group:
-                        buffers = call["buffers"]
-                        with torch.profiler.record_function(call["record"]["gather_range"]):
-                            _gather(buffers["source"][1], buffers["output"][1], call["rank_major"])
-                        torch.add(buffers["output"][1], 1, out=buffers["consumer"][1])
-                torch.npu.synchronize()
-                if name == "samples":
-                    profiler.stop()
-                _check_profile_group(group, executed=True)
-                if scratch is not None:
-                    _check_scratch(scratch)
-                    _check_state(
-                        controls, epochs, (starting_epochs + len(group) * rounds) % 2, args.lanes, args.world_size
-                    )
-                profile[name] = [call["record"] for call in group]
-                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/checked")
-                _save(result_path, result, f"count-{count}/profile/{name}/checked")
-    else:
-        profile["submission_pattern"] = "checked_single_graph_replay"
-        for ordinal in range(args.profile_warmup + args.profile_samples):
-            sample_index = ordinal - args.profile_warmup
-            iteration = args.repeats + ordinal + 1
-            phase = f"count-{count}/profile/sample-{sample_index}"
-            _save(result_path, result, phase)
-            previous_epochs = _previous_epochs()
-            local = _prepare(iteration)
-            torch.npu.synchronize()
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
-            if sample_index == 0:
-                profiler.start()
-                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
-            gather_range = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
-            with torch.npu.stream(stream):
-                with torch.profiler.record_function(gather_range):
-                    profile_graph.replay()
-                torch.add(output, 1, out=consumed)
-            torch.npu.synchronize()
-            _check_outputs(iteration, local, previous_epochs)
-            _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
-            records = profile["warmup_samples"] if sample_index < 0 else profile["samples"]
-            records.append({"sample_index": sample_index, "input_iteration": iteration, "gather_range": gather_range})
-            _save(result_path, result, f"{phase}/checked")
-        torch.npu.synchronize()
-        profiler.stop()
+            aligned["warmups"].append(record)
+            aligned["warmup_graph_replays"] += 1
+            aligned["warmup_allgather_calls"] += len(calls)
+        _save(result_path, result, f"{phase}/checked")
+        _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/drained")
     traces = sorted(profile_dir.rglob("trace_view.json"))
     if not traces:
@@ -762,18 +668,13 @@ def _run_case(
         raise RuntimeError(f"Profiler database export did not complete: {completion}")
     profile["databases"] = [_file_identity(path) for path in databases]
     profile["export_complete"] = _file_identity(completion)
-    if profile_graph is not None:
-        graph_dump = (
-            profile_dir / "graph.json"
-            if args.profile_submission is not None
-            else args.artifact_dir / f"profile-graph-rank-{args.rank}-count-{count}.json"
-        )
-        profile_graph.debug_dump(str(graph_dump))
-        json.loads(graph_dump.read_text(encoding="utf-8"))
-        profile["graph_dump"] = _file_identity(graph_dump)
-        profile_graph.reset()
-        profile["graph_reset"] = True
-        del profile_graph
+    graph_dump = profile_dir / "graph.json"
+    profile_graph.debug_dump(str(graph_dump))
+    json.loads(graph_dump.read_text(encoding="utf-8"))
+    profile["graph_dump"] = _file_identity(graph_dump)
+    profile_graph.reset()
+    profile["graph_reset"] = True
+    del profile_graph
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/closed")
     _save(result_path, result, f"count-{count}/profile/complete")
 
@@ -1164,12 +1065,9 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl"), default="shmem")
-    parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(3, 4), help="HCCL AIV (3) or AIV Only (4)")
+    parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(4,), help="Matched HCCL AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
-    parser.add_argument("--profile-warmup", type=int, help="Logical eager warmups (default 20; aligned graph 0)")
-    parser.add_argument(
-        "--profile-rank0-delay-ms", type=int, help="Diagnostic-only rank-0 batch delay; explicit 0 is a control"
-    )
+    parser.add_argument("--profile-warmup", type=int, help="Logical warmups; aligned profiling requires 0")
     parser.add_argument(
         "--profile-submission", choices=("alltoall_graph",), help="Capture one AlltoAll followed by 50 AllGather calls"
     )
@@ -1207,17 +1105,15 @@ def _main() -> None:
         args.profile_warmup = 0 if args.profile_submission == "alltoall_graph" else 20
     if args.profile_samples < 0:
         parser.error("profile-samples must be nonnegative")
-    if args.profile_submission is not None:
+    if args.profile_samples or args.profile_submission is not None:
         if (
-            args.profile_samples != 50
+            args.profile_submission != "alltoall_graph"
+            or args.profile_samples != 50
             or args.profile_warmup != 0
             or args.backend not in ("hccl", "ascendc")
             or args.mode != "eager"
-            or args.profile_rank0_delay_ms is not None
         ):
-            parser.error(
-                "alltoall_graph requires native eager profiling, 50 samples, profile-warmup=0 and no rank delay"
-            )
+            parser.error("Profiling requires native eager mode, explicit alltoall_graph, 50 samples and warmup=0")
         if args.profile_graph_warmup is None:
             args.profile_graph_warmup = 20
         if args.profile_graph_warmup < 1:
@@ -1227,16 +1123,7 @@ def _main() -> None:
                 parser.error(f"alltoall_graph requires {name} unset or 0 for device-only stream ordering")
     elif args.profile_graph_warmup is not None:
         parser.error("profile-graph-warmup requires alltoall_graph submission")
-    if args.profile_rank0_delay_ms is not None and (
-        args.profile_rank0_delay_ms < 0
-        or not args.profile_samples
-        or args.backend not in ("hccl", "ascendc")
-        or args.mode != "eager"
-    ):
-        parser.error("profile-rank0-delay-ms requires nonnegative delay and eager HCCL/Ascend C gather-only profiling")
     if args.profile_samples:
-        if args.profile_samples < 2 or (args.profile_submission is None and args.profile_warmup < 2):
-            parser.error("Ordinary gather-only profiling requires at least two warmup and measured samples")
         if (
             args.compile_only
             or args.stress_batch
@@ -1275,12 +1162,10 @@ def _main() -> None:
     if args.backend != "hccl" and args.hccl_op_expansion_mode is not None:
         parser.error("hccl-op-expansion-mode requires the HCCL backend")
     if args.backend == "hccl":
-        if args.hccl_op_expansion_mode is None:
-            args.hccl_op_expansion_mode = 3
         if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
-        if args.profile_submission == "alltoall_graph" and args.hccl_op_expansion_mode != 4:
-            parser.error("alltoall_graph requires HCCL AllGather expansion mode 4")
+        if args.hccl_op_expansion_mode != 4 or args.dtype != "bfloat16":
+            parser.error("Matched alltoall_graph requires BF16 HCCL with explicit expansion mode 4")
     if args.backend == "hccl" or args.profile_submission == "alltoall_graph":
         if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV" or any(
             not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
@@ -1336,7 +1221,7 @@ def _main() -> None:
         "comparison_id": args.comparison_id,
         "round_id": args.round_id,
         "stage_index": args.stage_index,
-        "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
+        "profile_rank0_delay_ms": None,
         "profile_submission": args.profile_submission,
         "profile_graph_warmup": args.profile_graph_warmup,
         "row_width": args.row_width,
