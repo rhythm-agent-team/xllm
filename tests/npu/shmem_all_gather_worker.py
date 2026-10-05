@@ -14,11 +14,14 @@
 
 """One rank of direct AllGather correctness and optional msprof capture.
 
-TileLang and native Ascend C use CPU FileStore coordination and official
-SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. Matched profiling
-may explicitly select the existing current-stream native HCCL AllGather instead.
-The caller must verify device availability, package/native identities and prior
-required correctness evidence before requesting measurement.
+TileLang and native SHMEM Ascend C use CPU FileStore coordination and official
+SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
+backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
+payload executes in the custom AIV kernel. It currently permits eager numerical
+checks only, not continuous-call or graph qualification. Matched profiling may
+select the existing current-stream native HCCL AllGather instead. The caller must
+verify device availability, package/native identities and prior required
+correctness evidence before requesting measurement.
 
 A failure leaves the original traceback and saved phase; it does not enter a
 cleanup rendezvous that could hide the failure behind a peer timeout.
@@ -46,6 +49,8 @@ from scripts.logger import logger
 _GUARD_BYTES = 128
 _GUARD_VALUE = -123
 _SKEW_PHASES = {"none": 0, "read": 1, "ack": 2}
+# Retain failed MC2 state until the process boundary reports the original error.
+_active_prepared: Any | None = None
 
 
 def _save(result_path: Path, result: dict[str, Any], phase: str) -> None:
@@ -197,11 +202,15 @@ def _load_native(args: argparse.Namespace, result: dict[str, Any]) -> None:
     result["native_library"] = _file_identity(args.native_library)
     result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
     torch.ops.load_library(str(args.native_library))
-    namespace = torch.ops.aclshmem_ops if args.backend == "ascendc" else torch.ops.xllm_ops
-    name = "all_gather" if args.backend == "ascendc" else "npu_all_gather"
-    operator = getattr(namespace, name, None)
-    if operator is None or not callable(operator.default):
-        raise RuntimeError(f"Native {args.backend} AllGather registration {name} is not callable")
+    if args.backend == "hccl_aiv":
+        if not callable(torch.classes.hccl_aiv_ops.PreparedAllGather):
+            raise RuntimeError("Native hccl_aiv PreparedAllGather class is not callable")
+    else:
+        namespace = torch.ops.aclshmem_ops if args.backend == "ascendc" else torch.ops.xllm_ops
+        name = "all_gather" if args.backend == "ascendc" else "npu_all_gather"
+        operator = getattr(namespace, name, None)
+        if operator is None or not callable(operator.default):
+            raise RuntimeError(f"Native {args.backend} AllGather registration {name} is not callable")
     if result["native_library"] != _file_identity(args.native_library):
         raise RuntimeError(f"{args.backend} native library identity changed during loading")
 
@@ -242,7 +251,10 @@ def _run_case(
     epochs: torch.Tensor | None,
     comm: int | None = None,
     prefix_group: dist.ProcessGroup | None = None,
+    hccl_comm_name: str | None = None,
 ) -> None:
+    global _active_prepared
+
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
     source_storage, source, source_guard = _guarded(count, dtype, device)
@@ -253,6 +265,7 @@ def _run_case(
     result["cases"].append(case)
     scratch = None
     kernel = None
+    prepared = None
     if args.backend in ("shmem", "ascendc"):
         if receive is None or controls is None or epochs is None:
             raise RuntimeError("SHMEM AllGather requires its initialized symmetric buffers")
@@ -263,12 +276,23 @@ def _run_case(
         case.update(identity)
     elif args.backend == "hccl" and not comm:
         raise RuntimeError("HCCL AllGather requires a valid initialized communicator")
+    elif args.backend == "hccl_aiv":
+        if not hccl_comm_name:
+            raise RuntimeError("MC2 AIV AllGather requires the initialized HCCL communicator name")
+        if _active_prepared is not None:
+            raise RuntimeError("A previous MC2 prepared object was not successfully closed")
+        _save(result_path, result, f"count-{count}/prepare")
+        prepared = torch.classes.hccl_aiv_ops.PreparedAllGather(
+            source, output, hccl_comm_name, args.world_size, args.chunk_bytes
+        )
+        _active_prepared = prepared
     ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
     _save(result_path, result, ready_phase)
     _rendezvous(store, args.rank, args.world_size, ready_phase)
-    rounds = (count + args.lanes * args.chunk_bytes // source.element_size() - 1) // (
-        args.lanes * args.chunk_bytes // source.element_size()
-    )
+    rounds = 0
+    if scratch is not None:
+        round_elements = args.lanes * args.chunk_bytes // source.element_size()
+        rounds = (count + round_elements - 1) // round_elements
     stream = torch.npu.Stream() if args.profile_samples else torch.npu.current_stream()
 
     def _gather(
@@ -280,6 +304,8 @@ def _run_case(
             kernel(source_tensor, rank_major, receive, controls, epochs, scratch["tensor"], args.rank)
         elif args.backend == "ascendc":
             _gather_ascendc(args, source_tensor, output_tensor, receive, controls, epochs, scratch["tensor"])
+        elif args.backend == "hccl_aiv":
+            prepared.run()
         else:
             torch.ops.xllm_ops.npu_all_gather(source_tensor, output_tensor, comm)
 
@@ -323,8 +349,8 @@ def _run_case(
         torch.npu.synchronize()
         _check_outputs(iteration, local, previous_epochs)
         case["checked_iterations"].append(iteration)
-        # Keep the next invocation from changing controls during another PE's
-        # host-side state checks. This is once per collective, never per row.
+        # Keep the next invocation from changing state during another PE's host
+        # checks. hccl_aiv passes here do not qualify continuous-call safety.
         _rendezvous(store, args.rank, args.world_size, f"count-{count}/iteration-{iteration}/checked")
 
     def _check_capture(local: torch.Tensor, previous_epochs: torch.Tensor | None) -> None:
@@ -390,6 +416,12 @@ def _run_case(
     if graph is not None:
         graph.reset()
         del graph
+    if prepared is not None:
+        _save(result_path, result, f"count-{count}/close")
+        prepared.close()
+        _active_prepared = None
+        prepared = None
+        case["prepared_closed"] = True
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
     _save(result_path, result, f"count-{count}/checked")
     if not args.profile_samples:
@@ -968,7 +1000,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "environment",
     )
     configuration_data = {name: result[name] for name in configuration_fields}
-    if args.backend == "hccl":
+    if args.backend in ("hccl", "hccl_aiv"):
         configuration_data["hccl_config"] = result["hccl_config"]
     if args.profile_submission == "alltoall_graph":
         configuration_data["prefix_hccl_config"] = result["prefix_hccl_config"]
@@ -1027,11 +1059,15 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
     device = torch.device(f"npu:{args.device}")
     result["versions"] = {"torch": torch.__version__, "torch_npu": torch_npu.__version__}
     _load_native(args, result)
+    identities = ("worker", "native_library")
+    if args.backend == "hccl_aiv":
+        result["kernel"] = _file_identity(args.kernel_source)
+        identities += ("kernel",)
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    options.hccl_config = {"hccl_op_expansion_mode": args.hccl_op_expansion_mode}
+    options.hccl_config = {"hccl_op_expansion_mode": args.hccl_op_expansion_mode} if args.backend == "hccl" else {}
     result["hccl_config"] = dict(options.hccl_config)
     _save(result_path, result, "bootstrap")
-    store = _bootstrap_store(args, result, ("worker", "native_library"))
+    store = _bootstrap_store(args, result, identities)
     prefix_group = _init_hccl_process_group(args, result)
     group = dist.new_group(
         ranks=list(range(args.world_size)),
@@ -1039,19 +1075,33 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
         timeout=timedelta(seconds=120),
         pg_options=options,
     )
+    _save(result_path, result, "bootstrap/communicator-allreduce")
     warm = torch.ones(1, dtype=torch.float32, device=device)
+    # This initializes communicator resources, never the test's AllGather payload.
     dist.all_reduce(warm, group=group)
     torch.npu.synchronize()
-    comm = group._get_backend(device).get_hccl_comm(device.index)
-    if not comm:
-        raise RuntimeError(f"No HCCL communicator on {device}")
+    backend = group._get_backend(device)
+    comm = None
+    hccl_comm_name = None
+    if args.backend == "hccl_aiv":
+        if not callable(getattr(backend, "get_hccl_comm_name", None)):
+            raise RuntimeError("ProcessGroupHCCL does not expose get_hccl_comm_name")
+        hccl_comm_name = backend.get_hccl_comm_name(dist.get_rank(), init_comm=False)
+        if not isinstance(hccl_comm_name, str) or not 0 < len(hccl_comm_name) < 128:
+            raise RuntimeError(f"Invalid initialized HCCL communicator name: {hccl_comm_name!r}")
+        result["hccl_comm_name"] = hccl_comm_name
+        result["bootstrap_allreduce_role"] = "communicator_resource_initialization_only"
+    else:
+        comm = backend.get_hccl_comm(device.index)
+        if not comm:
+            raise RuntimeError(f"No HCCL communicator on {device}")
+        result["hccl_comm"] = hex(comm)
     result["bootstrap"] = "HCCL/ProcessGroup"
-    result["hccl_comm"] = hex(comm)
     result["group_name"] = group.group_name
     result["pg_owner"] = "torch.distributed.new_group(ranks=all_PEs, backend='hccl')"
     _rendezvous(store, args.rank, args.world_size, "initialized")
     for count in args.counts:
-        _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group)
+        _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group, hccl_comm_name)
     _save(result_path, result, "close/drain")
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "drained")
@@ -1064,7 +1114,7 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
 
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl"), default="shmem")
+    parser.add_argument("--backend", choices=("shmem", "ascendc", "hccl", "hccl_aiv"), default="shmem")
     parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(4,), help="Matched HCCL AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
     parser.add_argument("--profile-warmup", type=int, help="Logical warmups; aligned profiling requires 0")
@@ -1096,11 +1146,33 @@ def _main() -> None:
         "--compile-only", action="store_true", help="Lower DSL only; no SHMEM bootstrap or NPU execution"
     )
     parser.add_argument("--counts", type=int, nargs="+", default=[64, 65, 127, 128, 129])
-    parser.add_argument("--lanes", type=int, default=2)
+    parser.add_argument("--lanes", type=int, help="SHMEM lanes (default 2); not used by hccl_aiv")
     parser.add_argument("--chunk-bytes", type=int, default=128)
-    parser.add_argument("--heap-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--heap-bytes", type=int, help="SHMEM heap bytes (default 64 MiB); not used by hccl_aiv")
     parser.add_argument("--repeats", type=int, default=16)
     args = parser.parse_args()
+    if args.backend == "hccl_aiv":
+        if (
+            args.mode != "eager"
+            or args.stress_batch
+            or args.skew_phase != "none"
+            or args.skew_iterations != 0
+            or args.graph_replays is not None
+            or args.alternate_count is not None
+            or args.profile_samples
+            or args.profile_submission is not None
+            or args.profile_graph_warmup is not None
+        ):
+            parser.error("hccl_aiv currently supports eager numerical checks only, without graph/stress/skew/profiling")
+        if args.world_size not in (2, 8, 16):
+            parser.error("hccl_aiv requires 2/8/16 ranks")
+        if args.lanes is not None or args.heap_bytes is not None:
+            parser.error("hccl_aiv uses MC2 rank-based blocks/windows, not SHMEM lanes or heap")
+    else:
+        if args.lanes is None:
+            args.lanes = 2
+        if args.heap_bytes is None:
+            args.heap_bytes = 64 * 1024 * 1024
     if args.profile_warmup is None:
         args.profile_warmup = 0 if args.profile_submission == "alltoall_graph" else 20
     if args.profile_samples < 0:
@@ -1145,7 +1217,7 @@ def _main() -> None:
         parser.error("Profiling metadata requires positive profile-samples")
     if args.compile_only and args.backend != "shmem":
         parser.error("compile-only is available only for the TileLang SHMEM backend")
-    if args.backend in ("hccl", "ascendc"):
+    if args.backend in ("hccl", "ascendc", "hccl_aiv"):
         if args.native_library is None or not args.native_library.is_absolute() or not args.native_library.is_file():
             parser.error(f"{args.backend} requires native-library as an existing absolute file")
         args.native_library = args.native_library.resolve()
@@ -1153,12 +1225,12 @@ def _main() -> None:
             parser.error(f"{args.backend} requires the full native-build-revision caller assertion")
     elif args.native_library is not None or args.native_build_revision is not None:
         parser.error("TileLang SHMEM must not load a native library")
-    if args.backend == "ascendc":
+    if args.backend in ("ascendc", "hccl_aiv"):
         if args.kernel_source is None or not args.kernel_source.is_absolute() or not args.kernel_source.is_file():
-            parser.error("Ascend C requires kernel-source as an existing absolute file")
+            parser.error(f"{args.backend} requires kernel-source as an existing absolute file")
         args.kernel_source = args.kernel_source.resolve()
     elif args.kernel_source is not None:
-        parser.error("kernel-source is only valid for the standalone Ascend C backend")
+        parser.error("kernel-source is only valid for the standalone ascendc/hccl_aiv backends")
     if args.backend != "hccl" and args.hccl_op_expansion_mode is not None:
         parser.error("hccl-op-expansion-mode requires the HCCL backend")
     if args.backend == "hccl":
@@ -1171,6 +1243,10 @@ def _main() -> None:
             not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
         ):
             parser.error("HCCL requires explicit AIV expansion and host/NPU socket port ranges")
+    if args.backend == "hccl_aiv" and any(
+        not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
+    ):
+        parser.error("hccl_aiv resource bootstrap requires host/NPU socket port ranges")
     if not 0 <= args.rank < args.world_size or args.device < 0:
         parser.error("Require 0 <= rank < world-size and a nonnegative explicit device")
     if args.stress_batch and args.compile_only:
@@ -1189,14 +1265,15 @@ def _main() -> None:
         args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
     ):
         parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
-    if args.repeats <= 0 or args.lanes <= 0:
-        parser.error("Require positive repeats and positive lanes")
+    if args.repeats <= 0 or (args.lanes is not None and args.lanes <= 0):
+        parser.error("Require positive repeats and positive SHMEM lanes")
     if args.backend == "ascendc" and args.lanes > 48:
         parser.error("Ascend C supports lanes in 1..48; native launch also checks hardware capacity")
-    if args.backend != "ascendc" and args.lanes % 2:
+    if args.backend in ("shmem", "hccl") and args.lanes % 2:
         parser.error("TileLang MIX and matched HCCL configuration require even lanes")
-    if not 0 < args.chunk_bytes <= 64 * 1024 or args.chunk_bytes % 128:
-        parser.error("Require chunk-bytes <= 64 KiB and a positive multiple of 128")
+    chunk_limit = 4 * 1024 * 1024 if args.backend == "hccl_aiv" else 64 * 1024
+    if not 0 < args.chunk_bytes <= chunk_limit or args.chunk_bytes % 128:
+        parser.error(f"Require chunk-bytes <= {chunk_limit} and a positive multiple of 128")
     if len(set(args.counts)) != len(args.counts) or any(
         not 0 < args.world_size * count <= (1 << 31) - 1 for count in args.counts
     ):
@@ -1208,9 +1285,10 @@ def _main() -> None:
             total_rounds += (args.alternate_count + round_elements - 1) // round_elements
         if total_rounds % 2 != 1:
             parser.error("Retained graph sequence must have odd total rounds to exercise both epoch parities")
-    required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
-    if args.heap_bytes < required_bytes:
-        parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")
+    if args.backend != "hccl_aiv":
+        required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
+        if args.heap_bytes < required_bytes:
+            parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1226,7 +1304,11 @@ def _main() -> None:
         "profile_graph_warmup": args.profile_graph_warmup,
         "row_width": args.row_width,
         "native_build_revision": args.native_build_revision,
-        "native_build_revision_owner": {"ascendc": "workspace_source", "hccl": "xllm_source"}.get(args.backend),
+        "native_build_revision_owner": {
+            "ascendc": "workspace_source",
+            "hccl_aiv": "workspace_source",
+            "hccl": "xllm_source",
+        }.get(args.backend),
         "rank": args.rank,
         "world_size": args.world_size,
         "device": args.device,
@@ -1252,6 +1334,8 @@ def _main() -> None:
             for name in (
                 "ASCEND_RT_VISIBLE_DEVICES",
                 "ASCEND_HOME_PATH",
+                "ASCEND_CUSTOM_OPP_PATH",
+                "LD_LIBRARY_PATH",
                 "TL_ROOT",
                 "SHMEM_HOME_PATH",
                 "HCCL_OP_EXPANSION_MODE",
@@ -1274,7 +1358,7 @@ def _main() -> None:
     if args.compile_only:
         _compile_only(args, result, result_path)
         return
-    if args.backend == "hccl":
+    if args.backend in ("hccl", "hccl_aiv"):
         _run_hccl(args, result, result_path)
         return
     # Native initialization resets its log level; the environment overrides it.
@@ -1397,4 +1481,13 @@ if __name__ == "__main__":
         _main()
     except Exception:
         logger.exception("AllGather worker failed; inspect its saved phase and original traceback")
+        if _active_prepared is not None:
+            # No device drain or destructor may replace this failure with a hang
+            # or abort. The launcher still owns failure exit and peer cleanup.
+            logger.error("MC2 prepared state retained; exiting without device cleanup after failure")
+            for handler in logger.handlers:
+                handler.flush()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
         raise
