@@ -20,7 +20,9 @@ backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
 payload executes in the custom AIV kernel. Its test entry permits eager numerical
 checks, basic PE2/8/16 normal graph entries and a bounded two-live-graph PE2 entry.
 Larger-rank entry support is not runtime qualification; capture alone is not a
-numerical pass. Profiling, eager stress and skew remain unsupported. --mc2-probe-stage
+numerical pass. Normal MC2 aligned profiling reuses the AlltoAll-to-50 graph with
+20 full-graph warmups; entry support is not device-duration or performance proof.
+Eager stress and skew remain unsupported. --mc2-probe-stage
 explicitly selects resource, first-barrier or final-zero diagnostics, not
 AllGather qualification.
 Matched profiling may select the existing current-stream native HCCL AllGather
@@ -297,7 +299,7 @@ def _run_case(
             raise RuntimeError("MC2 AIV AllGather requires the initialized HCCL communicator name")
         if _active_prepared is not None:
             raise RuntimeError("A previous MC2 prepared object was not successfully closed")
-        if args.mode == "graph" and _active_graph is not None:
+        if (args.mode == "graph" or args.profile_samples) and _active_graph is not None:
             raise RuntimeError("A previous MC2 graph was not successfully reset")
         _save(result_path, result, f"count-{count}/prepare")
         name = _MC2_PREPARED_CLASSES[args.mc2_probe_stage]
@@ -356,7 +358,7 @@ def _run_case(
     if scratch is not None:
         round_elements = args.lanes * args.chunk_bytes // source.element_size()
         rounds = (count + round_elements - 1) // round_elements
-    stream = torch.npu.Stream() if args.profile_samples else torch.npu.current_stream()
+    stream = torch.npu.Stream() if args.profile_samples and args.backend != "hccl_aiv" else torch.npu.current_stream()
 
     def _gather(
         source_tensor: torch.Tensor = source,
@@ -830,6 +832,19 @@ def _run_case(
     )
     profile["submission_pattern"] = "alltoall_aligned_graph"
     calls = []
+    prefix_buffers = {}
+    if args.backend == "hccl_aiv":
+        _active_graph = {
+            "stream": stream,
+            "calls": calls,
+            "prefix_group": prefix_group,
+            "prefix_buffers": prefix_buffers,
+            "source_storage": source_storage,
+            "output_storage": output_storage,
+            "consumer_storage": consumer_storage,
+            "consumed": consumed,
+        }
+        profile["prepared_closed"] = False
     for sample_index in range(args.profile_samples):
         iteration = args.repeats + sample_index + 1
         buffers = {
@@ -849,6 +864,10 @@ def _run_case(
                 "record": {"sample_index": sample_index, "input_iteration": iteration},
             }
         )
+        if args.backend == "hccl_aiv":
+            calls[-1]["prepared"] = torch.classes.hccl_aiv_ops.PreparedAllGather(
+                buffers["source"][1], buffers["output"][1], hccl_comm_name, args.world_size, args.chunk_bytes
+            )
 
     def _check_profile_group(executed: bool | None) -> str:
         observed = set()
@@ -872,10 +891,8 @@ def _run_case(
     if prefix_group is None:
         raise RuntimeError("AlltoAll-aligned graph requires its initialized HCCL prefix group")
     prefix_elements = 32
-    prefix_buffers = {
-        "source": _guarded(args.world_size * prefix_elements, torch.float32, device),
-        "output": _guarded(args.world_size * prefix_elements, torch.float32, device),
-    }
+    prefix_buffers["source"] = _guarded(args.world_size * prefix_elements, torch.float32, device)
+    prefix_buffers["output"] = _guarded(args.world_size * prefix_elements, torch.float32, device)
     prefix_local = torch.empty(0)
     prefix_expected = torch.empty(0)
 
@@ -930,17 +947,20 @@ def _run_case(
         output_state = _check_profile_group(executed)
         prefix_state = _check_prefix(executed)
         assert output_state != "CORRECT" or prefix_state == "CORRECT", "AllGather executed without its prefix"
-        ending = _previous_epochs()
         if scratch is not None:
             _check_scratch(scratch)
             advanced = len(calls) * rounds if output_state == "CORRECT" else 0
             _check_state(controls, epochs, (previous + advanced) % 2, args.lanes, args.world_size)
-        return {
-            "outputs": output_state,
-            "prefix_outputs": prefix_state,
-            "starting_epochs": None if previous is None else previous.tolist(),
-            "ending_epochs": None if ending is None else ending.tolist(),
-        }
+        checked: dict[str, Any] = {"outputs": output_state, "prefix_outputs": prefix_state}
+        if args.backend != "hccl_aiv":
+            ending = _previous_epochs()
+            checked.update(
+                {
+                    "starting_epochs": None if previous is None else previous.tolist(),
+                    "ending_epochs": None if ending is None else ending.tolist(),
+                }
+            )
+        return checked
 
     _prepare_prefix(-args.profile_graph_warmup - 2)
     torch.npu.synchronize()
@@ -971,11 +991,11 @@ def _run_case(
         "measured_prefix_input_iteration": 0,
         "measured_prefix_checked": False,
         "checked_samples": [],
-        "starting_epochs": None,
-        "ending_epochs": None,
         "replay_range": f"all_gather_aligned/rank-{args.rank}/count-{count}/replay-0",
         "consumer_in_graph": False,
     }
+    if args.backend != "hccl_aiv":
+        aligned.update({"starting_epochs": None, "ending_epochs": None})
     profile["aligned_graph"] = aligned
     # Disjoint negative phases advance by 65 so even count=1 changes;
     # the last warmup offset is -1 mod 32 before the measured inputs.
@@ -989,10 +1009,15 @@ def _run_case(
     _save(result_path, result, f"{phase}/prepared")
     _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
     profile_graph = torch.npu.NPUGraph()
+    if args.backend == "hccl_aiv":
+        _active_graph["graph"] = profile_graph
     with torch.npu.graph(profile_graph, stream=stream):
         _submit_prefix()
         for call in calls:
-            _gather(call["buffers"]["source"][1], call["buffers"]["output"][1], call["rank_major"])
+            if args.backend == "hccl_aiv":
+                call["prepared"].run()
+            else:
+                _gather(call["buffers"]["source"][1], call["buffers"]["output"][1], call["rank_major"])
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
     aligned["capture"] = {
@@ -1031,19 +1056,19 @@ def _run_case(
             "prefix_input_iteration": prefix_iteration,
             "prefix_checked": True,
             "checked_samples": list(range(len(calls))),
-            "starting_epochs": checked["starting_epochs"],
-            "ending_epochs": checked["ending_epochs"],
         }
+        if args.backend != "hccl_aiv":
+            record.update({"starting_epochs": checked["starting_epochs"], "ending_epochs": checked["ending_epochs"]})
         if measured:
             aligned.update(
                 {
                     "measured_graph_replays": 1,
                     "measured_prefix_checked": True,
                     "checked_samples": record["checked_samples"],
-                    "starting_epochs": record["starting_epochs"],
-                    "ending_epochs": record["ending_epochs"],
                 }
             )
+            if args.backend != "hccl_aiv":
+                aligned.update({"starting_epochs": record["starting_epochs"], "ending_epochs": record["ending_epochs"]})
             profile["samples"] = [call["record"] for call in calls]
         else:
             aligned["warmups"].append(record)
@@ -1064,13 +1089,22 @@ def _run_case(
         raise RuntimeError(f"Profiler database export did not complete: {completion}")
     profile["databases"] = [_file_identity(path) for path in databases]
     profile["export_complete"] = _file_identity(completion)
+    if args.backend == "hccl_aiv":
+        stream.synchronize()
     graph_dump = profile_dir / "graph.json"
     profile_graph.debug_dump(str(graph_dump))
     json.loads(graph_dump.read_text(encoding="utf-8"))
     profile["graph_dump"] = _file_identity(graph_dump)
     profile_graph.reset()
     profile["graph_reset"] = True
+    if args.backend == "hccl_aiv":
+        del _active_graph["graph"]
     del profile_graph
+    if args.backend == "hccl_aiv":
+        for call in calls:
+            call["prepared"].close()
+        profile["prepared_closed"] = True
+        _active_graph = None
     _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/closed")
     _save(result_path, result, f"count-{count}/profile/complete")
 
@@ -1513,7 +1547,9 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
     result["pg_owner"] = "torch.distributed.new_group(ranks=all_PEs, backend='hccl')"
     _rendezvous(store, args.rank, args.world_size, "initialized")
     run_stream = (
-        torch.npu.Stream() if args.backend == "hccl_aiv" and args.mode == "graph" else torch.npu.current_stream()
+        torch.npu.Stream()
+        if args.backend == "hccl_aiv" and (args.mode == "graph" or args.profile_samples)
+        else torch.npu.current_stream()
     )
     with torch.npu.stream(run_stream):
         if args.stress_batch:
@@ -1627,14 +1663,8 @@ def _main() -> None:
                 "hccl_aiv retained graphs require normal PE2 graph, one primary count, "
                 "repeats=1 and distinct alternate count"
             )
-        if (
-            args.skew_phase != "none"
-            or args.skew_iterations != 0
-            or args.profile_samples
-            or args.profile_submission is not None
-            or args.profile_graph_warmup is not None
-        ):
-            parser.error("hccl_aiv supports numerical checks without skew/profiling")
+        if args.skew_phase != "none" or args.skew_iterations != 0:
+            parser.error("hccl_aiv requires numerical or aligned profiling checks without skew")
         if args.world_size not in (2, 8, 16):
             parser.error("hccl_aiv requires 2/8/16 ranks")
         if args.lanes is not None or args.heap_bytes is not None:
@@ -1653,7 +1683,7 @@ def _main() -> None:
             args.profile_submission != "alltoall_graph"
             or args.profile_samples != 50
             or args.profile_warmup != 0
-            or args.backend not in ("hccl", "ascendc")
+            or args.backend not in ("hccl", "ascendc", "hccl_aiv")
             or args.mode != "eager"
         ):
             parser.error("Profiling requires native eager mode, explicit alltoall_graph, 50 samples and warmup=0")
@@ -1661,6 +1691,10 @@ def _main() -> None:
             args.profile_graph_warmup = 20
         if args.profile_graph_warmup < 1:
             parser.error("profile-graph-warmup must be positive")
+        if args.backend == "hccl_aiv" and (args.mc2_probe_stage is not None or args.profile_graph_warmup != 20):
+            parser.error(
+                "hccl_aiv aligned profiling requires normal uninstrumented AllGather and 20 full-graph warmups"
+            )
         for name in ("TORCH_HCCL_BLOCKING_WAIT", "HCCL_BLOCKING_WAIT"):
             if os.environ.get(name) not in (None, "0"):
                 parser.error(f"alltoall_graph requires {name} unset or 0 for device-only stream ordering")
