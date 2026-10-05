@@ -40,9 +40,6 @@ struct Usage {
 
   // Retained generated tokens inside the model's reasoning delimiters.
   int32_t num_reasoning_tokens = 0;
-
-  // Input-token positions newly published in the reusable prompt cache.
-  int32_t num_cache_write_tokens = 0;
 };
 
 }  // namespace xllm

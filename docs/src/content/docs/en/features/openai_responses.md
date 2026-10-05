@@ -165,10 +165,10 @@ Final usage contains:
 
 - `input_tokens`, `output_tokens`, and `total_tokens` from generation accounting.
 - `input_tokens_details.cached_tokens`: the high-water count of actual prompt positions reused from the prefix cache.
-- `input_tokens_details.cache_write_tokens`: unique logical prompt positions actually published to the owned prefix cache on insertion misses, not traversed cache hits and not an inferred hosted-API billing quantity.
+- `input_tokens_details.cache_write_tokens`: always `0`, matching SGLang's Responses serialization. This profile does not separately report cache-write usage. The value is not an actual write count and does not mean that no internal cache writes occurred.
 - `output_tokens_details.reasoning_tokens`: actual retained generated token IDs inside reasoning spans, excluding delimiters, using the rendered prompt's initial reasoning state. This is not retokenized output text.
 
-Cache hit and write counts are not necessarily a partition of input tokens: eviction and republication can make their sum exceed `input_tokens`. Normal flat-KV prefix caching, cache-disabled execution, and the supported MTP path use the owned accounting. Responses rejects configurations whose accounting is not supported, including disaggregated/distributed serving paths, external KV storage, host offload, and prefix-cached linear or compressed cache layouts. It does not silently disable caching or fill missing counters with zero.
+Cache-hit input is reported by `cached_tokens`; uncached input can be derived as `input_tokens - cached_tokens`. Internal cache publication is not a separate reported usage category. The fixed cache-write value does not change caching behavior. Responses still rejects disaggregated/distributed serving paths, external KV storage, and host offload because the required reasoning or cache-hit accounting is not supported for those configurations.
 
 ## Supported request profile
 

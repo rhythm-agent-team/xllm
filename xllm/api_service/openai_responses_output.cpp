@@ -333,13 +333,11 @@ bool ResponsesOutput::flush_parsers(bool incomplete) {
 
 bool ResponsesOutput::set_usage(const Usage& usage) {
   if (usage.num_prompt_tokens < 0 || usage.num_generated_tokens < 0 ||
-      usage.num_cached_tokens < 0 || usage.num_cache_write_tokens < 0 ||
-      usage.num_reasoning_tokens < 0 ||
+      usage.num_cached_tokens < 0 || usage.num_reasoning_tokens < 0 ||
       usage.num_total_tokens !=
           usage.num_prompt_tokens + usage.num_generated_tokens ||
       usage.num_reasoning_tokens > usage.num_generated_tokens ||
-      usage.num_cached_tokens > usage.num_prompt_tokens ||
-      usage.num_cache_write_tokens > usage.num_prompt_tokens) {
+      usage.num_cached_tokens > usage.num_prompt_tokens) {
     return set_error("Generation returned inconsistent token usage.");
   }
   response_["usage"] = {
@@ -347,8 +345,7 @@ bool ResponsesOutput::set_usage(const Usage& usage) {
       {"output_tokens", usage.num_generated_tokens},
       {"total_tokens", usage.num_total_tokens},
       {"input_tokens_details",
-       {{"cached_tokens", usage.num_cached_tokens},
-        {"cache_write_tokens", usage.num_cache_write_tokens}}},
+       {{"cached_tokens", usage.num_cached_tokens}, {"cache_write_tokens", 0}}},
       {"output_tokens_details",
        {{"reasoning_tokens", usage.num_reasoning_tokens}}}};
   return true;

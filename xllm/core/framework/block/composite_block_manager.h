@@ -119,8 +119,7 @@ class CompositeBlockManager : public BlockManager {
              std::vector<Block>& blocks,
              size_t existed_shared_blocks_num = 0,
              const MMData& mm_data = MMData(),
-             const Slice<XXH3Key>& block_hashes = {},
-             std::vector<size_t>* inserted_blocks = nullptr) override;
+             const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const std::vector<Block>& blocks) override;
 
   // Stats reported from the single capacity leaf (see capacity_leaf()).

@@ -216,97 +216,59 @@ TEST_F(ResponsesCacheUsageTest, CountsRetainedMtpIdsWithoutPlaceholders) {
   pool.deallocate(&seq);
 }
 
-TEST_F(ResponsesCacheUsageTest,
-       CountsRealMissesAndPreservesWritesOnPreemption) {
-  BlockManagerPool pool(options(true), 1);
+TEST_F(ResponsesCacheUsageTest, PreservesCachedInputHighWaterOnPreemption) {
+  BlockManagerPool pool(options(/*enabled=*/true), /*dp_size=*/1);
   auto request = make_usage_request({1, 2, 3, 4, 5, 6, 7, 8, 9});
   Sequence& seq = *request->sequences().front();
-  ASSERT_TRUE(pool.allocate(&seq, 4));
-  seq.kv_state().set_kv_cache_tokens_num(4);
-  ASSERT_TRUE(pool.allocate(&seq, 8));
-  EXPECT_EQ(seq.num_cache_write_tokens(), 4u);
-  pool.cache(&seq, 4);
-  EXPECT_EQ(seq.num_cache_write_tokens(), 4u);
   ASSERT_TRUE(pool.allocate(&seq, seq.num_prompt_tokens()));
-
   seq.kv_state().set_kv_cache_tokens_num(seq.num_prompt_tokens());
   pool.deallocate(&seq);
-  EXPECT_EQ(seq.num_cache_write_tokens(), 8u);
   EXPECT_EQ(seq.kv_state().num_blocks(BlockType::KV), 0u);
   ASSERT_TRUE(pool.allocate(&seq, seq.num_prompt_tokens()));
   request->record_num_prefix_cache_tokens();
   EXPECT_EQ(request->num_prefix_cache_tokens(), 8u);
   seq.kv_state().set_kv_cache_tokens_num(seq.num_prompt_tokens());
   pool.deallocate(&seq);
-  EXPECT_EQ(seq.num_cache_write_tokens(), 8u);
 
   UsageTokenizer tokenizer;
   RequestOutput output = request->generate_output(tokenizer);
   ASSERT_TRUE(output.usage.has_value());
   EXPECT_EQ(output.usage->num_cached_tokens, 8);
-  EXPECT_EQ(output.usage->num_cache_write_tokens, 8);
   evict(pool);
 }
 
-TEST_F(ResponsesCacheUsageTest, InitialHitsAndDedupPublicationsAreNotWrites) {
-  BlockManagerPool pool(options(true), 1);
+TEST_F(ResponsesCacheUsageTest, CountsInitialCachedInputHits) {
+  BlockManagerPool pool(options(/*enabled=*/true), /*dp_size=*/1);
   auto first = make_usage_request({1, 2, 3, 4, 5, 6, 7, 8, 9});
-  auto dedup = make_usage_request({1, 2, 3, 4, 5, 6, 7, 8, 10});
-  Sequence& seq1 = *first->sequences().front();
-  Sequence& seq2 = *dedup->sequences().front();
-  ASSERT_TRUE(pool.allocate(&seq1, seq1.num_prompt_tokens()));
-  ASSERT_TRUE(pool.allocate(&seq2, seq2.num_prompt_tokens()));
-  seq1.kv_state().set_kv_cache_tokens_num(seq1.num_prompt_tokens());
-  seq2.kv_state().set_kv_cache_tokens_num(seq2.num_prompt_tokens());
-  pool.cache(&seq1);
-  pool.cache(&seq2);
-  EXPECT_EQ(seq1.num_cache_write_tokens(), 8u);
-  EXPECT_EQ(seq2.num_cache_write_tokens(), 0u);
-  pool.deallocate(&seq1);
-  pool.deallocate(&seq2);
+  Sequence& seed = *first->sequences().front();
+  ASSERT_TRUE(pool.allocate(&seed, seed.num_prompt_tokens()));
+  seed.kv_state().set_kv_cache_tokens_num(seed.num_prompt_tokens());
+  pool.deallocate(&seed);
 
   auto hit = make_usage_request({1, 2, 3, 4, 5, 6, 7, 8, 11});
-  Sequence& seq3 = *hit->sequences().front();
-  ASSERT_TRUE(pool.allocate(&seq3, seq3.num_prompt_tokens()));
+  Sequence& seq = *hit->sequences().front();
+  ASSERT_TRUE(pool.allocate(&seq, seq.num_prompt_tokens()));
   hit->record_num_prefix_cache_tokens();
   EXPECT_EQ(hit->num_prefix_cache_tokens(), 8u);
-  seq3.kv_state().set_kv_cache_tokens_num(seq3.num_prompt_tokens());
-  pool.deallocate(&seq3);
-  EXPECT_EQ(seq3.num_cache_write_tokens(), 0u);
-  evict(pool);
-}
-
-TEST_F(ResponsesCacheUsageTest,
-       ClipsMixedPromptBlockAndExcludesGeneratedBlocks) {
-  BlockManagerPool pool(options(true), 1);
-  auto request = make_usage_request({1, 2, 3, 4, 5});
-  Sequence& seq = *request->sequences().front();
-  ASSERT_TRUE(pool.allocate(&seq, 12));
   seq.kv_state().set_kv_cache_tokens_num(seq.num_prompt_tokens());
-  for (int32_t id = 10; id < 17; ++id) {
-    seq.append_token(Token(id));
-  }
-  seq.kv_state().set_kv_cache_tokens_num(seq.num_tokens());
   pool.deallocate(&seq);
-  EXPECT_EQ(pool.num_blocks_in_prefix_cache().front(), 3u);
-  EXPECT_EQ(seq.num_cache_write_tokens(), 5u);
   evict(pool);
 }
 
-TEST_F(ResponsesCacheUsageTest,
-       DisabledCacheAndLegacyRequestsRemainUnaccounted) {
+TEST_F(ResponsesCacheUsageTest, DisabledCacheAndLegacyRequestsPreserveUsage) {
   for (bool enabled : {false, true}) {
     SCOPED_TRACE(enabled);
-    BlockManagerPool pool(options(enabled), 1);
+    BlockManagerPool pool(options(enabled), /*dp_size=*/1);
     auto request = make_usage_request({1, 2, 3, 4, 5}, false, false, !enabled);
     Sequence& seq = *request->sequences().front();
     ASSERT_TRUE(pool.allocate(&seq, seq.num_prompt_tokens()));
     seq.kv_state().set_kv_cache_tokens_num(seq.num_prompt_tokens());
     pool.deallocate(&seq);
-    EXPECT_EQ(seq.num_cache_write_tokens(), 0u);
     UsageTokenizer tokenizer;
-    EXPECT_EQ(request->generate_output(tokenizer).force_reasoning.has_value(),
-              !enabled);
+    const RequestOutput output = request->generate_output(tokenizer);
+    ASSERT_TRUE(output.usage.has_value());
+    EXPECT_EQ(output.usage->num_cached_tokens, 0);
+    EXPECT_EQ(output.force_reasoning.has_value(), !enabled);
     if (enabled) {
       evict(pool);
     }
@@ -417,14 +379,13 @@ TEST_F(ResponsesUsageFactoryTest,
 
 TEST_F(ResponsesUsageFactoryTest,
        RejectsUnaccountableConfigurationsAndReleases) {
-  for (int32_t variant = 0; variant < 8; ++variant) {
+  for (int32_t variant = 0; variant < 6; ++variant) {
     SCOPED_TRACE(variant);
     RequestParams params;
     params.responses_usage = true;
     params.responses_reasoning_parser = "qwen3";
     options_ = Options{};
     options_.enable_schedule_overlap(false).num_speculative_tokens(0);
-    args_.linear_conv_kernel_dim(0).compress_ratios({});
     tokenizer_.dedicated_markers = true;
     switch (variant) {
       case 0:
@@ -443,12 +404,6 @@ TEST_F(ResponsesUsageFactoryTest,
         options_.host_blocks_factor(2.0);
         break;
       case 5:
-        args_.linear_conv_kernel_dim(4);
-        break;
-      case 6:
-        args_.compress_ratios({1, 4, 128});
-        break;
-      case 7:
         params.n = 2;
         break;
     }

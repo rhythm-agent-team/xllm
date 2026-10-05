@@ -189,7 +189,6 @@ Sequence::Sequence(const Sequence& other, size_t index)
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
-      cache_write_ranges_(other.cache_write_ranges_),
       block_hashes_by_stride_(other.block_hashes_by_stride_),
       hash_block_size_(other.hash_block_size_),
       linear_state_hashes_(other.linear_state_hashes_),
@@ -531,33 +530,6 @@ size_t Sequence::num_reasoning_tokens() const {
       continue;
     }
     count += in_reasoning ? 1 : 0;
-  }
-  return count;
-}
-
-void Sequence::record_cache_write_block(size_t begin, size_t block_size) {
-  if (!sequence_params_.responses_usage || begin >= num_prompt_tokens_) {
-    return;
-  }
-  size_t end = begin + std::min(block_size, num_prompt_tokens_ - begin);
-  auto first = cache_write_ranges_.begin();
-  while (first != cache_write_ranges_.end() && first->second < begin) {
-    ++first;
-  }
-  auto last = first;
-  while (last != cache_write_ranges_.end() && last->first <= end) {
-    begin = std::min(begin, last->first);
-    end = std::max(end, last->second);
-    ++last;
-  }
-  first = cache_write_ranges_.erase(first, last);
-  cache_write_ranges_.emplace(first, begin, end);
-}
-
-size_t Sequence::num_cache_write_tokens() const {
-  size_t count = 0;
-  for (const auto& [begin, end] : cache_write_ranges_) {
-    count += end - begin;
   }
   return count;
 }

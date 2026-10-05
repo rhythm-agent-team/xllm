@@ -94,7 +94,6 @@ struct SequenceParams {
   // whether the request is streaming
   bool streaming = false;
 
-  bool responses_usage = false;
   bool force_reasoning = false;
   std::optional<ReasoningTokenMetadata> reasoning_token_metadata;
 
@@ -210,9 +209,6 @@ class Sequence {
   Slice<int32_t> tokens() const { return {tokens_, num_tokens_}; }
 
   size_t num_reasoning_tokens() const;
-  size_t num_cache_write_tokens() const;
-  bool responses_usage() const { return sequence_params_.responses_usage; }
-  void record_cache_write_block(size_t begin, size_t block_size);
   // get tokens in kv cache
   Slice<int32_t> cached_tokens() const {
     return {tokens_, kv_state_.kv_cache_tokens_num()};
@@ -643,9 +639,6 @@ class Sequence {
 
   // the length of the prompt tokens
   size_t num_prompt_tokens_ = 0;
-
-  // Prompt intervals published by this sequence, retained across preemption.
-  std::vector<std::pair<size_t, size_t>> cache_write_ranges_;
 
   // Precomputed chained block hashes covering all full blocks of `tokens_`,
   // keyed by block-size stride. DSV4 admission probes multiple strides (base /

@@ -62,7 +62,6 @@ void Request::create_sequences_group() {
   sequence_params.n = state_.n;
   sequence_params.best_of = state_.best_of;
   sequence_params.streaming = state_.stream;
-  sequence_params.responses_usage = state_.responses_usage;
   sequence_params.force_reasoning = state_.force_reasoning;
   sequence_params.reasoning_token_metadata = state_.reasoning_token_metadata;
   sequence_params.enable_schedule_overlap = state_.enable_schedule_overlap;
@@ -215,13 +214,9 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
     CHECK_EQ(sequences().size(), 1u);
     const Sequence& sequence = *sequences().front();
     const size_t reasoning_tokens = sequence.num_reasoning_tokens();
-    const size_t cache_write_tokens = sequence.num_cache_write_tokens();
     CHECK_LE(reasoning_tokens,
              static_cast<size_t>(std::numeric_limits<int32_t>::max()));
-    CHECK_LE(cache_write_tokens,
-             static_cast<size_t>(std::numeric_limits<int32_t>::max()));
     usage.num_reasoning_tokens = static_cast<int32_t>(reasoning_tokens);
-    usage.num_cache_write_tokens = static_cast<int32_t>(cache_write_tokens);
   }
   usage.num_total_tokens = usage.num_prompt_tokens + usage.num_generated_tokens;
 

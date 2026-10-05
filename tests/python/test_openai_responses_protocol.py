@@ -190,7 +190,7 @@ def _assert_usage(usage: dict[str, Any]) -> None:
     for field in ("cached_tokens", "cache_write_tokens"):
         _nonnegative_integer(details[field])
     assert details["cached_tokens"] <= usage["input_tokens"]
-    assert details["cache_write_tokens"] <= usage["input_tokens"]
+    assert details["cache_write_tokens"] == 0
     reasoning_tokens = usage["output_tokens_details"]["reasoning_tokens"]
     _nonnegative_integer(reasoning_tokens)
     assert reasoning_tokens <= usage["output_tokens"]

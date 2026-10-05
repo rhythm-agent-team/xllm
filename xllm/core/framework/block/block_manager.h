@@ -132,8 +132,7 @@ class BlockManager {
                      std::vector<Block>& blocks,
                      size_t existed_shared_blocks_num = 0,
                      const MMData& mm_data = MMData(),
-                     const Slice<XXH3Key>& block_hashes = {},
-                     std::vector<size_t>* inserted_blocks = nullptr) = 0;
+                     const Slice<XXH3Key>& block_hashes = {}) = 0;
   virtual void cache(const std::vector<Block>& blocks) = 0;
 
   virtual size_t num_blocks_in_prefix_cache() const = 0;

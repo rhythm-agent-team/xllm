@@ -107,8 +107,7 @@ class LinearStateBlockManager final : public BlockManagerImpl {
              std::vector<Block>& blocks,
              size_t existed_shared_blocks_num = 0,
              const MMData& mm_data = MMData(),
-             const Slice<XXH3Key>& block_hashes = {},
-             std::vector<size_t>* inserted_blocks = nullptr) override;
+             const Slice<XXH3Key>& block_hashes = {}) override;
   // The pre-hashed cache(const std::vector<Block>&) primitive is reused
   // verbatim for checkpoint insertion, so keep the base version instead of a
   // bespoke one.

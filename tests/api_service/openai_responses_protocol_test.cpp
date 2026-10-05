@@ -90,7 +90,6 @@ RequestOutput fixture_chunk(std::string text,
     usage.num_generated_tokens = 5;
     usage.num_total_tokens = 14;
     usage.num_cached_tokens = 3;
-    usage.num_cache_write_tokens = 2;
     usage.num_reasoning_tokens = reasoning ? 1 : 0;
     result.usage = usage;
   }
@@ -493,7 +492,7 @@ class OpenAIResponsesProtocolTest : public testing::Test {
     EXPECT_EQ(final["usage"]["output_tokens"], 5);
     EXPECT_EQ(final["usage"]["total_tokens"], 14);
     EXPECT_EQ(final["usage"]["input_tokens_details"],
-              (Json{{"cached_tokens", 3}, {"cache_write_tokens", 2}}));
+              (Json{{"cached_tokens", 3}, {"cache_write_tokens", 0}}));
     EXPECT_EQ(final["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
     EXPECT_EQ(final["store"], false);
     EXPECT_FALSE(final.contains("choices"));

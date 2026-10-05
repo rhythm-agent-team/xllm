@@ -323,13 +323,6 @@ bool LLMRequestFactory::configure_responses_usage(
         "Responses usage is not supported with distributed request "
         "routing or host KV-cache storage");
   }
-  if (options_->enable_prefix_cache() &&
-      (model_args_->linear_conv_kernel_dim() > 0 ||
-       !model_args_->compress_ratios().empty())) {
-    return reject(
-        "Responses cache-write accounting requires a flat KV prefix "
-        "cache; linear and compressed prefix caches are unsupported");
-  }
   req_state.responses_usage = true;
   if (sp.responses_reasoning_parser.empty()) {
     return true;

@@ -165,10 +165,10 @@ print(answer.output_text)
 
 - `input_tokens`、`output_tokens`、`total_tokens`：生成路径的实际计数。
 - `input_tokens_details.cached_tokens`：实际复用前缀缓存的提示词位置数的高水位。
-- `input_tokens_details.cache_write_tokens`：缓存拥有者在插入未命中时实际发布的唯一逻辑提示词位置数，不是遍历的缓存命中数，也不是推测出来的托管 API 计费值。
+- `input_tokens_details.cache_write_tokens`：固定为 `0`，与 SGLang 的 Responses 序列化行为一致。本接口不单独报告缓存写入用量；该值不是实际写入计数，也不表示内部没有发生缓存写入。
 - `output_tokens_details.reasoning_tokens`：按照渲染后提示词的初始推理状态统计、位于推理区间内的实际保留生成 token ID，不含分隔符；不是对输出文本重新分词。
 
-命中数与写入数不必构成输入 token 的互斥划分：淘汰和重新发布可使两者之和大于 `input_tokens`。普通 flat-KV 前缀缓存、禁用缓存和受支持的 MTP 路径使用所属路径的计数。Responses 明确拒绝计数尚不支持的配置，包括分离式/分布式服务、外部 KV 存储、host offload，以及开启前缀缓存的 linear 或压缩缓存布局；不会悄悄关闭缓存或用零填补缺失计数。
+缓存命中输入由 `cached_tokens` 表示，未命中输入可由 `input_tokens - cached_tokens` 得到；内部缓存发布不作为单独的用量类别报告。固定的缓存写入字段值不会改变缓存行为。Responses 仍拒绝分离式/分布式服务、外部 KV 存储和 host offload，因为这些配置尚未支持所需的 reasoning 或缓存命中计数。
 
 ## 支持的请求范围
 

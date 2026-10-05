@@ -189,17 +189,12 @@ void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                              std::vector<Block>& blocks,
                              size_t existed_shared_blocks_num,
                              const MMData& mm_data,
-                             const Slice<XXH3Key>& block_hashes,
-                             std::vector<size_t>* inserted_blocks) {
+                             const Slice<XXH3Key>& block_hashes) {
   if (options_.enable_prefix_cache()) {
     AUTO_COUNTER(prefix_cache_latency_seconds_insert);
     // Add the kv cache to the prefix cache
-    prefix_cache_->insert(token_ids,
-                          blocks,
-                          existed_shared_blocks_num,
-                          mm_data,
-                          block_hashes,
-                          inserted_blocks);
+    prefix_cache_->insert(
+        token_ids, blocks, existed_shared_blocks_num, mm_data, block_hashes);
   }
 }
 

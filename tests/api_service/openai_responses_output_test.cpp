@@ -44,7 +44,6 @@ Usage token_usage() {
   usage.num_generated_tokens = 5;
   usage.num_total_tokens = 14;
   usage.num_cached_tokens = 3;
-  usage.num_cache_write_tokens = 2;
   usage.num_reasoning_tokens = 1;
   return usage;
 }
@@ -127,7 +126,7 @@ TEST(OpenAIResponsesOutputTest, TextStreamAndFinalSnapshotAgree) {
   EXPECT_GE(output.snapshot()["completed_at"].get<int64_t>(),
             output.snapshot()["created_at"].get<int64_t>());
   EXPECT_EQ(output.snapshot()["usage"]["input_tokens_details"],
-            (nlohmann::json{{"cached_tokens", 3}, {"cache_write_tokens", 2}}));
+            (nlohmann::json{{"cached_tokens", 3}, {"cache_write_tokens", 0}}));
   EXPECT_EQ(
       output.snapshot()["usage"]["output_tokens_details"]["reasoning_tokens"],
       1);
@@ -374,14 +373,13 @@ TEST(OpenAIResponsesOutputTest, LiteralPartialMarkerAtEofIsNotDiscarded) {
   EXPECT_EQ(output.snapshot()["output"][0]["content"][0]["text"], "literal<");
 }
 
-TEST(OpenAIResponsesOutputTest, CacheReadAndWriteCountersAreIndependent) {
+TEST(OpenAIResponsesOutputTest, CacheWriteUsageIsZeroWithCachedInput) {
   ResponsesOutput output(initial_response(), false, {}, "", "", false, {});
-  auto complete = chunk("text", true);
+  auto complete = chunk("text", /*finished=*/true);
   complete.usage->num_cached_tokens = 8;
-  complete.usage->num_cache_write_tokens = 7;
   ASSERT_TRUE(output.append(complete));
   EXPECT_EQ(output.snapshot()["usage"]["input_tokens_details"],
-            (nlohmann::json{{"cached_tokens", 8}, {"cache_write_tokens", 7}}));
+            (nlohmann::json{{"cached_tokens", 8}, {"cache_write_tokens", 0}}));
 }
 
 TEST(OpenAIResponsesOutputTest, MalformedGlmXmlIsNotConvertedToEmptyArguments) {
