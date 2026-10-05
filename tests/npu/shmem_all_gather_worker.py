@@ -18,8 +18,9 @@ TileLang and native SHMEM Ascend C use CPU FileStore coordination and official
 SHMEM TCP/MTE bootstrap, without an HCCL process group or MPI. The hccl_aiv
 backend uses a ProcessGroup only to prepare HCCL/MC2 resources; its AllGather
 payload executes in the custom AIV kernel. Its test entry permits eager numerical
-checks and basic PE2 normal graphs; capture alone is not a numerical pass.
-Retained graphs, profiling, stress and skew remain unsupported. --mc2-probe-stage
+checks, basic PE2 normal graphs and a bounded two-live-graph PE2 entry.
+Capture alone is not a numerical pass; profiling, eager stress and skew remain
+unsupported. --mc2-probe-stage
 explicitly selects resource, first-barrier or final-zero diagnostics, not
 AllGather qualification.
 Matched profiling may select the existing current-stream native HCCL AllGather
@@ -1000,12 +1001,23 @@ def _run_batch(
     store: dist.Store,
     result: dict[str, Any],
     result_path: Path,
-    receive: torch.Tensor,
-    controls: torch.Tensor,
-    epochs: torch.Tensor,
+    receive: torch.Tensor | None,
+    controls: torch.Tensor | None,
+    epochs: torch.Tensor | None,
+    hccl_comm_name: str | None = None,
 ) -> None:
+    global _active_graph
+
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
+    uses_shmem = args.backend in ("shmem", "ascendc")
+    if uses_shmem and (receive is None or controls is None or epochs is None):
+        raise RuntimeError("SHMEM retained AllGather requires its initialized symmetric buffers")
+    if args.backend == "hccl_aiv":
+        if not hccl_comm_name:
+            raise RuntimeError("MC2 retained AllGather requires the initialized HCCL communicator name")
+        if _active_prepared is not None or _active_graph is not None:
+            raise RuntimeError("Previous MC2 prepared/graph resources were not successfully released")
     kernels = {}
     if args.backend == "shmem":
         _save(result_path, result, "batch/compile")
@@ -1019,14 +1031,20 @@ def _run_batch(
 
     _save(result_path, result, "batch/prepare")
     calls = []
-    round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
+    graphs = []
+    stream = torch.npu.current_stream()
+    if args.backend == "hccl_aiv":
+        _active_graph = {"stream": stream, "graphs": graphs, "calls": calls}
+    round_elements = args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
+    if uses_shmem:
+        round_elements *= args.lanes
     batch_counts = args.counts * args.repeats
     retained_counts = batch_counts + ([] if args.alternate_count is None else [args.alternate_count])
     for call_id, count in enumerate(retained_counts):
         source_storage, source, source_guard = _guarded(count, dtype, device)
         output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
         consumer_storage, consumer, consumer_guard = _guarded(args.world_size * count, dtype, device)
-        scratch = _prepare_scratch(args, device)
+        scratch = _prepare_scratch(args, device) if uses_shmem else None
         local = _payload(args.rank, count, call_id, dtype)
         expected = torch.cat([_payload(peer, count, call_id, dtype) for peer in range(args.world_size)])
         source.copy_(local)
@@ -1054,17 +1072,22 @@ def _run_batch(
                 "expected": expected,
             }
         )
+        if args.backend == "hccl_aiv":
+            calls[-1]["prepared"] = torch.classes.hccl_aiv_ops.PreparedAllGather(
+                source, output, hccl_comm_name, args.world_size, args.chunk_bytes
+            )
     groups = [calls[: len(batch_counts)]]
     if args.alternate_count is not None:
         groups.append(calls[len(batch_counts) :])
     group_rounds = [sum(call["rounds"] for call in group) for group in groups]
     torch.npu.synchronize()
-    starting_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
-    assert torch.all((starting_epochs == 0) | (starting_epochs == 1)), "Invalid device epoch"
+    starting_epochs = None
+    if uses_shmem:
+        starting_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        assert torch.all((starting_epochs == 0) | (starting_epochs == 1)), "Invalid device epoch"
     result["batch"] = {
         "counts": batch_counts,
         "rounds": [call["rounds"] for call in groups[0]],
-        "starting_epochs": starting_epochs.tolist(),
         "total_rounds": group_rounds[0],
         "checked_calls": [],
         "graph_groups": [[call["count"] for call in group] for group in groups],
@@ -1074,6 +1097,10 @@ def _run_batch(
         "graph_replays": [],
         "graphs_reset": False,
     }
+    if uses_shmem:
+        result["batch"]["starting_epochs"] = starting_epochs.tolist()
+    else:
+        result["batch"]["prepared_closed"] = False
     _rendezvous(store, args.rank, args.world_size, "batch/prepared")
 
     def _submit(group: list[dict[str, Any]]) -> None:
@@ -1089,6 +1116,8 @@ def _run_batch(
                     call["scratch"]["tensor"],
                     args.rank,
                 )
+            elif args.backend == "hccl_aiv":
+                call["prepared"].run()
             else:
                 _gather_ascendc(
                     args, call["source"], call["output"], receive, controls, epochs, call["scratch"]["tensor"]
@@ -1101,15 +1130,20 @@ def _run_batch(
             if executed:
                 torch.testing.assert_close(call["output"].cpu(), call["expected"], rtol=0, atol=0)
                 torch.testing.assert_close(call["consumer"].cpu(), call["expected"] + 1, rtol=0, atol=0)
-                _check_scratch(call["scratch"])
+                if uses_shmem:
+                    _check_scratch(call["scratch"])
             else:
                 assert torch.all(torch.isnan(call["output"].cpu())), "Inactive graph output poison changed"
                 assert torch.all(torch.isnan(call["consumer"].cpu())), "Inactive graph consumer poison changed"
-                torch.testing.assert_close(call["scratch"]["tensor"].cpu(), call["scratch"]["initial"], rtol=0, atol=0)
+                if uses_shmem:
+                    torch.testing.assert_close(
+                        call["scratch"]["tensor"].cpu(), call["scratch"]["initial"], rtol=0, atol=0
+                    )
             _check_guards(call["source_storage"], call["count"], call["source_guard"])
             _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
             _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
-            _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
+            if uses_shmem:
+                _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
 
     def _prepare(group: list[dict[str, Any]], iteration: int) -> None:
         for call in group:
@@ -1121,21 +1155,22 @@ def _run_batch(
             call["source"].copy_(call["local"])
             call["output"].fill_(float("nan"))
             call["consumer"].fill_(float("nan"))
-            call["scratch"]["tensor"].copy_(call["scratch"]["initial"])
+            if uses_shmem:
+                call["scratch"]["tensor"].copy_(call["scratch"]["initial"])
 
-    def _check_group(group_id: int, previous: torch.Tensor, phase: str) -> dict[str, Any]:
+    def _check_group(group_id: int, previous: torch.Tensor | None, phase: str) -> dict[str, Any]:
         torch.npu.synchronize()
         _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
         _check_outputs(groups[group_id])
-        expected_epochs = (previous + group_rounds[group_id]) % 2
-        _check_state(controls, epochs, expected_epochs, args.lanes, args.world_size)
-        observed_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].tolist()
         record = {
             "group": group_id,
-            "starting_epochs": previous.tolist(),
-            "ending_epochs": observed_epochs,
             "checked_calls": [call["call_id"] for call in groups[group_id]],
         }
+        if uses_shmem:
+            expected_epochs = (previous + group_rounds[group_id]) % 2
+            _check_state(controls, epochs, expected_epochs, args.lanes, args.world_size)
+            record["starting_epochs"] = previous.tolist()
+            record["ending_epochs"] = epochs.cpu().view(args.lanes, 32)[:, 0].tolist()
         _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
         return record
 
@@ -1151,7 +1186,7 @@ def _run_batch(
         for group_id, group in enumerate(groups):
             phase = f"batch/warmup-{iteration}/group-{group_id}"
             _save(result_path, result, phase)
-            previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+            previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone() if uses_shmem else None
             _prepare(group, iteration)
             torch.npu.synchronize()
             _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
@@ -1160,14 +1195,13 @@ def _run_batch(
             checked["iteration"] = iteration
             result["batch"]["graph_warmups"].append(checked)
 
-    graphs = []
-    capture_stream = torch.npu.Stream()
+    capture_stream = stream if args.backend == "hccl_aiv" else torch.npu.Stream()
     for group_id, group in enumerate(groups):
         phase = f"batch/capture/group-{group_id}"
         _save(result_path, result, phase)
         _prepare(group, -3)
         torch.npu.synchronize()
-        before_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+        before_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone() if uses_shmem else None
         _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
         graph = torch.npu.NPUGraph()
         graphs.append(graph)
@@ -1176,30 +1210,32 @@ def _run_batch(
         torch.npu.synchronize()
         # Capture may or may not execute; only observed replay prestate is used.
         _rendezvous(store, args.rank, args.world_size, f"{phase}/captured")
-        after_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
-        assert torch.equal(after_capture, before_capture) or torch.equal(
-            after_capture, (before_capture + group_rounds[group_id]) % 2
-        ), "Invalid capture epoch transition"
-        _check_state(controls, epochs, after_capture, args.lanes, args.world_size)
+        capture = {"group": group_id}
+        if uses_shmem:
+            after_capture = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+            assert torch.equal(after_capture, before_capture) or torch.equal(
+                after_capture, (before_capture + group_rounds[group_id]) % 2
+            ), "Invalid capture epoch transition"
+            _check_state(controls, epochs, after_capture, args.lanes, args.world_size)
+            capture.update({"starting_epochs": before_capture.tolist(), "ending_epochs": after_capture.tolist()})
         for call in calls:
             torch.testing.assert_close(call["source"].cpu(), call["local"], rtol=0, atol=0)
-            source_band = call["scratch"]["elements"] // 2
-            torch.testing.assert_close(
-                call["scratch"]["tensor"][:source_band].cpu(),
-                call["scratch"]["initial"][:source_band],
-                rtol=0,
-                atol=0,
-            )
+            if uses_shmem:
+                source_band = call["scratch"]["elements"] // 2
+                torch.testing.assert_close(
+                    call["scratch"]["tensor"][:source_band].cpu(),
+                    call["scratch"]["initial"][:source_band],
+                    rtol=0,
+                    atol=0,
+                )
+                _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
             _check_guards(call["source_storage"], call["count"], call["source_guard"])
             _check_guards(call["output_storage"], args.world_size * call["count"], call["output_guard"])
             _check_guards(call["consumer_storage"], args.world_size * call["count"], call["consumer_guard"])
-            _check_guards(call["scratch"]["storage"], call["scratch"]["elements"], call["scratch"]["guard"])
-        result["batch"]["graph_captures"].append(
-            {"group": group_id, "starting_epochs": before_capture.tolist(), "ending_epochs": after_capture.tolist()}
-        )
+        result["batch"]["graph_captures"].append(capture)
         _rendezvous(store, args.rank, args.world_size, f"{phase}/observed")
 
-    last_ending = after_capture.tolist()
+    last_ending = after_capture.tolist() if uses_shmem else None
     for group in groups:
         _prepare(group, -4)
     torch.npu.synchronize()
@@ -1211,9 +1247,11 @@ def _run_batch(
         for group_id, group in enumerate(groups):
             phase = f"batch/replay-{iteration}/group-{group_id}"
             _save(result_path, result, phase)
-            previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
-            assert previous.tolist() == last_ending, "Protocol state changed between checked operations"
-            assert torch.all((previous == 0) | (previous == 1)), "Invalid replay prestate"
+            previous = None
+            if uses_shmem:
+                previous = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
+                assert previous.tolist() == last_ending, "Protocol state changed between checked operations"
+                assert torch.all((previous == 0) | (previous == 1)), "Invalid replay prestate"
             _prepare(group, iteration)
             torch.npu.synchronize()
             _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
@@ -1226,17 +1264,19 @@ def _run_batch(
             checked["checked_inactive_groups"] = inactive_groups
             checked["iteration"] = iteration
             result["batch"]["graph_replays"].append(checked)
-            last_ending = checked["ending_epochs"]
+            if uses_shmem:
+                last_ending = checked["ending_epochs"]
             retained_groups.add(group_id)
             _rendezvous(store, args.rank, args.world_size, f"{phase}/retained-checked")
 
-    for group_id in range(len(groups)):
-        starts = {
-            tuple(record["starting_epochs"])
-            for record in result["batch"]["graph_replays"]
-            if record["group"] == group_id
-        }
-        assert starts == {(0,) * args.lanes, (1,) * args.lanes}, "Live graphs did not exercise both epoch parities"
+    if uses_shmem:
+        for group_id in range(len(groups)):
+            starts = {
+                tuple(record["starting_epochs"])
+                for record in result["batch"]["graph_replays"]
+                if record["group"] == group_id
+            }
+            assert starts == {(0,) * args.lanes, (1,) * args.lanes}, "Live graphs did not exercise both epoch parities"
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "batch/graphs-drained")
     for graph in graphs:
@@ -1244,7 +1284,14 @@ def _run_batch(
     graphs.clear()
     _rendezvous(store, args.rank, args.world_size, "batch/graphs-reset")
     result["batch"]["graphs_reset"] = True
-    result["batch"]["final_epochs"] = last_ending
+    if uses_shmem:
+        result["batch"]["final_epochs"] = last_ending
+    else:
+        _save(result_path, result, "batch/close")
+        for call in calls:
+            call["prepared"].close()
+        result["batch"]["prepared_closed"] = True
+        _active_graph = None
     result["batch"]["checked_calls"] = list(range(len(batch_counts)))
     _save(result_path, result, "batch/checked")
 
@@ -1390,8 +1437,11 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
         torch.npu.Stream() if args.backend == "hccl_aiv" and args.mode == "graph" else torch.npu.current_stream()
     )
     with torch.npu.stream(run_stream):
-        for count in args.counts:
-            _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group, hccl_comm_name)
+        if args.stress_batch:
+            _run_batch(args, store, result, result_path, None, None, None, hccl_comm_name)
+        else:
+            for count in args.counts:
+                _run_case(args, store, result, result_path, count, None, None, None, comm, prefix_group, hccl_comm_name)
     _save(result_path, result, "close/drain")
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, "drained")
@@ -1470,17 +1520,28 @@ def _main() -> None:
     if args.backend == "hccl_aiv":
         if args.mode == "graph" and (args.world_size != 2 or args.mc2_probe_stage is not None):
             parser.error("hccl_aiv graph mode requires PE2 normal AllGather without diagnostics")
+        if args.stress_batch and (
+            args.mode != "graph"
+            or args.world_size != 2
+            or args.mc2_probe_stage is not None
+            or len(args.counts) != 1
+            or args.repeats != 1
+            or args.alternate_count is None
+            or args.alternate_count == args.counts[0]
+            or not 0 < args.world_size * args.alternate_count <= (1 << 31) - 1
+        ):
+            parser.error(
+                "hccl_aiv retained graphs require normal PE2 graph, one primary count, "
+                "repeats=1 and distinct alternate count"
+            )
         if (
-            args.stress_batch
-            or args.skew_phase != "none"
+            args.skew_phase != "none"
             or args.skew_iterations != 0
-            or args.graph_replays is not None
-            or args.alternate_count is not None
             or args.profile_samples
             or args.profile_submission is not None
             or args.profile_graph_warmup is not None
         ):
-            parser.error("hccl_aiv supports numerical checks without stress/skew/retained graphs/profiling")
+            parser.error("hccl_aiv supports numerical checks without skew/profiling")
         if args.world_size not in (2, 8, 16):
             parser.error("hccl_aiv requires 2/8/16 ranks")
         if args.lanes is not None or args.heap_bytes is not None:
@@ -1576,7 +1637,7 @@ def _main() -> None:
             args.graph_replays = 16
         if args.graph_replays < 2:
             parser.error("Retained graphs require at least two replay rounds")
-        if args.alternate_count is not None and args.alternate_count not in args.counts:
+        if args.backend != "hccl_aiv" and args.alternate_count is not None and args.alternate_count not in args.counts:
             parser.error("Alternate count must belong to --counts")
     if (args.skew_phase == "none" and args.skew_iterations != 0) or (
         args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
@@ -1595,7 +1656,7 @@ def _main() -> None:
         not 0 < args.world_size * count <= (1 << 31) - 1 for count in args.counts
     ):
         parser.error("Require distinct positive counts with world-size * count <= INT32_MAX")
-    if retained_graph:
+    if retained_graph and args.backend in ("shmem", "ascendc"):
         round_elements = args.lanes * args.chunk_bytes // (4 if args.dtype == "float32" else 2)
         total_rounds = sum((count + round_elements - 1) // round_elements for count in args.counts) * args.repeats
         if args.alternate_count is not None:
