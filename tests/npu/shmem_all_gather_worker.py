@@ -327,6 +327,11 @@ def _run_case(
                 "cpu_snapshots": [],
                 "events": [],
             }
+            observation_level = prepared.observation_level()
+            if observation_level not in ("dense", "lean"):
+                raise RuntimeError(f"Invalid MC2 final-zero observation level: {observation_level!r}")
+            if observation_level == "lean" and args.mc2_delay_iterations != 0:
+                raise RuntimeError("MC2 final-zero lean observation requires delay_iterations=0")
             observer = torch.npu.Stream()
             _active_diagnostic["observer"] = observer
             cpu_snapshots = _active_diagnostic["cpu_snapshots"]
@@ -429,6 +434,7 @@ def _run_case(
         probe: dict[str, Any] = {
             "stage": "final-zero",
             "delay_iterations": args.mc2_delay_iterations,
+            "observation_level": observation_level,
             "actual": [],
             "verified": False,
             "pair_completed": False,
@@ -444,6 +450,8 @@ def _run_case(
         }
         case["mc2_probe"] = probe
         seen: dict[int, dict[str, Any]] = {}
+        poll_samples = (1, 1024, 65536) if observation_level == "dense" else (65536, 262144, 1048576)
+        poll_slots = {first + sample: (first, sample) for first in (5, 8, 14, 17) for sample in range(3)}
 
         def _observe_final_zero_snapshot(buffer: torch.Tensor, pair_pending: bool | None) -> None:
             actual = buffer.tolist()
@@ -480,6 +488,26 @@ def _run_case(
                 if (record[1], record[2], record[3]) != (call, (args.rank << 32) | block, slot):
                     failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
                     break
+                if observation_level == "lean" and slot not in poll_slots:
+                    failure = f"Invalid MC2 final-zero lean checkpoint at record {record_index}: {record}"
+                    break
+                if slot in poll_slots:
+                    first, sample = poll_slots[slot]
+                    role, peer, expected = {
+                        5: (block < args.world_size and block != args.rank, block, 1),
+                        8: (block >= args.world_size, block - args.world_size, 0),
+                        14: (block == args.rank, args.rank, args.world_size),
+                        17: (block == args.rank, args.rank, args.world_size),
+                    }[first]
+                    if (
+                        not role
+                        or record[4] != peer
+                        or record[5] != expected
+                        or not -(1 << 31) <= record[6] < (1 << 31)
+                        or record[7] != poll_samples[sample]
+                    ):
+                        failure = f"Invalid MC2 final-zero {observation_level} poll at record {record_index}: {record}"
+                        break
                 entry.update(
                     {
                         "qualified_snapshot_index": snapshot_index,
@@ -610,26 +638,27 @@ def _run_case(
             2
         ] * probe_block_count:
             raise RuntimeError(f"MC2 final-zero block counters are not two: {probe['actual'][:probe_counter_words]}")
-        required = [
-            (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
-            for call in range(1, probe_call_count + 1)
-            for block in range(probe_block_count)
-            for slot in (0, 1, 11, 12, 13, *range(21, probe_records_per_block))
-        ]
-        required.extend(
-            (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
-            for call in range(1, probe_call_count + 1)
-            for slot in (14, 17)
-        )
-        required.extend(
-            (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
-            for call in range(1, probe_call_count + 1)
-            for block in range(args.world_size, probe_block_count)
-        )
-        if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required):
-            raise RuntimeError(
-                "MC2 final-zero pair has incomplete common, self-sender V2/ACK or output ACK_SENT records"
+        if observation_level == "dense":
+            required = [
+                (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
+                for call in range(1, probe_call_count + 1)
+                for block in range(probe_block_count)
+                for slot in (0, 1, 11, 12, 13, *range(21, probe_records_per_block))
+            ]
+            required.extend(
+                (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
+                for call in range(1, probe_call_count + 1)
+                for slot in (14, 17)
             )
+            required.extend(
+                (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
+                for call in range(1, probe_call_count + 1)
+                for block in range(args.world_size, probe_block_count)
+            )
+            if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required):
+                raise RuntimeError(
+                    "MC2 final-zero pair has incomplete common, self-sender V2/ACK or output ACK_SENT records"
+                )
         probe["verified"] = True
         _save(result_path, result, f"count-{count}/close")
         prepared.close()
