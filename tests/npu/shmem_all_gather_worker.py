@@ -304,23 +304,41 @@ def _run_case(
         if args.mc2_probe_stage == "final-zero":
             if _active_diagnostic is not None:
                 raise RuntimeError("A previous MC2 diagnostic owner was not successfully released")
-            diagnostic_storage, diagnostic, diagnostic_guard = _guarded(800, torch.int64, device)
+            probe_block_count = 2 * args.world_size
+            probe_call_count = 2
+            probe_record_words = 8
+            probe_records_per_block = 37
+            probe_records_per_call = probe_block_count * probe_records_per_block
+            probe_record_count = probe_call_count * probe_records_per_call
+            probe_counter_words = probe_block_count * probe_record_words
+            probe_words = probe_counter_words + probe_record_count * probe_record_words
+            diagnostic_storage, diagnostic, diagnostic_guard = _guarded(probe_words, torch.int64, device)
             prepared = getattr(torch.classes.hccl_aiv_ops, name)(
                 source, output, diagnostic, hccl_comm_name, args.world_size, args.chunk_bytes, args.mc2_delay_iterations
             )
             _active_prepared = prepared
-            observer = torch.npu.Stream()
-            cpu_snapshots = [torch.empty(800, dtype=torch.int64, pin_memory=True) for _ in range(2)]
-            initialized = torch.npu.Event(enable_timing=False)
-            pair_done = torch.npu.Event(enable_timing=False)
-            copied = torch.npu.Event(enable_timing=False)
             _active_diagnostic = {
                 "storage": diagnostic_storage,
                 "diagnostic": diagnostic,
-                "observer": observer,
-                "cpu_snapshots": cpu_snapshots,
-                "events": (initialized, pair_done, copied),
+                "source_storage": source_storage,
+                "output_storage": output_storage,
+                "consumer_storage": consumer_storage,
+                "consumed": consumed,
+                "cpu_snapshots": [],
+                "events": [],
             }
+            observer = torch.npu.Stream()
+            _active_diagnostic["observer"] = observer
+            cpu_snapshots = _active_diagnostic["cpu_snapshots"]
+            for _ in range(2):
+                cpu_snapshots.append(torch.empty(probe_words, dtype=torch.int64, pin_memory=True))
+            events = _active_diagnostic["events"]
+            initialized = torch.npu.Event(enable_timing=False)
+            events.append(initialized)
+            pair_done = torch.npu.Event(enable_timing=False)
+            events.append(pair_done)
+            copied = torch.npu.Event(enable_timing=False)
+            events.append(copied)
         else:
             prepared = getattr(torch.classes.hccl_aiv_ops, name)(
                 source, output, hccl_comm_name, args.world_size, args.chunk_bytes
@@ -421,6 +439,8 @@ def _run_case(
             "event_pending": {"pair": None, "observer_copy": False},
             "observations": [],
             "observed_records": [],
+            "checked_preflight_iterations": [],
+            "pair_iteration": args.repeats if args.world_size == 16 else 0,
         }
         case["mc2_probe"] = probe
         seen: dict[int, dict[str, Any]] = {}
@@ -433,9 +453,9 @@ def _run_case(
             new_commits = []
             qualified = []
             failure = None
-            for record_index in range(96):
-                offset = 32 + record_index * 8
-                record = actual[offset : offset + 8]
+            for record_index in range(probe_record_count):
+                offset = probe_counter_words + record_index * probe_record_words
+                record = actual[offset : offset + probe_record_words]
                 entry = seen.get(record_index)
                 if record[0] == 0 and entry is None:
                     continue
@@ -454,9 +474,9 @@ def _run_case(
                         break
                     continue
                 # The body is accepted only from a completed copy AFTER seeing commit.
-                call = record_index // 48 + 1
-                block = (record_index % 48) // 12
-                slot = record_index % 12
+                call = record_index // probe_records_per_call + 1
+                block = (record_index % probe_records_per_call) // probe_records_per_block
+                slot = record_index % probe_records_per_block
                 if (record[1], record[2], record[3]) != (call, (args.rank << 32) | block, slot):
                     failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
                     break
@@ -491,9 +511,22 @@ def _run_case(
             if failure is not None:
                 raise RuntimeError(failure)
 
-        local = _prepare(0)
-        diagnostic.zero_()
-        initialized.record(stream)
+        if args.world_size == 16:
+            for iteration in (-2, -1, 0, 1):
+                _save(result_path, result, f"{phase}/preflight-{iteration}")
+                with torch.npu.stream(stream):
+                    local = _prepare(iteration)
+                    diagnostic.zero_()
+                    _submit()
+                _check(iteration, local, None)
+                _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
+                probe["checked_preflight_iterations"].append(iteration)
+                _save(result_path, result, f"{phase}/preflight-{iteration}/checked")
+
+        with torch.npu.stream(stream):
+            local = _prepare(probe["pair_iteration"])
+            diagnostic.zero_()
+            initialized.record(stream)
         torch.npu.synchronize()
         observer.wait_event(initialized)
         deadline = time.monotonic() + 90
@@ -571,15 +604,32 @@ def _run_case(
         _save(result_path, result, f"{phase}/observed")
         observer.synchronize()
         stream.synchronize()
-        _check_outputs(0, local, None)
-        _check_guards(diagnostic_storage, 800, diagnostic_guard)
-        if [probe["actual"][block * 8] for block in range(4)] != [2] * 4:
-            raise RuntimeError(f"MC2 final-zero block counters are not two: {probe['actual'][:32]}")
+        _check_outputs(probe["pair_iteration"], local, None)
+        _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
+        if [probe["actual"][block * probe_record_words] for block in range(probe_block_count)] != [
+            2
+        ] * probe_block_count:
+            raise RuntimeError(f"MC2 final-zero block counters are not two: {probe['actual'][:probe_counter_words]}")
         required = [
-            ((call - 1) * 4 + block) * 12 + slot for call in (1, 2) for block in range(4) for slot in (0, 1, 11)
+            (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
+            for call in range(1, probe_call_count + 1)
+            for block in range(probe_block_count)
+            for slot in (0, 1, 11, 12, 13, *range(21, probe_records_per_block))
         ]
+        required.extend(
+            (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
+            for call in range(1, probe_call_count + 1)
+            for slot in (14, 17)
+        )
+        required.extend(
+            (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
+            for call in range(1, probe_call_count + 1)
+            for block in range(args.world_size, probe_block_count)
+        )
         if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required):
-            raise RuntimeError("MC2 final-zero pair has incomplete ENTRY/FINAL_RESET_VISIBLE/EXIT records")
+            raise RuntimeError(
+                "MC2 final-zero pair has incomplete common, self-sender V2/ACK or output ACK_SENT records"
+            )
         probe["verified"] = True
         _save(result_path, result, f"count-{count}/close")
         prepared.close()
@@ -1509,14 +1559,28 @@ def _main() -> None:
             parser.error("final-zero requires mc2-delay-iterations in 0..100000000")
     elif args.mc2_delay_iterations is not None:
         parser.error("mc2-delay-iterations requires the final-zero diagnostic")
-    if args.mc2_probe_stage is not None and (
-        args.world_size != 2
-        or args.dtype != "float16"
-        or args.counts != [64]
-        or args.repeats != 1
-        or args.chunk_bytes != 128
-    ):
-        parser.error("mc2-probe-stage requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128")
+    if args.mc2_probe_stage is not None:
+        pe2_control = (
+            args.world_size == 2
+            and args.dtype == "float16"
+            and args.counts == [64]
+            and args.repeats == 1
+            and args.chunk_bytes == 128
+        )
+        pe16_control = (
+            args.mc2_probe_stage == "final-zero"
+            and args.world_size == 16
+            and args.dtype == "bfloat16"
+            and args.counts == [1]
+            and args.repeats == 2
+            and args.chunk_bytes == 65536
+            and args.mc2_delay_iterations == 0
+        )
+        if not pe2_control and not pe16_control:
+            parser.error(
+                "mc2-probe-stage requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128; "
+                "only final-zero also permits PE16 BF16, counts=[1], repeats=2, chunk-bytes=65536 and delay=0"
+            )
     if args.backend == "hccl_aiv":
         if args.mode == "graph" and (args.world_size != 2 or args.mc2_probe_stage is not None):
             parser.error("hccl_aiv graph mode requires PE2 normal AllGather without diagnostics")
