@@ -19,7 +19,6 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/config/service_config.h"
 #include "core/util/scope_guard.h"
-#include "function_call/function_call_parser.h"
 #include "parser/detector_registry.h"
 #include "parser/reasoning_parser.h"
 
@@ -55,16 +54,16 @@ Status validate_capabilities(const LLMMaster& master,
       return Status(StatusCode::INVALID_ARGUMENT,
                     "Function tools require a configured model tool parser");
     }
-    auto [parser_status, resolved] =
-        function_call::FunctionCallParser::resolve_parser(
-            configured, model_type, /*strict_errors=*/true);
-    if (!parser_status.ok() || resolved.empty()) {
+    if (configured != "qwen25" && configured != "qwen3_coder" &&
+        configured != "glm45" && configured != "glm47" &&
+        configured != "glm5") {
       *error_param = "tools";
       return Status(StatusCode::INVALID_ARGUMENT,
-                    "The selected model does not support function tools: " +
-                        parser_status.message());
+                    "The selected model does not support Responses function "
+                    "tools with parser: " +
+                        configured);
     }
-    *tool_parser = std::move(resolved);
+    *tool_parser = configured;
   }
   if (request->params.response_format == ResponseFormatType::JSON_OBJECT &&
       !ServiceConfig::get_instance().enable_json_object_output()) {

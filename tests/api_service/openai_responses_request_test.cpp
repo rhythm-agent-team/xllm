@@ -60,7 +60,7 @@ TEST(OpenAIResponsesRequestTest, DefaultsUseLoadedModelAndStatelessProfile) {
   EXPECT_EQ(request.params.max_tokens, 5120U);
   EXPECT_FLOAT_EQ(request.params.temperature, 1.0f);
   EXPECT_FLOAT_EQ(request.params.top_p, 1.0f);
-  EXPECT_TRUE(request.params.responses_usage);
+  EXPECT_TRUE(request.params.responses_request);
   EXPECT_TRUE(request.params.request_id.starts_with("resp_"));
   EXPECT_EQ(request.params.tool_choice, "auto");
   EXPECT_EQ(request.params.response_format, ResponseFormatType::NONE);

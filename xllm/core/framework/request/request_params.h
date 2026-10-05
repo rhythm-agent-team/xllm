@@ -106,8 +106,8 @@ struct RequestParams {
 
   bool streaming = false;
 
-  // Responses requires token-aligned reasoning and prompt-cache accounting.
-  bool responses_usage = false;
+  // Responses propagates the rendered prompt's initial reasoning state.
+  bool responses_request = false;
   std::string responses_reasoning_parser;
 
   // number of tokens to generate. truncated to model's max context length.

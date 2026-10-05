@@ -44,7 +44,6 @@ Usage token_usage() {
   usage.num_generated_tokens = 5;
   usage.num_total_tokens = 14;
   usage.num_cached_tokens = 3;
-  usage.num_reasoning_tokens = 1;
   return usage;
 }
 
@@ -127,9 +126,10 @@ TEST(OpenAIResponsesOutputTest, TextStreamAndFinalSnapshotAgree) {
             output.snapshot()["created_at"].get<int64_t>());
   EXPECT_EQ(output.snapshot()["usage"]["input_tokens_details"],
             (nlohmann::json{{"cached_tokens", 3}, {"cache_write_tokens", 0}}));
-  EXPECT_EQ(
-      output.snapshot()["usage"]["output_tokens_details"]["reasoning_tokens"],
-      1);
+  const auto& reasoning_tokens =
+      output.snapshot()["usage"]["output_tokens_details"]["reasoning_tokens"];
+  EXPECT_TRUE(reasoning_tokens.is_number_integer());
+  EXPECT_EQ(reasoning_tokens, 0);
   EXPECT_FALSE(output.append(chunk("late", /*finished=*/true)));
   EXPECT_FALSE(output.fail(StatusCode::UNKNOWN, "late"));
   EXPECT_EQ(events.size(), expected.size());
@@ -267,6 +267,10 @@ TEST(OpenAIResponsesOutputTest, RawReasoningRemainsSeparateFromTextAndSummary) {
   EXPECT_EQ(deltas(events, "response.reasoning_text.delta"), "why");
   EXPECT_EQ(deltas(events, "response.output_text.delta"), "answer");
   EXPECT_EQ(output.snapshot()["output"][1]["content"][0]["text"], "answer");
+  const auto& reasoning_tokens =
+      output.snapshot()["usage"]["output_tokens_details"]["reasoning_tokens"];
+  EXPECT_TRUE(reasoning_tokens.is_number_integer());
+  EXPECT_EQ(reasoning_tokens, 0);
 }
 
 TEST(OpenAIResponsesOutputTest, ActualTemplateMetadataForcesInitialReasoning) {
@@ -350,24 +354,8 @@ TEST(OpenAIResponsesOutputTest,
             (nlohmann::json{{"city", "Paris"}}));
 }
 
-TEST(OpenAIResponsesOutputTest, CompletedMalformedOrUndeclaredToolFails) {
-  for (const std::string text :
-       {"<tool_call>\n{\"name\":\"missing\",\"arguments\":{}}\n</tool_call>",
-        "<tool_call>\n{\"name\":\"weather\",\"arguments\":42}\n</tool_call>",
-        "<tool_call>\n{broken}\n</tool_call>",
-        "<tool_call>\n{\"name\":\"weather\"}\n</tool_call>",
-        "<tool_call>\n{\"name\":\"weather\",\"arguments\":"}) {
-    ResponsesOutput output(
-        initial_response(), false, weather_tool(), "qwen25", "", false, {});
-    EXPECT_FALSE(output.append(chunk(text, true))) << text;
-    EXPECT_EQ(output.snapshot()["status"], "failed");
-    EXPECT_FALSE(output.status().ok());
-  }
-}
-
 TEST(OpenAIResponsesOutputTest, LiteralPartialMarkerAtEofIsNotDiscarded) {
-  ResponsesOutput output(
-      initial_response(), false, weather_tool(), "qwen25", "qwen3", false, {});
+  ResponsesOutput output(initial_response(), false, {}, "", "qwen3", false, {});
   ASSERT_TRUE(output.append(chunk("literal<", true)))
       << output.status().message();
   EXPECT_EQ(output.snapshot()["output"][0]["content"][0]["text"], "literal<");
@@ -382,224 +370,13 @@ TEST(OpenAIResponsesOutputTest, CacheWriteUsageIsZeroWithCachedInput) {
             (nlohmann::json{{"cached_tokens", 8}, {"cache_write_tokens", 0}}));
 }
 
-TEST(OpenAIResponsesOutputTest, MalformedGlmXmlIsNotConvertedToEmptyArguments) {
-  for (const std::string text :
-       {"<tool_call>weather<arg_key>city</arg_key></tool_call>",
-        "<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</tool_call>",
-        "<tool_call>weather<arg_key>city</arg_key><arg_key>city</"
-        "arg_key><arg_value>Paris</arg_value></tool_call>",
-        "<tool_call>weather</tool_call><tool_call>weather<arg"}) {
-    ResponsesOutput output(
-        initial_response(), false, weather_tool(), "glm47", "", false, {});
-    EXPECT_FALSE(output.append(chunk(text, true))) << text;
-    EXPECT_EQ(output.snapshot()["status"], "failed");
-    EXPECT_FALSE(output.status().ok());
-  }
-}
-
-TEST(OpenAIResponsesOutputTest, StrictToolFormatsAgreeAtEveryChunkBoundary) {
-  const std::vector<std::string> formats = {
-      "qwen25", "qwen3_coder", "glm45", "glm47", "glm5"};
-  for (const auto& format : formats) {
-    const std::string first =
-        format == "qwen25" ? "<tool_call>\n{\"name\":\"weather\",\"arguments\":"
-                             "{\"city\":\"  Paris  \"}}\n</tool_call>"
-        : format == "qwen3_coder"
-            ? "<tool_call><function=weather><parameter=city>  Paris  "
-              "</parameter></function></tool_call>"
-            : "<tool_call>weather\n<arg_key>city</arg_key> \t\n<arg_value>  "
-              "Paris  </arg_value> \n</tool_call>";
-    const std::string second =
-        format == "qwen25" ? "<tool_call>\n{\"name\":\"weather\",\"arguments\":"
-                             "{\"city\":\"北京\"}}\n</tool_call>"
-        : format == "qwen3_coder"
-            ? "<tool_call><function=weather><parameter=city>北京</parameter></"
-              "function></tool_call>"
-            : "<tool_call>weather<arg_key>city</arg_key><arg_value>\"北京\"</"
-              "arg_value></tool_call>";
-    const std::string text =
-        "before " + first + " between " + second + " after<";
-    function_call::FunctionCallParser full(weather_tool(),
-                                           format,
-                                           /*strict_errors=*/true);
-    const auto [normal, calls] = full.parse_non_stream(text);
-    ASSERT_TRUE(full.error_status().ok()) << format;
-    EXPECT_EQ(normal, "before  between  after<") << format;
-    ASSERT_EQ(calls.size(), 2) << format;
-    EXPECT_EQ(nlohmann::json::parse(calls[0].parameters),
-              (nlohmann::json{{"city", "  Paris  "}}));
-    EXPECT_EQ(nlohmann::json::parse(calls[1].parameters),
-              (nlohmann::json{{"city", "北京"}}));
-    for (const bool stream : {false, true}) {
-      for (size_t split = 0; split <= text.size(); ++split) {
-        SCOPED_TRACE(format + ":" + std::to_string(split) + ":" +
-                     std::to_string(stream));
-        std::vector<nlohmann::json> events;
-        ResponsesOutput output(initial_response(),
-                               stream,
-                               weather_tool(),
-                               format,
-                               "",
-                               false,
-                               [&events](const nlohmann::json& event) {
-                                 events.emplace_back(event);
-                                 return true;
-                               });
-        ASSERT_TRUE(output.append(chunk(text.substr(0, split))))
-            << output.status().message();
-        ASSERT_TRUE(output.append(chunk(text.substr(split), true)))
-            << output.status().message();
-        std::vector<nlohmann::json> arguments;
-        arguments.reserve(calls.size());
-        for (const auto& item : output.snapshot()["output"]) {
-          if (item["type"] != "function_call") {
-            EXPECT_EQ(item["content"][0]["text"], normal);
-            continue;
-          }
-          EXPECT_EQ(item["name"], "weather");
-          arguments.emplace_back(
-              nlohmann::json::parse(item["arguments"].get<std::string>()));
-        }
-        ASSERT_EQ(arguments.size(), calls.size());
-        for (size_t index = 0; index < calls.size(); ++index) {
-          EXPECT_EQ(arguments[index],
-                    nlohmann::json::parse(calls[index].parameters));
-        }
-        if (stream) {
-          EXPECT_EQ(deltas(events, "response.output_text.delta"), normal);
-          EXPECT_EQ(events.back()["type"], "response.completed");
-          for (size_t index = 0; index < events.size(); ++index) {
-            EXPECT_EQ(events[index]["sequence_number"], index);
-          }
-        }
-      }
-    }
-  }
-}
-
-TEST(OpenAIResponsesOutputTest, StrictGlmValueConversionIsChunkIndependent) {
-  for (const std::string format : {"glm45", "glm47", "glm5"}) {
-    for (const bool declared : {false, true}) {
-      const auto tools = declared ? weather_tool() : [&] {
-        auto result = weather_tool();
-        result[0].function.parameters = {{"type", "object"}};
-        return result;
-      }();
-      for (const std::string value : {"  Paris  ",
-                                      "\"  Paris  \"",
-                                      "123",
-                                      "true",
-                                      "{\"key\":1}",
-                                      "\"123\""}) {
-        const auto parsed = nlohmann::json::parse(value,
-                                                  nullptr,
-                                                  /*allow_exceptions=*/false);
-        const auto expected = declared && !parsed.is_string()
-                                  ? nlohmann::json(value)
-                              : parsed.is_discarded() ? nlohmann::json(value)
-                                                      : parsed;
-        const std::string text =
-            "<tool_call>weather<arg_key>city</arg_key><arg_value>" + value +
-            "</arg_value> \n</tool_call>";
-        for (const bool stream : {false, true}) {
-          for (size_t split = 0; split <= text.size(); ++split) {
-            SCOPED_TRACE(format + ":" + value + ":" + std::to_string(split));
-            ResponsesOutput output(initial_response(),
-                                   stream,
-                                   tools,
-                                   format,
-                                   "",
-                                   false,
-                                   [](const nlohmann::json&) { return true; });
-            ASSERT_TRUE(output.append(chunk(text.substr(0, split))));
-            ASSERT_TRUE(output.append(chunk(text.substr(split), true)))
-                << output.status().message();
-            ASSERT_EQ(output.snapshot()["output"].size(), 1);
-            EXPECT_EQ(nlohmann::json::parse(
-                          output.snapshot()["output"][0]["arguments"]
-                              .get<std::string>())["city"],
-                      expected);
-          }
-        }
-      }
-    }
-  }
-}
-
-TEST(OpenAIResponsesOutputTest,
-     StrictToolTerminatorAndMalformedTailFailBothModes) {
-  const std::vector<std::pair<std::string, std::string>> cases = {
-      {"qwen25", "<tool_call>{\"name\":\"weather\",\"arguments\":{}}"},
-      {"qwen25",
-       "<tool_call>{\"name\":\"weather\",\"arguments\":{}}</"
-       "tool_call><tool_call>{"},
-      {"qwen3_coder", "<tool_call><function=weather></function>"},
-      {"qwen3_coder", "<tool_call><function=weather></tool_call>"},
-      {"qwen3_coder",
-       "<tool_call><function=weather><parameter=city>Paris</function></"
-       "tool_call>"},
-      {"qwen3_coder",
-       "<tool_call><function=weather></function>JUNK</tool_call>"},
-      {"glm45",
-       "<tool_call>weather\n</tool_call><tool_call>weather\n<arg_key>city"},
-      {"glm47",
-       "<tool_call>weather<arg_key>city</arg_key>JUNK<arg_value>Paris</"
-       "arg_value></tool_call>"},
-      {"glm47",
-       "<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</"
-       "arg_value>JUNK</tool_call>"},
-      {"glm5",
-       "<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</"
-       "arg_value>"}};
-  for (const auto& [format, text] : cases) {
-    for (const bool stream : {false, true}) {
-      for (const size_t split : {size_t{0}, text.size() / 2, text.size()}) {
-        SCOPED_TRACE(format + ":" + text + ":" + std::to_string(split));
-        std::vector<nlohmann::json> events;
-        ResponsesOutput output(initial_response(),
-                               stream,
-                               weather_tool(),
-                               format,
-                               "",
-                               false,
-                               [&events](const nlohmann::json& event) {
-                                 events.emplace_back(event);
-                                 return true;
-                               });
-        if (output.append(chunk(text.substr(0, split)))) {
-          EXPECT_FALSE(output.append(chunk(text.substr(split), true)));
-        }
-        EXPECT_FALSE(output.status().ok());
-        EXPECT_EQ(output.snapshot()["status"], "failed");
-        if (stream) {
-          ASSERT_FALSE(events.empty());
-          EXPECT_EQ(events.back()["type"], "response.failed");
-        }
-      }
-    }
-  }
-}
-
-TEST(OpenAIResponsesOutputTest, StrictCapabilityDoesNotChangeLegacyResolution) {
+TEST(OpenAIResponsesOutputTest, LegacyToolParserBehaviorIsUnchanged) {
   for (const std::string parser :
        {"kimi_k2", "deepseekv3", "deepseekv32", "deepseekv4"}) {
-    const auto [legacy, name] =
-        function_call::FunctionCallParser::resolve_parser(
-            parser, "", /*strict_errors=*/false);
-    EXPECT_TRUE(legacy.ok());
-    EXPECT_EQ(name, parser);
-    const auto [strict, unsupported] =
-        function_call::FunctionCallParser::resolve_parser(
-            parser, "", /*strict_errors=*/true);
-    EXPECT_EQ(strict.code(), StatusCode::INVALID_ARGUMENT);
-    EXPECT_TRUE(unsupported.empty());
+    EXPECT_EQ(function_call::FunctionCallParser::get_parser_auto(parser, ""),
+              parser);
   }
-  EXPECT_FALSE(function_call::FunctionCallParser::resolve_parser(
-                   "auto", "deepseek_v32", /*strict_errors=*/true)
-                   .first.ok());
-  EXPECT_EQ(function_call::FunctionCallParser::resolve_parser(
-                "qwen35", "", /*strict_errors=*/true)
-                .second,
+  EXPECT_EQ(function_call::FunctionCallParser::get_parser_auto("qwen35", ""),
             "qwen3_coder");
   function_call::FunctionCallParser legacy(weather_tool(), "glm47");
   const auto [text, calls] = legacy.parse_non_stream(

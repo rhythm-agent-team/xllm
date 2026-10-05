@@ -52,8 +52,6 @@ class Qwen25Detector : public BaseFormatDetector {
   StreamingParseResult parse_streaming_increment(
       const std::string& new_text,
       const std::vector<JsonTool>& tools) override;
-
-  StreamingParseResult finish_stream() override;
 };
 
 }  // namespace function_call

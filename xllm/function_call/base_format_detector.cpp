@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "function_call/base_format_detector.h"
+#include "base_format_detector.h"
 
 #include <algorithm>
 #include <iostream>
@@ -63,10 +63,6 @@ std::vector<ToolCallItem> BaseFormatDetector::parse_base_json(
     if (!act.is_object()) {
       LOG(ERROR) << "Invalid tool call item, expected object, got: "
                  << act.type_name();
-      if (strict_errors_) {
-        error_status_ = Status(StatusCode::UNKNOWN,
-                               "Model generated a non-object function call.");
-      }
       continue;
     }
 
@@ -75,21 +71,11 @@ std::vector<ToolCallItem> BaseFormatDetector::parse_base_json(
       name = act["name"].get<std::string>();
     } else {
       LOG(ERROR) << "Invalid tool call: missing 'name' field or invalid type";
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated a function call without a name.");
-      }
       continue;
     }
 
     if (tool_indices.find(name) == tool_indices.end()) {
       LOG(ERROR) << "Model attempted to call undefined function: " << name;
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated an undefined function: " + name);
-      }
       continue;
     }
 
@@ -101,41 +87,21 @@ std::vector<ToolCallItem> BaseFormatDetector::parse_base_json(
       parameters = act["arguments"];
     } else {
       LOG(ERROR) << "No parameters or arguments field found for tool: " << name;
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated a function without arguments: " + name);
-        continue;
-      }
     }
 
     if (!parameters.is_object()) {
       LOG(ERROR) << "Invalid arguments type for tool: " << name
                  << ", expected object, got: " << parameters.type_name();
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated non-object arguments for: " + name);
-        continue;
-      }
       parameters = nlohmann::json::object();
     }
 
     std::string parameters_str;
     try {
       parameters_str = parameters.dump(
-          -1,
-          ' ',
-          false,
-          strict_errors_ ? nlohmann::json::error_handler_t::strict
-                         : nlohmann::json::error_handler_t::ignore);
+          -1, ' ', false, nlohmann::json::error_handler_t::ignore);
     } catch (const std::exception& e) {
       LOG(ERROR) << "Failed to serialize arguments for tool: " << name
                  << ", error: " << e.what();
-      if (strict_errors_) {
-        error_status_ = Status(StatusCode::UNKNOWN, e.what());
-        continue;
-      }
       parameters_str = "{}";
     }
 
@@ -184,15 +150,6 @@ StreamingParseResult BaseFormatDetector::parse_streaming_increment(
   // Append new text to buffer
   buffer_ += new_text;
   std::string current_text = buffer_;
-  const size_t marker_position = current_text.find(bot_token_);
-  if (strict_errors_ && marker_position != std::string::npos &&
-      marker_position > 0) {
-    std::string normal_prefix = current_text.substr(0, marker_position);
-    buffer_.erase(0, marker_position);
-    auto result = parse_streaming_increment("", tools);
-    result.normal_text.insert(0, normal_prefix);
-    return result;
-  }
 
   // The current_text has tool_call if it is the start of a new tool call
   // sequence or it is the start of a new tool call after a tool call separator,
@@ -200,15 +157,7 @@ StreamingParseResult BaseFormatDetector::parse_streaming_increment(
   if (!(has_tool_call(current_text) ||
         (current_tool_id_ > 0 &&
          current_text.find(tool_call_separator_) == 0))) {
-    const int32_t partial_token = ends_with_partial_token(buffer_, bot_token_);
-    if (strict_errors_ && partial_token > 0 &&
-        static_cast<size_t>(partial_token) < buffer_.size()) {
-      std::string normal_text =
-          buffer_.substr(0, buffer_.size() - partial_token);
-      buffer_.erase(0, buffer_.size() - partial_token);
-      return StreamingParseResult(std::move(normal_text), {});
-    }
-    if (partial_token == 0) {
+    if (ends_with_partial_token(buffer_, bot_token_) == 0) {
       std::string normal_text = buffer_;
       buffer_.clear();
 
@@ -256,11 +205,6 @@ StreamingParseResult BaseFormatDetector::parse_streaming_increment(
     if (obj.contains("name") && obj["name"].is_string()) {
       std::string tool_name = obj["name"].get<std::string>();
       if (tool_indices_.find(tool_name) == tool_indices_.end()) {
-        if (strict_errors_) {
-          error_status_ =
-              Status(StatusCode::UNKNOWN,
-                     "Model generated an undefined function: " + tool_name);
-        }
         buffer_.clear();
         current_tool_id_ = -1;
         current_tool_name_sent_ = false;
@@ -401,74 +345,6 @@ StreamingParseResult BaseFormatDetector::parse_streaming_increment(
   } catch (const std::exception& e) {
     return StreamingParseResult();
   }
-}
-
-StreamingParseResult BaseFormatDetector::parse_streaming_framed(
-    const std::string& new_text,
-    const std::vector<JsonTool>& tools,
-    const std::string& begin_token,
-    const std::string& end_token) {
-  buffer_ += new_text;
-  StreamingParseResult result;
-  while (!buffer_.empty() && error_status_.ok()) {
-    const size_t begin = buffer_.find(begin_token);
-    if (begin == std::string::npos) {
-      size_t retained = 0;
-      const size_t limit = std::min(buffer_.size(), begin_token.size() - 1);
-      for (size_t length = limit; length > 0; --length) {
-        if (buffer_.compare(
-                buffer_.size() - length, length, begin_token, 0, length) == 0) {
-          retained = length;
-          break;
-        }
-      }
-      result.normal_text += buffer_.substr(0, buffer_.size() - retained);
-      buffer_.erase(0, buffer_.size() - retained);
-      break;
-    }
-    result.normal_text += buffer_.substr(0, begin);
-    buffer_.erase(0, begin);
-    const size_t end = buffer_.find(end_token, begin_token.size());
-    if (end == std::string::npos) {
-      framed_call_pending_ = true;
-      break;
-    }
-    framed_call_pending_ = false;
-    const size_t consumed = end + end_token.size();
-    auto parsed = detect_and_parse(buffer_.substr(0, consumed), tools);
-    if (!error_status_.ok()) {
-      return {};
-    }
-    if (!parsed.normal_text.empty() || parsed.calls.empty()) {
-      error_status_ = Status(StatusCode::UNKNOWN,
-                             "Model generated an unparsable function call.");
-      return {};
-    }
-    for (auto& call : parsed.calls) {
-      call.tool_index = ++current_tool_id_;
-      result.calls.emplace_back(std::move(call));
-    }
-    buffer_.erase(0, consumed);
-  }
-  return result;
-}
-
-StreamingParseResult BaseFormatDetector::finish_stream() {
-  // A complete tool marker must not be exposed as ordinary text at EOF.
-  if (framed_call_pending_ || has_tool_call(buffer_)) {
-    return {};
-  }
-  std::string text = std::move(buffer_);
-  buffer_.clear();
-  if (strict_errors_) {
-    return StreamingParseResult(std::move(text));
-  }
-  size_t position = 0;
-  while (!eot_token_.empty() &&
-         (position = text.find(eot_token_, position)) != std::string::npos) {
-    text.erase(position, eot_token_.size());
-  }
-  return StreamingParseResult(std::move(text));
 }
 
 }  // namespace function_call

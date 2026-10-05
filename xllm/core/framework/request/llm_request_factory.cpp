@@ -302,7 +302,7 @@ bool LLMRequestFactory::apply_json_object_grammar(
   return true;
 }
 
-bool LLMRequestFactory::configure_responses_usage(
+bool LLMRequestFactory::configure_responses_reasoning(
     RequestState& req_state,
     const RequestParams& sp,
     const OutputCallback& callback) {
@@ -314,16 +314,16 @@ bool LLMRequestFactory::configure_responses_usage(
     return false;
   };
   if (sp.n != 1 || sp.best_of.value_or(1) != 1 || sp.beam_width != 0) {
-    return reject("Responses usage requires one generation sequence");
+    return reject("Responses requires one generation sequence");
   }
   if (options_->enable_disagg_pd() || options_->enable_service_routing() ||
       options_->enable_kvcache_store() ||
       options_->host_blocks_factor() > 1.0) {
     return reject(
-        "Responses usage is not supported with distributed request "
-        "routing or host KV-cache storage");
+        "Responses is not supported with distributed request routing "
+        "or host KV-cache storage");
   }
-  req_state.responses_usage = true;
+  req_state.responses_request = true;
   if (sp.responses_reasoning_parser.empty()) {
     return true;
   }
@@ -335,24 +335,6 @@ bool LLMRequestFactory::configure_responses_usage(
   auto detector = registry.get_detector(sp.responses_reasoning_parser,
                                         /*stream_reasoning=*/true,
                                         /*force_reasoning=*/false);
-  auto marker_token = [&](const std::string& marker) -> std::optional<int32_t> {
-    std::vector<int32_t> ids;
-    if (!tokenizer_->encode(marker, &ids, /*add_special_tokens=*/false) ||
-        ids.size() != 1 || ids.front() < 0 ||
-        ids.front() >= model_args_->vocab_size() ||
-        tokenizer_->decode(ids, /*skip_special_tokens=*/false) != marker) {
-      return std::nullopt;
-    }
-    return ids.front();
-  };
-  const auto start_token = marker_token(detector->start_marker());
-  const auto end_token = marker_token(detector->end_marker());
-  if (!start_token.has_value() || !end_token.has_value() ||
-      start_token == end_token) {
-    return reject(
-        "Responses reasoning usage requires lossless dedicated "
-        "tokenizer tokens for the selected parser delimiters");
-  }
   std::string_view prompt = req_state.prompt;
   while (!prompt.empty() && std::string_view(" \t\n\r").find(prompt.back()) !=
                                 std::string_view::npos) {
@@ -364,8 +346,6 @@ bool LLMRequestFactory::configure_responses_usage(
   } else if (prompt.ends_with(detector->end_marker())) {
     req_state.force_reasoning = false;
   }
-  req_state.reasoning_token_metadata =
-      ReasoningTokenMetadata{start_token.value(), end_token.value()};
   return true;
 }
 
@@ -463,8 +443,8 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                          sp.decode_address,
                          call);
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
-  if (sp.responses_usage &&
-      !configure_responses_usage(req_state, sp, callback)) {
+  if (sp.responses_request &&
+      !configure_responses_reasoning(req_state, sp, callback)) {
     return nullptr;
   }
   if (json_object &&

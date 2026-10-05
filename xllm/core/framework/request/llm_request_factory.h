@@ -120,9 +120,9 @@ class LLMRequestFactory final {
       std::optional<ChatTemplateGenerationMode> generation_mode,
       const OutputCallback& callback);
 
-  bool configure_responses_usage(RequestState& req_state,
-                                 const RequestParams& sp,
-                                 const OutputCallback& callback);
+  bool configure_responses_reasoning(RequestState& req_state,
+                                     const RequestParams& sp,
+                                     const OutputCallback& callback);
 
   std::shared_ptr<const JsonObjectGrammar> get_json_object_grammar(
       bool reasoning_enabled,

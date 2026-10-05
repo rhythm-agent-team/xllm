@@ -20,7 +20,7 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
-#include "function_call/base_format_detector.h"
+#include "base_format_detector.h"
 
 namespace xllm {
 namespace function_call {
@@ -29,7 +29,7 @@ class Qwen3CoderDetector : public BaseFormatDetector {
  public:
   Qwen3CoderDetector();
 
-  ~Qwen3CoderDetector() override = default;
+  virtual ~Qwen3CoderDetector() = default;
 
   bool has_tool_call(const std::string& text) override;
 
@@ -70,12 +70,12 @@ class Qwen3CoderDetector : public BaseFormatDetector {
   void parse_parameters(const std::string& params_text,
                         const std::string& func_name,
                         const std::vector<JsonTool>& tools,
-                        nlohmann::json* parsed_params);
+                        nlohmann::json* parsed_params) const;
 
   void parse_tool_call_content(const std::string& tool_content,
                                const std::vector<JsonTool>& tools,
                                int32_t* tool_idx,
-                               std::vector<ToolCallItem>* calls);
+                               std::vector<ToolCallItem>* calls) const;
 };
 
 }  // namespace function_call

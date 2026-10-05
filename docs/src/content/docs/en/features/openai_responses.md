@@ -103,7 +103,7 @@ There is no Chat-style `[DONE]` sentinel. A disconnected client cannot receive a
 
 ## Client-side function tools
 
-Function tools use the **flat Responses form**, not Chat's nested `function` object. They require a supported tool parser configured for the selected model. This Responses profile supports `qwen25`, `qwen3_coder`, `glm45`, `glm47`, and `glm5`, including aliases resolving to those formats. Other formats are rejected before generation because their current parsers cannot guarantee malformed-output and EOF validation. This parser validation is distinct from strict JSON Schema enforcement, which is unsupported. xLLM emits calls; **the client supplies results**, and no function is executed by the server.
+Function tools use the **flat Responses form**, not Chat's nested `function` object. They require a supported tool parser configured for the selected model. This Responses profile supports `qwen25`, `qwen3_coder`, `glm45`, `glm47`, and `glm5`, including aliases resolving to those formats; other formats are rejected before generation. Responses reuses the existing model tool parsers, including their normalization and parsing limitations. The API validates returned call names, indexes, and completed argument JSON objects. It does not add full model-syntax or end-tag validation, arbitrary chunk-boundary consistency, or EOF validation to those parsers. These checks are distinct from strict JSON Schema enforcement, which is unsupported. xLLM emits calls; **the client supplies results**, and no function is executed by the server.
 
 ```python
 import json
@@ -151,7 +151,7 @@ answer = client.responses.create(
 print(answer.output_text)
 ```
 
-`auto` allows the model to choose text or one or more calls; it does not force a call. `none` disables new calls while preserving replayed history. Every historical call must have a matching `function_call_output`, identified by its unique `call_id`. Arguments must encode a JSON object; results may be text or `input_text` parts. Out-of-order results after the corresponding calls are allowed. Malformed arguments and unmatched or duplicated results are errors, not repaired values.
+`auto` allows the model to choose text or one or more calls; it does not force a call. `none` disables new calls while preserving replayed history. Every historical call must have a matching `function_call_output`, identified by its unique `call_id`. History arguments must encode a JSON object; results may be text or `input_text` parts. Out-of-order results after the corresponding calls are allowed. Malformed client-supplied history arguments and unmatched or duplicated results are request errors, not repaired values. Generated calls are subject to the existing model parser's behavior; the API checks the parsed result rather than reconstructing discarded model syntax.
 
 This profile uses non-strict function schemas: omitted or null `strict` normalizes to false, and `strict=true` is rejected. `tool_choice="required"`, named forced choices, and `parallel_tool_calls=false` are rejected because the current backend cannot enforce them. Omitted, null, or true `parallel_tool_calls` allows multiple calls. Built-in tools such as web search, code interpreter, file search, computer use, and MCP are unsupported.
 
@@ -166,9 +166,9 @@ Final usage contains:
 - `input_tokens`, `output_tokens`, and `total_tokens` from generation accounting.
 - `input_tokens_details.cached_tokens`: the high-water count of actual prompt positions reused from the prefix cache.
 - `input_tokens_details.cache_write_tokens`: always `0`, matching SGLang's Responses serialization. This profile does not separately report cache-write usage. The value is not an actual write count and does not mean that no internal cache writes occurred.
-- `output_tokens_details.reasoning_tokens`: actual retained generated token IDs inside reasoning spans, excluding delimiters, using the rendered prompt's initial reasoning state. This is not retokenized output text.
+- `output_tokens_details.reasoning_tokens`: always integer `0` for compatibility. This profile does not separately report reasoning-token usage. Zero does not mean that the model performed no reasoning or emitted no raw reasoning text; it does not alter actual output/total usage or the generation budget.
 
-Cache-hit input is reported by `cached_tokens`; uncached input can be derived as `input_tokens - cached_tokens`. Internal cache publication is not a separate reported usage category. The fixed cache-write value does not change caching behavior. Responses still rejects disaggregated/distributed serving paths, external KV storage, and host offload because the required reasoning or cache-hit accounting is not supported for those configurations.
+Cache-hit input is reported by `cached_tokens`; uncached input can be derived as `input_tokens - cached_tokens`. Internal cache publication is not a separate reported usage category. The fixed cache-write value does not change caching behavior. Responses still rejects disaggregated/distributed serving paths, external KV storage, and host offload. Their text-state propagation or cache-hit accounting is outside the supported profile; omitting separate reasoning-token accounting does not expand those capabilities.
 
 ## Supported request profile
 
@@ -224,7 +224,7 @@ The same module provides an HTTP-only client for an existing externally owned se
 ```bash
 python tests/python/test_openai_responses_protocol.py \
   --base-url http://127.0.0.1:9977/v1 --model loaded-model \
-  --limit-one --evidence-dir /path/to/fresh-results
+  --expect-reasoning --evidence-dir /path/to/fresh-results
 ```
 
-`--limit-one` requires the owning service runner to configure `max_concurrent_requests=1`; the client does not change service configuration or start another runner. `--fixture` selects deterministic brpc fixture prompts and requires all fixture cases, including reasoning, split UTF-8, failures, admission rejection, and disconnect recovery. Without that flag, requests go to the real model and function-call behavior must actually occur. Fixture and model evidence are recorded separately. These commands describe validation, not a claim that a particular model or environment has passed.
+For ordinary model validation, the owning runner configures `max_concurrent_requests=16` and the client sends requests serially, without `--fixture` or `--limit-one`. `--expect-reasoning` additionally requires genuine raw reasoning text. Admission/disconnect checks are separate: `--limit-one` requires the owning runner to configure `max_concurrent_requests=1`; the client does not change service configuration or start another runner. `--fixture` selects deterministic brpc fixture prompts and requires all fixture cases, including reasoning, split UTF-8, failures, admission rejection, and disconnect recovery. Without that flag, requests go to the real model and function-call behavior must actually occur. Fixture and model evidence are recorded separately. These commands describe validation, not a claim that a particular model or environment has passed.

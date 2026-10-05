@@ -549,7 +549,7 @@ std::pair<Status, ResponsesRequest> parse_responses_request(
   request.params.temperature = 1.0f;
   request.params.top_p = 1.0f;
   request.params.n = 1;
-  request.params.responses_usage = true;
+  request.params.responses_request = true;
   request.params.request_id = "resp_" + ShortUUID().random();
   for (auto [field, target, upper] :
        {std::tuple{"temperature", &request.params.temperature, 2.0},

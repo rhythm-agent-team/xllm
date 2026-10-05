@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "function_call/glm45_detector.h"
+#include "glm45_detector.h"
 
 #include <algorithm>
 #include <iostream>
@@ -22,7 +22,7 @@ limitations under the License.
 namespace xllm {
 namespace function_call {
 
-Glm45Detector::Glm45Detector() : Glm47Detector() {
+Glm45Detector::Glm45Detector() : BaseFormatDetector() {
   bot_token_ = "<tool_call>";
   eot_token_ = "</tool_call>";
 
@@ -57,9 +57,6 @@ bool Glm45Detector::has_tool_call(const std::string& text) {
 StreamingParseResult Glm45Detector::detect_and_parse(
     const std::string& text,
     const std::vector<JsonTool>& tools) {
-  if (strict_errors_) {
-    return Glm47Detector::detect_and_parse(text, tools);
-  }
   size_t idx = text.find(bot_token_);
   std::string normal_text =
       (idx != std::string::npos) ? text.substr(0, idx) : text;
@@ -137,9 +134,6 @@ StreamingParseResult Glm45Detector::detect_and_parse(
 StreamingParseResult Glm45Detector::parse_streaming_increment(
     const std::string& new_text,
     const std::vector<JsonTool>& tools) {
-  if (strict_errors_) {
-    return Glm47Detector::parse_streaming_increment(new_text, tools);
-  }
   buffer_ += new_text;
   std::string current_text = buffer_;
 

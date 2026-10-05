@@ -19,7 +19,7 @@ limitations under the License.
 #include <string>
 #include <string_view>
 
-#include "function_call/glm47_detector.h"
+#include "base_format_detector.h"
 
 namespace xllm {
 namespace function_call {
@@ -47,11 +47,11 @@ namespace function_call {
  * </tool_call>
  * ```
  */
-class Glm45Detector final : public Glm47Detector {
+class Glm45Detector : public BaseFormatDetector {
  public:
   Glm45Detector();
 
-  ~Glm45Detector() override = default;
+  virtual ~Glm45Detector() = default;
 
   bool has_tool_call(const std::string& text) override;
 

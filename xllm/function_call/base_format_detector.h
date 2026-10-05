@@ -24,8 +24,8 @@ limitations under the License.
 #include <vector>
 
 #include "chat.pb.h"
-#include "function_call/core_types.h"
-#include "function_call/utils.h"
+#include "core_types.h"
+#include "utils.h"
 
 namespace xllm {
 namespace function_call {
@@ -54,18 +54,11 @@ class BaseFormatDetector {
       const std::string& new_text,
       const std::vector<JsonTool>& tools);
 
-  virtual StreamingParseResult finish_stream();
-
   std::vector<std::unordered_map<std::string, std::string>> prev_tool_call_arr_;
 
   std::vector<std::string> streamed_args_for_tool_;
 
-  void set_strict_errors(bool strict_errors) { strict_errors_ = strict_errors; }
-  const Status& error_status() const { return error_status_; }
-
  protected:
-  bool strict_errors_ = false;
-  Status error_status_;
   std::string buffer_;
 
   int32_t current_tool_id_;
@@ -75,13 +68,6 @@ class BaseFormatDetector {
   std::string bot_token_;
   std::string eot_token_;
   std::string tool_call_separator_;
-  bool framed_call_pending_ = false;
-
-  StreamingParseResult parse_streaming_framed(
-      const std::string& new_text,
-      const std::vector<JsonTool>& tools,
-      const std::string& begin_token,
-      const std::string& end_token);
 
   int32_t ends_with_partial_token(const std::string& buffer,
                                   const std::string& bot_token) const;

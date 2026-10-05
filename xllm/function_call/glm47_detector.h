@@ -74,7 +74,7 @@ class Glm47Detector : public BaseFormatDetector {
       const std::string& content) const;
 
   std::vector<std::pair<std::string, std::string>> extract_argument_pairs(
-      const std::string& args_raw);
+      const std::string& args_raw) const;
 
   StreamState stream_state_;
   std::string current_key_;

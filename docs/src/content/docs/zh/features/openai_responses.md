@@ -103,7 +103,7 @@ with client.responses.stream(
 
 ## 客户端函数工具
 
-工具采用 **Responses 扁平格式**，不是 Chat 中嵌套的 `function` 对象。所选模型需要配置受支持的工具解析器。本版本支持 `qwen25`、`qwen3_coder`、`glm45`、`glm47`、`glm5` 及解析到这些格式的别名；其他格式在生成前拒绝，因为当前解析器不能保证畸形输出和 EOF 校验。解析器校验不等于严格 JSON Schema 约束，后者仍不支持。xLLM 只产生调用，**由客户端提供结果**，服务端不执行函数。
+工具采用 **Responses 扁平格式**，不是 Chat 中嵌套的 `function` 对象。所选模型需要配置受支持的工具解析器。本版本支持 `qwen25`、`qwen3_coder`、`glm45`、`glm47`、`glm5` 及解析到这些格式的别名；其他格式在生成前拒绝。Responses 复用已有模型工具解析器，包括其规范化行为和解析限制。API 校验解析器返回的调用名称、索引以及已完成调用参数是否为 JSON 对象；本次实现不为这些解析器新增完整模型语法、结束标签、任意分片一致性或 EOF 校验。这些检查不等于严格 JSON Schema 约束，后者仍不支持。xLLM 只产生调用，**由客户端提供结果**，服务端不执行函数。
 
 ```python
 import json
@@ -151,7 +151,7 @@ answer = client.responses.create(
 print(answer.output_text)
 ```
 
-`auto` 允许模型返回文本或一个/多个调用，但不强制产生调用。`none` 禁止新的调用，同时保留回放历史。每个历史函数调用都必须对应唯一 `call_id` 的 `function_call_output`。参数必须编码为 JSON 对象，结果可为文本或 `input_text` 数组。对应调用之后的多个结果允许交换顺序。畸形参数、缺失结果或重复结果会报错，不会被修补成默认值。
+`auto` 允许模型返回文本或一个/多个调用，但不强制产生调用。`none` 禁止新的调用，同时保留回放历史。每个历史函数调用都必须对应唯一 `call_id` 的 `function_call_output`。历史调用的参数必须编码为 JSON 对象，结果可为文本或 `input_text` 数组。对应调用之后的多个结果允许交换顺序。客户端提供的畸形历史参数、缺失结果或重复结果会作为请求错误报出，不会被修补成默认值。生成调用沿用已有模型解析器的行为；API 校验解析结果，不重新构造解析器已丢弃的模型语法。
 
 本接口只提供非严格函数 schema：省略或 null 的 `strict` 归一为 false，`strict=true` 报错。后端无法强制执行的 `tool_choice="required"`、按名称强制调用、`parallel_tool_calls=false` 均报错。省略、null 或 true 的 `parallel_tool_calls` 允许多个调用。内置 web search、code interpreter、file search、computer use、MCP 等工具不受支持。
 
@@ -166,9 +166,9 @@ print(answer.output_text)
 - `input_tokens`、`output_tokens`、`total_tokens`：生成路径的实际计数。
 - `input_tokens_details.cached_tokens`：实际复用前缀缓存的提示词位置数的高水位。
 - `input_tokens_details.cache_write_tokens`：固定为 `0`，与 SGLang 的 Responses 序列化行为一致。本接口不单独报告缓存写入用量；该值不是实际写入计数，也不表示内部没有发生缓存写入。
-- `output_tokens_details.reasoning_tokens`：按照渲染后提示词的初始推理状态统计、位于推理区间内的实际保留生成 token ID，不含分隔符；不是对输出文本重新分词。
+- `output_tokens_details.reasoning_tokens`：固定为整数 `0`，用于兼容。本接口不单独报告推理 token 用量；`0` 不表示模型没有实际推理或没有输出原始推理文本，也不会改变实际 output/total 用量或生成预算。
 
-缓存命中输入由 `cached_tokens` 表示，未命中输入可由 `input_tokens - cached_tokens` 得到；内部缓存发布不作为单独的用量类别报告。固定的缓存写入字段值不会改变缓存行为。Responses 仍拒绝分离式/分布式服务、外部 KV 存储和 host offload，因为这些配置尚未支持所需的 reasoning 或缓存命中计数。
+缓存命中输入由 `cached_tokens` 表示，未命中输入可由 `input_tokens - cached_tokens` 得到；内部缓存发布不作为单独的用量类别报告。固定的缓存写入字段值不会改变缓存行为。Responses 仍拒绝分离式/分布式服务、外部 KV 存储和 host offload。这些配置的文本状态传递或缓存命中计数不在受支持范围内；不单独报告推理 token 用量不会扩大这些能力。
 
 ## 支持的请求范围
 
@@ -224,7 +224,7 @@ python -m pytest tests/python/test_openai_responses_protocol.py
 ```bash
 python tests/python/test_openai_responses_protocol.py \
   --base-url http://127.0.0.1:9977/v1 --model loaded-model \
-  --limit-one --evidence-dir /path/to/fresh-results
+  --expect-reasoning --evidence-dir /path/to/fresh-results
 ```
 
-`--limit-one` 要求服务 runner 已将 `max_concurrent_requests` 配置为 1；客户端不会修改服务配置或另建 runner。`--fixture` 选择确定性的 brpc fixture 输入并要求执行全部 fixture 用例，包括推理、跨字节 UTF-8、失败、准入拒绝及断开后名额恢复。不使用该选项时请求由真实模型处理，函数调用必须实际产生。Fixture 和真实模型证据分开记录。上述命令是验证入口说明，不代表某个模型或环境已经通过测试。
+普通真实模型验证由服务 runner 配置 `max_concurrent_requests=16`，客户端串行请求，不使用 `--fixture` 或 `--limit-one`。`--expect-reasoning` 额外要求真实原始推理文本。准入/断开验证单独执行：`--limit-one` 要求服务 runner 已将 `max_concurrent_requests` 配置为 1；客户端不会修改服务配置或另建 runner。`--fixture` 选择确定性的 brpc fixture 输入并要求执行全部 fixture 用例，包括推理、跨字节 UTF-8、失败、准入拒绝及断开后名额恢复。不使用该选项时请求由真实模型处理，函数调用必须实际产生。Fixture 和真实模型证据分开记录。上述命令是验证入口说明，不代表某个模型或环境已经通过测试。

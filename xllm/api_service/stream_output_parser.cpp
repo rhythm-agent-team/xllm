@@ -22,21 +22,19 @@ StreamOutputParser::StreamOutputParser(
     const std::string& tool_call_parser_format,
     const std::string& reasoning_parser_format,
     bool force_reasoning,
-    bool strict_tool_errors,
     std::optional<bool> initial_reasoning,
     bool lossless_reasoning)
     : tools_(tools),
       tool_call_parser_format_(tool_call_parser_format),
       reasoning_parser_format_(reasoning_parser_format),
       force_reasoning_(force_reasoning),
-      strict_tool_errors_(strict_tool_errors),
       initial_reasoning_(initial_reasoning),
       lossless_reasoning_(lossless_reasoning) {
   sequence_parsers_.resize(1);
   if (is_tool_call()) {
     sequence_parsers_[0].tool_call_parser =
         std::make_unique<function_call::FunctionCallParser>(
-            tools_, tool_call_parser_format_, strict_tool_errors_);
+            tools_, tool_call_parser_format_);
   }
   if (is_reasoning()) {
     sequence_parsers_[0].reasoning_parser_ =
@@ -73,7 +71,7 @@ function_call::FunctionCallParser* StreamOutputParser::get_tool_call_parser(
   if (!sequence_parsers_[index].tool_call_parser) {
     sequence_parsers_[index].tool_call_parser =
         std::make_unique<function_call::FunctionCallParser>(
-            tools_, tool_call_parser_format_, strict_tool_errors_);
+            tools_, tool_call_parser_format_);
   }
 
   return sequence_parsers_[index].tool_call_parser.get();

@@ -504,36 +504,6 @@ size_t Sequence::num_valid_generated_tokens() const {
                                            : 0;
 }
 
-size_t Sequence::num_reasoning_tokens() const {
-  if (!sequence_params_.reasoning_token_metadata.has_value()) {
-    return 0;
-  }
-  const ReasoningTokenMetadata& markers =
-      sequence_params_.reasoning_token_metadata.value();
-  bool in_reasoning = sequence_params_.force_reasoning;
-  bool seen_start = false;
-  size_t count = 0;
-  const size_t end = num_valid_tokens();
-  for (size_t offset = num_prompt_tokens_; offset < end; ++offset) {
-    const int32_t token_id = tokens_[offset];
-    if (token_id < 0) {
-      continue;
-    }
-    if (!seen_start && token_id == markers.start_token_id) {
-      seen_start = true;
-      in_reasoning = true;
-      continue;
-    }
-    if (in_reasoning && token_id == markers.end_token_id) {
-      in_reasoning = false;
-      seen_start = true;
-      continue;
-    }
-    count += in_reasoning ? 1 : 0;
-  }
-  return count;
-}
-
 std::optional<SequenceOutput> Sequence::generate_streaming_output(
     size_t /*size*/,
     const Tokenizer& tokenizer) {

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "function_call/glm47_detector.h"
+#include "glm47_detector.h"
 
 #include <algorithm>
 #include <iostream>
@@ -121,15 +121,11 @@ std::vector<std::pair<size_t, size_t>> Glm47Detector::find_tool_call_ranges(
 
   while (search_pos < text.length()) {
     size_t start_pos = text.find(bot_token_, search_pos);
-    if (start_pos == std::string::npos) {
-      break;
-    }
+    if (start_pos == std::string::npos) break;
 
     size_t content_start = start_pos + bot_len;
     size_t end_pos = text.find(eot_token_, content_start);
-    if (end_pos == std::string::npos) {
-      break;
-    }
+    if (end_pos == std::string::npos) break;
 
     ranges.emplace_back(content_start, end_pos);
     search_pos = end_pos + eot_len;
@@ -141,7 +137,7 @@ std::string Glm47Detector::extract_normal_text(
     const std::string& text,
     const std::vector<std::pair<size_t, size_t>>& ranges) const {
   if (ranges.empty()) {
-    return strict_errors_ ? text : trim_whitespace(text);
+    return trim_whitespace(text);
   }
 
   std::string normal_text;
@@ -166,7 +162,7 @@ std::string Glm47Detector::extract_normal_text(
     }
   }
 
-  return strict_errors_ ? normal_text : trim_whitespace(normal_text);
+  return trim_whitespace(normal_text);
 }
 
 std::pair<std::string, std::string> Glm47Detector::parse_tool_call_content(
@@ -185,7 +181,7 @@ std::pair<std::string, std::string> Glm47Detector::parse_tool_call_content(
 }
 
 std::vector<std::pair<std::string, std::string>>
-Glm47Detector::extract_argument_pairs(const std::string& args_raw) {
+Glm47Detector::extract_argument_pairs(const std::string& args_raw) const {
   std::vector<std::pair<std::string, std::string>> pairs;
 
   const std::string key_open = "<arg_key>";
@@ -196,63 +192,20 @@ Glm47Detector::extract_argument_pairs(const std::string& args_raw) {
   size_t pos = 0;
   while (pos < args_raw.length()) {
     size_t key_start = args_raw.find(key_open, pos);
-    if (strict_errors_ &&
-        !trim_whitespace(args_raw.substr(pos,
-                                         key_start == std::string::npos
-                                             ? std::string::npos
-                                             : key_start - pos))
-             .empty()) {
-      error_status_ =
-          Status(StatusCode::UNKNOWN,
-                 "Model generated malformed XML function arguments.");
-      return {};
-    }
-    if (key_start == std::string::npos) {
-      break;
-    }
+    if (key_start == std::string::npos) break;
     key_start += key_open.length();
 
     size_t key_end = args_raw.find(key_close, key_start);
-    if (key_end == std::string::npos) {
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated an unfinished function argument key.");
-      }
-      break;
-    }
+    if (key_end == std::string::npos) break;
 
-    const size_t key_close_end = key_end + key_close.length();
-    size_t val_start = args_raw.find(val_open, key_close_end);
-    if (strict_errors_ && val_start != std::string::npos &&
-        !trim_whitespace(
-             args_raw.substr(key_close_end, val_start - key_close_end))
-             .empty()) {
-      error_status_ =
-          Status(StatusCode::UNKNOWN,
-                 "Model generated malformed XML function arguments.");
-      return {};
-    }
-    if (val_start == std::string::npos) {
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated a function argument without a value.");
-      }
-      break;
-    }
+    size_t val_start = args_raw.find(val_open, key_end);
+    if (val_start == std::string::npos) break;
 
     // Check for an intervening key tag, which indicates a malformed pair where
     // a key is missing its value.
     size_t next_key_start =
         args_raw.find(key_open, key_end + key_close.length());
     if (next_key_start != std::string::npos && next_key_start < val_start) {
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated a function argument without a value.");
-        return {};
-      }
       // Skip to the next key, as this one is missing a value.
       pos = next_key_start;
       continue;
@@ -261,29 +214,10 @@ Glm47Detector::extract_argument_pairs(const std::string& args_raw) {
     val_start += val_open.length();
 
     size_t val_end = args_raw.find(val_close, val_start);
-    if (val_end == std::string::npos) {
-      if (strict_errors_) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated an unfinished function argument value.");
-      }
-      break;
-    }
+    if (val_end == std::string::npos) break;
 
     std::string key = args_raw.substr(key_start, key_end - key_start);
     std::string value = args_raw.substr(val_start, val_end - val_start);
-    if (strict_errors_) {
-      const std::string normalized_key = trim_whitespace(key);
-      if (normalized_key.empty() ||
-          std::any_of(pairs.begin(), pairs.end(), [&](const auto& pair) {
-            return trim_whitespace(pair.first) == normalized_key;
-          })) {
-        error_status_ =
-            Status(StatusCode::UNKNOWN,
-                   "Model generated an empty or duplicate argument.");
-        return {};
-      }
-    }
     pairs.emplace_back(key, value);
 
     pos = val_end + val_close.length();
@@ -395,19 +329,6 @@ Glm47Detector::parse_argument_pairs(
     std::string value = trim_whitespace(arg_value);
 
     std::string arg_type = get_argument_type(func_name, key, tools);
-    if (strict_errors_) {
-      auto parsed = nlohmann::json::parse(value,
-                                          nullptr,
-                                          /*allow_exceptions=*/false);
-      if (arg_type == "string") {
-        arguments[key] =
-            parsed.is_string() ? parsed : nlohmann::json(arg_value);
-      } else {
-        arguments[key] = parsed.is_discarded() ? nlohmann::json(arg_value)
-                                               : std::move(parsed);
-      }
-      continue;
-    }
     auto [parsed_value, is_good_json] = parse_arguments(value, arg_type);
 
     if (arg_type == "string") {
@@ -440,21 +361,12 @@ StreamingParseResult Glm47Detector::detect_and_parse(
   try {
     // Use string-based parsing instead of regex to avoid stack overflow
     auto ranges = find_tool_call_ranges(text);
-    const size_t parsed_end =
-        ranges.empty() ? 0 : ranges.back().second + eot_token_.size();
-    if (strict_errors_ &&
-        text.find(bot_token_, parsed_end) != std::string::npos) {
-      error_status_ = Status(StatusCode::UNKNOWN,
-                             "Model generated an unfinished function call.");
-      return {};
-    }
 
     if (ranges.empty()) {
       size_t idx = text.find(bot_token_);
-      std::string normal_text = strict_errors_ ? text : trim_whitespace(text);
+      std::string normal_text = trim_whitespace(text);
       if (idx != std::string::npos) {
-        normal_text = strict_errors_ ? text.substr(0, idx)
-                                     : trim_whitespace(text.substr(0, idx));
+        normal_text = trim_whitespace(text.substr(0, idx));
       }
       return StreamingParseResult(normal_text, {});
     }
@@ -466,9 +378,6 @@ StreamingParseResult Glm47Detector::detect_and_parse(
           text.substr(range.first, range.second - range.first);
       auto [func_name, args_raw] = parse_tool_call_content(content);
       auto pairs = extract_argument_pairs(args_raw);
-      if (!error_status_.ok()) {
-        return {};
-      }
 
       auto arguments = parse_argument_pairs(pairs, func_name, tools);
 
@@ -487,10 +396,6 @@ StreamingParseResult Glm47Detector::detect_and_parse(
 
   } catch (const std::exception& e) {
     LOG(ERROR) << "Error in GLM-4.7 detect_and_parse: " << e.what();
-    if (strict_errors_) {
-      error_status_ = Status(StatusCode::UNKNOWN, e.what());
-      return {};
-    }
     return StreamingParseResult(text, {});
   }
 }
@@ -726,9 +631,6 @@ std::string Glm47Detector::process_xml_to_json_streaming(
 StreamingParseResult Glm47Detector::parse_streaming_increment(
     const std::string& new_text,
     const std::vector<JsonTool>& tools) {
-  if (strict_errors_) {
-    return parse_streaming_framed(new_text, tools, bot_token_, eot_token_);
-  }
   buffer_ += new_text;
   std::string current_text = buffer_;
 

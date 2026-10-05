@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstdint>
 #include <utility>
 
+#include "api_service/utils.h"
 #include "core/util/uuid.h"
 
 namespace xllm::api_service {
@@ -92,7 +93,6 @@ bool ResponsesOutput::start(const RequestOutput& output) {
                                                  tool_parser_format_,
                                                  reasoning_parser_format_,
                                                  force_reasoning_,
-                                                 /*strict_tool_errors=*/true,
                                                  output.force_reasoning,
                                                  /*lossless_reasoning=*/true);
   started_ = true;
@@ -263,9 +263,6 @@ bool ResponsesOutput::parse_normal_text(const std::string& text) {
     return append_text("message", text);
   }
   const auto parsed = tool_parser->parse_streaming_increment(text);
-  if (!tool_parser->error_status().ok()) {
-    return set_error(tool_parser->error_status().message());
-  }
   if (!append_text("message", parsed.normal_text)) {
     return false;
   }
@@ -313,30 +310,20 @@ bool ResponsesOutput::flush_parsers(bool incomplete) {
       return false;
     }
   }
-  auto* tool_parser = parser_->get_tool_call_parser(/*index=*/0);
-  if (tool_parser != nullptr) {
-    auto [parser_status, remaining] = tool_parser->finish_stream(incomplete);
-    if (!parser_status.ok()) {
-      return set_error(parser_status.message());
-    }
-    if (!append_text("message", remaining.normal_text)) {
-      return false;
-    }
-    for (const auto& call : remaining.calls) {
-      if (!append_tool(call)) {
-        return false;
-      }
-    }
-  }
-  return true;
+  return incomplete ||
+         check_for_unstreamed_tool_args(
+             parser_,
+             /*index=*/0,
+             [this](const std::string& arguments, int index) {
+               return append_tool({index, std::nullopt, arguments});
+             });
 }
 
 bool ResponsesOutput::set_usage(const Usage& usage) {
   if (usage.num_prompt_tokens < 0 || usage.num_generated_tokens < 0 ||
-      usage.num_cached_tokens < 0 || usage.num_reasoning_tokens < 0 ||
+      usage.num_cached_tokens < 0 ||
       usage.num_total_tokens !=
           usage.num_prompt_tokens + usage.num_generated_tokens ||
-      usage.num_reasoning_tokens > usage.num_generated_tokens ||
       usage.num_cached_tokens > usage.num_prompt_tokens) {
     return set_error("Generation returned inconsistent token usage.");
   }
@@ -346,8 +333,7 @@ bool ResponsesOutput::set_usage(const Usage& usage) {
       {"total_tokens", usage.num_total_tokens},
       {"input_tokens_details",
        {{"cached_tokens", usage.num_cached_tokens}, {"cache_write_tokens", 0}}},
-      {"output_tokens_details",
-       {{"reasoning_tokens", usage.num_reasoning_tokens}}}};
+      {"output_tokens_details", {{"reasoning_tokens", 0}}}};
   return true;
 }
 

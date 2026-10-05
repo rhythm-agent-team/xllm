@@ -94,9 +94,6 @@ struct SequenceParams {
   // whether the request is streaming
   bool streaming = false;
 
-  bool force_reasoning = false;
-  std::optional<ReasoningTokenMetadata> reasoning_token_metadata;
-
   // enable_schedule_overlap or not. default = false.
   bool enable_schedule_overlap = false;
 
@@ -207,8 +204,6 @@ class Sequence {
   // Generated tokens excluding trailing scheduler placeholders.
   size_t num_valid_generated_tokens() const;
   Slice<int32_t> tokens() const { return {tokens_, num_tokens_}; }
-
-  size_t num_reasoning_tokens() const;
   // get tokens in kv cache
   Slice<int32_t> cached_tokens() const {
     return {tokens_, kv_state_.kv_cache_tokens_num()};

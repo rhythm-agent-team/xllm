@@ -75,8 +75,7 @@ class CountingClosure final : public google::protobuf::Closure {
 
 RequestOutput fixture_chunk(std::string text,
                             bool finished = false,
-                            const std::string& reason = "stop",
-                            bool reasoning = false) {
+                            const std::string& reason = "stop") {
   RequestOutput result;
   result.force_reasoning = false;
   result.finished = finished;
@@ -90,7 +89,6 @@ RequestOutput fixture_chunk(std::string text,
     usage.num_generated_tokens = 5;
     usage.num_total_tokens = 14;
     usage.num_cached_tokens = 3;
-    usage.num_reasoning_tokens = reasoning ? 1 : 0;
     result.usage = usage;
   }
   return result;
@@ -170,7 +168,7 @@ class ResponsesFixtureService final : public proto::XllmAPIService {
                        OutputsFunc{},
                        /*decode_address=*/"",
                        &call);
-    state.responses_usage = true;
+    state.responses_request = true;
     auto owner = std::make_shared<Request>(parsed.params.request_id,
                                            "",
                                            "",
@@ -260,7 +258,7 @@ class ResponsesFixtureService final : public proto::XllmAPIService {
               selector == "__responses_fixture_incomplete__" ? "length"
               : selector == "__responses_fixture_tool__"     ? "function_call"
                                                              : "stop";
-          output.append(fixture_chunk("", true, reason, reasoning));
+          output.append(fixture_chunk("", true, reason));
         }
       }
       if (!parsed.params.streaming &&
@@ -493,7 +491,10 @@ class OpenAIResponsesProtocolTest : public testing::Test {
     EXPECT_EQ(final["usage"]["total_tokens"], 14);
     EXPECT_EQ(final["usage"]["input_tokens_details"],
               (Json{{"cached_tokens", 3}, {"cache_write_tokens", 0}}));
-    EXPECT_EQ(final["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
+    const auto& reasoning_tokens =
+        final["usage"]["output_tokens_details"]["reasoning_tokens"];
+    EXPECT_TRUE(reasoning_tokens.is_number_integer());
+    EXPECT_EQ(reasoning_tokens, 0);
     EXPECT_EQ(final["store"], false);
     EXPECT_FALSE(final.contains("choices"));
     EXPECT_EQ(body.find("chat.completion"), std::string::npos);
@@ -630,7 +631,10 @@ TEST_F(OpenAIResponsesProtocolTest, RawReasoningIsNotInventedSummary) {
     EXPECT_TRUE(final["output"][0]["summary"].empty());
     EXPECT_EQ(final["output"][0]["content"][0]["text"], "why");
     EXPECT_EQ(final["output"][1]["content"][0]["text"], "answer");
-    EXPECT_EQ(final["usage"]["output_tokens_details"]["reasoning_tokens"], 1);
+    const auto& reasoning_tokens =
+        final["usage"]["output_tokens_details"]["reasoning_tokens"];
+    EXPECT_TRUE(reasoning_tokens.is_number_integer());
+    EXPECT_EQ(reasoning_tokens, 0);
     ASSERT_TRUE(service_.wait_idle());
   }
 }
