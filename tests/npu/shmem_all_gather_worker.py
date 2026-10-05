@@ -461,7 +461,23 @@ def _run_case(
                 case["graph_replays"] += 1
         _check(iteration, local, previous_epochs)
 
-    torch.npu.synchronize()
+    if args.backend == "hccl_aiv":
+        iteration = args.repeats
+        local = _prepare(iteration)
+        torch.npu.synchronize()
+        phase = f"count-{count}/continuous-pair"
+        case["continuous_pair"] = {"calls": 2, "checked_final_output": False}
+        _save(result_path, result, phase)
+        _rendezvous(store, args.rank, args.world_size, phase)
+        with torch.npu.stream(stream):
+            prepared.run()
+            prepared.run()
+            torch.add(output, 1, out=consumed)
+        torch.npu.synchronize()
+        _check_outputs(iteration, local, None)
+        case["continuous_pair"]["checked_final_output"] = True
+    else:
+        torch.npu.synchronize()
     if graph is not None:
         graph.reset()
         del graph
