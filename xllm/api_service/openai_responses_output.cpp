@@ -22,7 +22,6 @@ limitations under the License.
 #include <cstdint>
 #include <utility>
 
-#include "api_service/utils.h"
 #include "core/util/uuid.h"
 
 namespace xllm::api_service {
@@ -266,7 +265,8 @@ bool ResponsesOutput::parse_normal_text(const std::string& text) {
     tool_text_ += text;
     return true;
   }
-  return append_tool_output(tool_parser->parse_streaming_increment(text));
+  return text.empty() ||
+         append_tool_output(tool_parser->parse_streaming_increment(text));
 }
 
 bool ResponsesOutput::append_tool_output(
@@ -335,21 +335,19 @@ bool ResponsesOutput::flush_tools(bool incomplete) {
       }
       return append_tool_output({std::move(normal_text), std::move(calls)});
     }
-    if (!append_tool_output(tool_parser->parse_streaming_increment(text))) {
+    if (!text.empty() &&
+        !append_tool_output(tool_parser->parse_streaming_increment(text))) {
       return false;
     }
   }
-  // Incremental parsers may return the name before already-buffered arguments.
-  if (!append_tool_output(tool_parser->parse_streaming_increment(""))) {
+  const auto remaining = tool_parser->finish_stream();
+  if (!append_tool_output(remaining.output)) {
     return false;
   }
-  return incomplete ||
-         check_for_unstreamed_tool_args(
-             parser_,
-             /*index=*/0,
-             [this](const std::string& arguments, int index) {
-               return append_tool({index, std::nullopt, arguments});
-             });
+  if (!incomplete && remaining.has_pending_tool) {
+    return set_error("Generation ended inside a function call.");
+  }
+  return true;
 }
 
 bool ResponsesOutput::set_usage(const Usage& usage) {
@@ -504,19 +502,25 @@ bool ResponsesOutput::set_error(const std::string& message) {
 }
 
 bool ResponsesOutput::fail(StatusCode code, const std::string& message) {
-  if (finished_) {
+  if (finished_ || failing_) {
     return false;
   }
-  if (!stream_ && !tool_text_.empty() && !flush_tools(/*incomplete=*/true)) {
-    return false;
-  }
+  failing_ = true;
   status_ = Status(code, message);
   response_["error"] = {{"code", "server_error"}, {"message", message}};
+  if (started_) {
+    flush_tools(/*incomplete=*/true);
+    if (finished_) {
+      failing_ = false;
+      return false;
+    }
+  }
   response_["status"] = "failed";
   for (auto& item : response_["output"]) {
     item["status"] = "incomplete";
   }
   finished_ = true;
+  failing_ = false;
   if (started_) {
     emit({{"type", "response.failed"}, {"response", response_}});
   }

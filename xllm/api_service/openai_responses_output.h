@@ -83,6 +83,7 @@ class ResponsesOutput final {
   int64_t sequence_number_ = 0;
   bool started_ = false;
   bool finished_ = false;
+  bool failing_ = false;
 };
 
 }  // namespace xllm::api_service
