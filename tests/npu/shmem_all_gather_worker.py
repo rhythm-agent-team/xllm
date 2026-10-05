@@ -34,6 +34,7 @@ import re
 import socket
 import sys
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -401,7 +402,7 @@ def _run_case(
     profile: dict[str, Any] = {
         "backend": args.backend,
         "mode": args.mode,
-        "scope": "gather_only",
+        "scope": "gather_consumer_batch" if args.profile_submission == "batch_graph" else "gather_only",
         "duration_source": "msprof_device_trace",
         "evidence_version": 1,
         "device_association": "UNVERIFIED",
@@ -409,13 +410,14 @@ def _run_case(
         "round_id": args.round_id,
         "stage_index": args.stage_index,
         "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
+        "profile_submission": args.profile_submission,
         "row_width": args.row_width,
         "rows": None if args.row_width is None else count // args.row_width,
         "warmup_samples": [],
         "samples": [],
         "warmup_excluded": True,
         "consumer_in_gather_range": False,
-        "graph_reset": False if args.mode == "graph" else None,
+        "graph_reset": False if args.mode == "graph" or args.profile_submission is not None else None,
         "stream_ptr": hex(stream.npu_stream),
         "stream_ptr_is_trace_stream_id": False,
         "directory": str(profile_dir),
@@ -446,7 +448,8 @@ def _run_case(
         ),
     )
     if args.mode == "eager":
-        profile["submission_pattern"] = "retained_continuous"
+        batch_graph = args.profile_submission == "batch_graph"
+        profile["submission_pattern"] = "retained_batch_graph" if batch_graph else "retained_continuous"
         calls = []
         for ordinal in range(args.profile_warmup + args.profile_samples):
             sample_index = ordinal - args.profile_warmup
@@ -461,42 +464,45 @@ def _run_case(
             buffers["source"][1].copy_(local)
             buffers["output"][1].fill_(float("nan"))
             buffers["consumer"][1].fill_(float("nan"))
+            record: dict[str, Any] = {"sample_index": sample_index, "input_iteration": iteration}
+            if not batch_graph or sample_index < 0:
+                record["gather_range"] = f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}"
             calls.append(
                 {
                     "buffers": buffers,
                     "rank_major": buffers["output"][1].view(args.world_size, count),
                     "local": local,
                     "expected": expected,
-                    "record": {
-                        "sample_index": sample_index,
-                        "input_iteration": iteration,
-                        "gather_range": f"all_gather/rank-{args.rank}/count-{count}/sample-{sample_index}",
-                    },
+                    "record": record,
                 }
             )
 
-        for name, group in (
-            ("warmup_samples", calls[: args.profile_warmup]),
-            ("samples", calls[args.profile_warmup :]),
-        ):
-            torch.npu.synchronize()
-            starting_epochs = _previous_epochs()
-            _save(result_path, result, f"count-{count}/profile/{name}/prepared")
-            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/prepared")
-            if name == "samples":
-                profiler.start()
-                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
-                if args.rank == 0 and args.profile_rank0_delay_ms is not None and args.profile_rank0_delay_ms > 0:
-                    time.sleep(args.profile_rank0_delay_ms / 1000)
-            with torch.npu.stream(stream):
-                for call in group:
-                    buffers = call["buffers"]
-                    with torch.profiler.record_function(call["record"]["gather_range"]):
-                        _gather(buffers["source"][1], buffers["output"][1], call["rank_major"])
-                    torch.add(buffers["output"][1], 1, out=buffers["consumer"][1])
-            torch.npu.synchronize()
-            if name == "samples":
-                profiler.stop()
+        def _submit_profile_group(group: list[dict[str, Any]], annotate: bool) -> None:
+            for call in group:
+                buffers = call["buffers"]
+                annotation = (
+                    torch.profiler.record_function(call["record"]["gather_range"]) if annotate else nullcontext()
+                )
+                with annotation:
+                    _gather(buffers["source"][1], buffers["output"][1], call["rank_major"])
+                torch.add(buffers["output"][1], 1, out=buffers["consumer"][1])
+
+        def _prepare_profile_group(group: list[dict[str, Any]], iteration_offset: int) -> None:
+            for call in group:
+                iteration = call["record"]["input_iteration"] + iteration_offset
+                local = _payload(args.rank, count, iteration, dtype)
+                expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
+                if iteration_offset:
+                    assert not torch.equal(local, call["local"]), "Capture input aliases measured input"
+                    assert not torch.equal(expected, call["expected"]), "Capture oracle aliases measured oracle"
+                call["local"], call["expected"] = local, expected
+                buffers = call["buffers"]
+                buffers["source"][1].copy_(local)
+                buffers["output"][1].fill_(float("nan"))
+                buffers["consumer"][1].fill_(float("nan"))
+
+        def _check_profile_group(group: list[dict[str, Any]], executed: bool | None) -> str:
+            observed = set()
             for call in group:
                 for key, expected in (
                     ("source", call["local"]),
@@ -504,12 +510,106 @@ def _run_case(
                     ("consumer", call["expected"] + 1),
                 ):
                     storage, tensor, guard = call["buffers"][key]
-                    torch.testing.assert_close(tensor.cpu(), expected, rtol=0, atol=0)
+                    actual = tensor.cpu()
+                    if key != "source" and torch.all(torch.isnan(actual)):
+                        observed.add("POISONED")
+                    else:
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        if key != "source":
+                            observed.add("CORRECT")
                     _check_guards(storage, tensor.numel(), guard)
+            assert len(observed) == 1, "Retained group has partially executed outputs or consumers"
+            output_state = observed.pop()
+            if executed is not None:
+                assert output_state == ("CORRECT" if executed else "POISONED"), "Unexpected retained output state"
+            return output_state
+
+        for name, group in (
+            ("warmup_samples", calls[: args.profile_warmup]),
+            ("samples", calls[args.profile_warmup :]),
+        ):
+            if name == "samples" and args.profile_submission is not None:
+                # A disjoint negative range with a different position-zero marker,
+                # including count=1; _payload repeats that marker every 32 calls.
+                capture_offset = -(32 * (group[-1]["record"]["input_iteration"] // 32 + 2) + 1)
+                capture_iterations = [call["record"]["input_iteration"] + capture_offset for call in group]
+                _prepare_profile_group(group, capture_offset)
+                torch.npu.synchronize()
+                before_capture = _previous_epochs()
+                phase = f"count-{count}/profile/batch-capture"
+                _save(result_path, result, f"{phase}/prepared")
+                _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+                profile_graph = torch.npu.NPUGraph()
+                with torch.npu.graph(profile_graph, stream=stream):
+                    _submit_profile_group(group, annotate=False)
+                torch.npu.synchronize()
+                _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
+                capture_outputs = _check_profile_group(group, executed=None)
+                after_capture = _previous_epochs()
+                if scratch is not None:
+                    _check_scratch(scratch)
+                    capture_rounds = len(group) * rounds if capture_outputs == "CORRECT" else 0
+                    _check_state(controls, epochs, (before_capture + capture_rounds) % 2, args.lanes, args.world_size)
+                profile["submission_diagnostic"] = {
+                    "capture": {
+                        "call_count": len(group),
+                        "input_iterations": capture_iterations,
+                        "outputs": capture_outputs,
+                        "starting_epochs": None if before_capture is None else before_capture.tolist(),
+                        "ending_epochs": None if after_capture is None else after_capture.tolist(),
+                    },
+                    "prepared_after_capture": False,
+                    "measured_graph_replays": 0,
+                    "replay_range": f"all_gather_batch/rank-{args.rank}/count-{count}/replay-0"
+                    if batch_graph
+                    else None,
+                    "consumer_in_replay_range": batch_graph,
+                    "checked_samples": [],
+                    "starting_epochs": None,
+                    "ending_epochs": None,
+                }
+                _save(result_path, result, f"{phase}/observed")
+                _rendezvous(store, args.rank, args.world_size, f"{phase}/observed")
+                _prepare_profile_group(group, 0)
+                torch.npu.synchronize()
+                _check_profile_group(group, executed=False)
+                if scratch is not None:
+                    _check_state(controls, epochs, after_capture, args.lanes, args.world_size)
+                profile["submission_diagnostic"]["prepared_after_capture"] = True
+            torch.npu.synchronize()
+            starting_epochs = _previous_epochs()
+            _save(result_path, result, f"count-{count}/profile/{name}/prepared")
+            _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/prepared")
+            if name == "samples":
+                if args.profile_submission is not None:
+                    profile["submission_diagnostic"]["starting_epochs"] = (
+                        None if starting_epochs is None else starting_epochs.tolist()
+                    )
+                profiler.start()
+                _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/started")
+                if args.rank == 0 and args.profile_rank0_delay_ms is not None and args.profile_rank0_delay_ms > 0:
+                    time.sleep(args.profile_rank0_delay_ms / 1000)
+            with torch.npu.stream(stream):
+                if name == "samples" and batch_graph:
+                    with torch.profiler.record_function(profile["submission_diagnostic"]["replay_range"]):
+                        profile_graph.replay()
+                    profile["submission_diagnostic"]["measured_graph_replays"] += 1
+                else:
+                    _submit_profile_group(group, annotate=True)
+            torch.npu.synchronize()
+            if name == "samples":
+                profiler.stop()
+            _check_profile_group(group, executed=True)
             if scratch is not None:
                 _check_scratch(scratch)
                 _check_state(controls, epochs, (starting_epochs + len(group) * rounds) % 2, args.lanes, args.world_size)
             profile[name] = [call["record"] for call in group]
+            if name == "samples" and args.profile_submission is not None:
+                ending_epochs = _previous_epochs()
+                profile["submission_diagnostic"]["ending_epochs"] = (
+                    None if ending_epochs is None else ending_epochs.tolist()
+                )
+                profile["submission_diagnostic"]["checked_samples"] = [call["record"]["sample_index"] for call in group]
             _rendezvous(store, args.rank, args.world_size, f"count-{count}/profile/{name}/checked")
             _save(result_path, result, f"count-{count}/profile/{name}/checked")
     else:
@@ -553,7 +653,11 @@ def _run_case(
     profile["databases"] = [_file_identity(path) for path in databases]
     profile["export_complete"] = _file_identity(completion)
     if profile_graph is not None:
-        graph_dump = args.artifact_dir / f"profile-graph-rank-{args.rank}-count-{count}.json"
+        graph_dump = (
+            profile_dir / "graph.json"
+            if args.profile_submission is not None
+            else args.artifact_dir / f"profile-graph-rank-{args.rank}-count-{count}.json"
+        )
         profile_graph.debug_dump(str(graph_dump))
         json.loads(graph_dump.read_text(encoding="utf-8"))
         profile["graph_dump"] = _file_identity(graph_dump)
@@ -828,6 +932,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
+        "profile_submission",
         "comparison_id",
         "round_id",
         "stage_index",
@@ -928,6 +1033,9 @@ def _main() -> None:
     parser.add_argument(
         "--profile-rank0-delay-ms", type=int, help="Diagnostic-only rank-0 batch delay; explicit 0 is a control"
     )
+    parser.add_argument(
+        "--profile-submission", choices=("eager", "batch_graph"), help="Diagnostic-only retained batch submission"
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -959,6 +1067,13 @@ def _main() -> None:
     args = parser.parse_args()
     if args.profile_samples < 0:
         parser.error("profile-samples must be nonnegative")
+    if args.profile_submission is not None and (
+        not args.profile_samples
+        or args.backend not in ("hccl", "ascendc")
+        or args.mode != "eager"
+        or args.profile_rank0_delay_ms is not None
+    ):
+        parser.error("profile-submission requires eager HCCL/Ascend C profiling without profile-rank0-delay-ms")
     if args.profile_rank0_delay_ms is not None and (
         args.profile_rank0_delay_ms < 0
         or not args.profile_samples
@@ -1066,6 +1181,7 @@ def _main() -> None:
         "round_id": args.round_id,
         "stage_index": args.stage_index,
         "profile_rank0_delay_ms": args.profile_rank0_delay_ms,
+        "profile_submission": args.profile_submission,
         "row_width": args.row_width,
         "native_build_revision": args.native_build_revision,
         "native_build_revision_owner": {"ascendc": "workspace_source", "hccl": "xllm_source"}.get(args.backend),
