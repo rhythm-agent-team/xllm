@@ -1444,7 +1444,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Unqualified Level2 lane identities: PE2 FP16/count64/L2/chunk128 or TP16 BF16/count309760/L4/chunk65536",
+        help="Unqualified Level2 lane identities: PE2 FP16/count64/L2/chunk128 or TP16 BF16/count309760/L4-or-L8/chunk65536",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1642,7 +1642,7 @@ def _main() -> None:
         args.world_size == 16
         and args.dtype == "bfloat16"
         and args.counts == [309760]
-        and args.lanes == 4
+        and args.lanes in (4, 8)
         and args.chunk_bytes == 65536
     )
     if args.mc2_capture_identity and (
@@ -1659,7 +1659,7 @@ def _main() -> None:
     ):
         parser.error(
             "mc2-capture-identity requires normal PE2 FP16/count64/L2/chunk128 or "
-            "TP16 BF16/count309760/L4/chunk65536, repeats2 Level2 aligned profiling; lane metadata is unqualified"
+            "TP16 BF16/count309760/L4-or-L8/chunk65536, repeats2 Level2 aligned profiling; lane metadata is unqualified"
         )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
