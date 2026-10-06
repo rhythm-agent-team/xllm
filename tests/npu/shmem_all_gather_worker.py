@@ -820,13 +820,19 @@ def _run_case(
         "stream_ptr_is_trace_stream_id": False,
         "directory": str(profile_dir),
     }
+    if args.backend == "hccl_aiv":
+        profile.update({"mc2_profile_level": args.mc2_profile_level, "profiler": f"CPU+NPU_{args.mc2_profile_level}"})
     case["profile"] = profile
     _save(result_path, result, f"count-{count}/profile/prepare")
     profiler = torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_dir)),
         experimental_config=torch_npu.profiler._ExperimentalConfig(
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            profiler_level=(
+                torch_npu.profiler.ProfilerLevel.Level2
+                if args.mc2_profile_level == "Level2"
+                else torch_npu.profiler.ProfilerLevel.Level1
+            ),
             export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
         ),
     )
@@ -1418,6 +1424,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "backend",
         "mc2_probe_stage",
         "mc2_delay_iterations",
+        "mc2_profile_level",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1588,6 +1595,12 @@ def _main() -> None:
         "--profile-submission", choices=("alltoall_graph",), help="Capture one AlltoAll followed by 50 AllGather calls"
     )
     parser.add_argument("--profile-graph-warmup", type=int, help="Full aligned-graph warmup replays (default 20)")
+    parser.add_argument(
+        "--mc2-profile-level",
+        choices=("Level1", "Level2"),
+        default=None,
+        help="Normal hccl_aiv aligned profiling coverage (default Level1)",
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -1796,6 +1809,10 @@ def _main() -> None:
         required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
         if args.heap_bytes < required_bytes:
             parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")
+    if args.mc2_profile_level is not None and (args.backend != "hccl_aiv" or not args.profile_samples):
+        parser.error("mc2-profile-level requires normal hccl_aiv alltoall_graph profiling")
+    if args.backend == "hccl_aiv" and args.profile_samples and args.mc2_profile_level is None:
+        args.mc2_profile_level = "Level1"
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1803,6 +1820,7 @@ def _main() -> None:
         "backend": args.backend,
         "mc2_probe_stage": args.mc2_probe_stage,
         "mc2_delay_iterations": args.mc2_delay_iterations,
+        "mc2_profile_level": args.mc2_profile_level,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
