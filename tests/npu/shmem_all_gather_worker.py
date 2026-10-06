@@ -1741,8 +1741,10 @@ def _main() -> None:
     if args.backend == "hccl":
         if not args.profile_samples:
             parser.error("The HCCL backend is only available for matched gather-only measurement")
-        if args.hccl_op_expansion_mode != 4 or args.dtype != "bfloat16":
-            parser.error("Matched alltoall_graph requires BF16 HCCL with explicit expansion mode 4")
+        if args.hccl_op_expansion_mode != 4 or args.dtype not in ("float16", "bfloat16"):
+            parser.error("Matched alltoall_graph requires FP16/BF16 HCCL with explicit expansion mode 4")
+        if args.dtype == "float16" and args.profile_graph_warmup != 20:
+            parser.error("FP16 HCCL raw baseline requires exactly 20 full-graph warmups")
     if args.backend == "hccl" or args.profile_submission == "alltoall_graph":
         if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV" or any(
             not os.environ.get(name) for name in ("HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")
