@@ -1444,7 +1444,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Unqualified Level2 lane identities: PE2 FP16/count64/L2/chunk128 or TP16 BF16/count309760/L4-or-L8/chunk65536",
+        help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at L8/chunk65536",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1640,10 +1640,18 @@ def _main() -> None:
         and args.chunk_bytes == 128
     ) or (
         args.world_size == 16
-        and args.dtype == "bfloat16"
-        and args.counts == [309760]
-        and args.lanes in (4, 8)
         and args.chunk_bytes == 65536
+        and (
+            (args.dtype == "bfloat16" and args.counts == [309760] and args.lanes in (4, 8))
+            or (
+                args.dtype in ("float16", "bfloat16")
+                and args.lanes == 8
+                and args.row_width in (384, 9680)
+                and len(args.counts) == 1
+                and args.counts[0]
+                in [args.row_width * tokens for tokens in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)]
+            )
+        )
     )
     if args.mc2_capture_identity and (
         args.backend != "hccl_aiv"
@@ -1658,8 +1666,9 @@ def _main() -> None:
         or args.repeats != 2
     ):
         parser.error(
-            "mc2-capture-identity requires normal PE2 FP16/count64/L2/chunk128 or "
-            "TP16 BF16/count309760/L4-or-L8/chunk65536, repeats2 Level2 aligned profiling; lane metadata is unqualified"
+            "mc2-capture-identity requires repeats2 Level2 aligned profiling and the PE2 control, "
+            "TP16 BF16/count309760/L4-or-L8, or one GLM5.2 TP16 embedding/logits shape at "
+            "L8/chunk65536; completion metadata remains unqualified"
         )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
