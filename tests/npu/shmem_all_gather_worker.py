@@ -22,9 +22,10 @@ checks, basic PE2/8/16 normal graph entries and a bounded two-live-graph PE2 ent
 Larger-rank entry support is not runtime qualification; capture alone is not a
 numerical pass. Normal MC2 aligned profiling reuses the AlltoAll-to-50 graph with
 20 full-graph warmups; entry support is not device-duration or performance proof.
-Eager stress and skew remain unsupported. --mc2-probe-stage
-explicitly selects resource, first-barrier or final-zero diagnostics, not
-AllGather qualification.
+MC2 uses communicator-owned lane state initialized once outside capture. Read/ack
+skew is available for correctness only; its bounded per-lane PIPE_ALL iterations
+are not time units or SHMEM scratch-copy steps. Eager stress remains unsupported.
+The retired whole-kernel-barrier diagnostic entries are not part of this protocol.
 Matched profiling may select the existing current-stream native HCCL AllGather
 instead. The caller must verify device availability, package/native identities
 and prior required correctness evidence before requesting measurement.
@@ -43,7 +44,6 @@ import re
 import socket
 import sys
 import threading
-import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -57,16 +57,10 @@ from scripts.logger import logger
 _GUARD_BYTES = 128
 _GUARD_VALUE = -123
 _SKEW_PHASES = {"none": 0, "read": 1, "ack": 2}
-_MC2_PREPARED_CLASSES = {
-    None: "PreparedAllGather",
-    "resource": "PreparedResourceProbe",
-    "before-barrier": "PreparedBeforeBarrierProbe",
-    "after-barrier": "PreparedAfterBarrierProbe",
-    "final-zero": "PreparedFinalZeroProbe",
-}
+_PREFIX_ELEMENTS = 32
+_MC2_PROTOCOL = "mc2_lane_fanout_v1"
 # Retain failed MC2 state until the process boundary reports the original error.
 _active_prepared: Any | None = None
-_active_diagnostic: dict[str, Any] | None = None
 _active_graph: dict[str, Any] | None = None
 
 
@@ -99,6 +93,11 @@ def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch
     columns = positions % 512
     values = (identity + (2 * iteration + 1) * columns + 31 * rows) % 512 - 256
     return values.to(dtype)
+
+
+def _prefix_payload(sender: int, destination: int, iteration: int, world_size: int) -> torch.Tensor:
+    marker = ((iteration % 128) * world_size + sender) * world_size + destination
+    return torch.arange(_PREFIX_ELEMENTS, dtype=torch.float32) + marker * _PREFIX_ELEMENTS
 
 
 def _guarded(count: int, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -220,9 +219,8 @@ def _load_native(args: argparse.Namespace, result: dict[str, Any]) -> None:
     result["native_build_revision_evidence"] = "caller_assertion_not_verified_build_provenance"
     torch.ops.load_library(str(args.native_library))
     if args.backend == "hccl_aiv":
-        name = _MC2_PREPARED_CLASSES[args.mc2_probe_stage]
-        if not callable(getattr(torch.classes.hccl_aiv_ops, name)):
-            raise RuntimeError(f"Native hccl_aiv {name} class is not callable")
+        if not callable(torch.classes.hccl_aiv_ops.PreparedAllGather):
+            raise RuntimeError("Native hccl_aiv PreparedAllGather class is not callable")
     else:
         namespace = torch.ops.aclshmem_ops if args.backend == "ascendc" else torch.ops.xllm_ops
         name = "all_gather" if args.backend == "ascendc" else "npu_all_gather"
@@ -271,7 +269,7 @@ def _run_case(
     prefix_group: dist.ProcessGroup | None = None,
     hccl_comm_name: str | None = None,
 ) -> None:
-    global _active_prepared, _active_diagnostic, _active_graph
+    global _active_prepared, _active_graph
 
     dtype = getattr(torch, args.dtype)
     device = torch.device(f"npu:{args.device}")
@@ -284,7 +282,6 @@ def _run_case(
     scratch = None
     kernel = None
     prepared = None
-    diagnostic = None
     if args.backend in ("shmem", "ascendc"):
         if receive is None or controls is None or epochs is None:
             raise RuntimeError("SHMEM AllGather requires its initialized symmetric buffers")
@@ -303,65 +300,22 @@ def _run_case(
         if (args.mode == "graph" or args.profile_samples) and _active_graph is not None:
             raise RuntimeError("A previous MC2 graph was not successfully reset")
         _save(result_path, result, f"count-{count}/prepare")
-        name = _MC2_PREPARED_CLASSES[args.mc2_probe_stage]
-        if args.mc2_probe_stage == "final-zero":
-            if _active_diagnostic is not None:
-                raise RuntimeError("A previous MC2 diagnostic owner was not successfully released")
-            probe_block_count = 2 * args.world_size
-            probe_call_count = 2
-            probe_record_words = 8
-            probe_max_rounds = 10
-            probe_barrier_capacity = 4 * probe_max_rounds + 4
-            probe_round_records_first = 21 + 2 * probe_barrier_capacity
-            probe_records_per_block = probe_round_records_first + 7 * (probe_max_rounds - 1)
-            probe_records_per_call = probe_block_count * probe_records_per_block
-            probe_record_count = probe_call_count * probe_records_per_call
-            probe_counter_words = probe_block_count * probe_record_words
-            probe_words = probe_counter_words + probe_record_count * probe_record_words
-            diagnostic_storage, diagnostic, diagnostic_guard = _guarded(probe_words, torch.int64, device)
-            prepared = getattr(torch.classes.hccl_aiv_ops, name)(
-                source, output, diagnostic, hccl_comm_name, args.world_size, args.chunk_bytes, args.mc2_delay_iterations
-            )
-            _active_prepared = prepared
-            _active_diagnostic = {
-                "storage": diagnostic_storage,
-                "diagnostic": diagnostic,
-                "source_storage": source_storage,
-                "output_storage": output_storage,
-                "consumer_storage": consumer_storage,
-                "consumed": consumed,
-                "cpu_snapshots": [],
-                "events": [],
-            }
-            observation_level = prepared.observation_level()
-            if observation_level not in ("dense", "lean"):
-                raise RuntimeError(f"Invalid MC2 final-zero observation level: {observation_level!r}")
-            if observation_level == "lean" and args.mc2_delay_iterations != 0:
-                raise RuntimeError("MC2 final-zero lean observation requires delay_iterations=0")
-            observer = torch.npu.Stream()
-            _active_diagnostic["observer"] = observer
-            cpu_snapshots = _active_diagnostic["cpu_snapshots"]
-            for _ in range(2):
-                cpu_snapshots.append(torch.empty(probe_words, dtype=torch.int64, pin_memory=True))
-            events = _active_diagnostic["events"]
-            initialized = torch.npu.Event(enable_timing=False)
-            events.append(initialized)
-            work_done = torch.npu.Event(enable_timing=False)
-            events.append(work_done)
-            copied = torch.npu.Event(enable_timing=False)
-            events.append(copied)
-        else:
-            prepared = getattr(torch.classes.hccl_aiv_ops, name)(
-                source, output, hccl_comm_name, args.world_size, args.chunk_bytes
-            )
-            _active_prepared = prepared
+        prepared = torch.classes.hccl_aiv_ops.PreparedAllGather(
+            source,
+            output,
+            hccl_comm_name,
+            args.world_size,
+            args.chunk_bytes,
+            args.lanes,
+            _SKEW_PHASES[args.skew_phase],
+            args.skew_iterations,
+        )
+        _active_prepared = prepared
     ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
     _save(result_path, result, ready_phase)
     _rendezvous(store, args.rank, args.world_size, ready_phase)
-    rounds = 0
-    if scratch is not None:
-        round_elements = args.lanes * args.chunk_bytes // source.element_size()
-        rounds = (count + round_elements - 1) // round_elements
+    round_elements = args.lanes * args.chunk_bytes // source.element_size()
+    rounds = (count + round_elements - 1) // round_elements
     stream = torch.npu.Stream() if args.profile_samples and args.backend != "hccl_aiv" else torch.npu.current_stream()
 
     def _gather(
@@ -434,410 +388,6 @@ def _run_case(
                 "Invalid capture epoch transition"
             )
             _check_state(controls, epochs, observed, args.lanes, args.world_size)
-
-    if args.mc2_probe_stage == "final-zero":
-        phase = f"count-{count}/mc2-probe/final-zero"
-        probe_rounds = (count + args.chunk_bytes // source.element_size() - 1) // (
-            args.chunk_bytes // source.element_size()
-        )
-        probe_barriers = 4 * probe_rounds + 4
-        barrier_observation = observation_level == "dense" or probe_rounds > 1
-        probe: dict[str, Any] = {
-            "stage": "final-zero",
-            "delay_iterations": args.mc2_delay_iterations,
-            "observation_level": observation_level,
-            "rounds": probe_rounds,
-            "barriers_per_call": probe_barriers,
-            "records_per_block": probe_records_per_block,
-            "barrier_observation": barrier_observation,
-            "verified": False,
-            "pair_completed": False,
-            "before_pair_submission": False,
-            "after_pair_submission": False,
-            "checked_preflight_iterations": [],
-            "preflights": [],
-            "pair_iteration": args.repeats if args.world_size == 16 else 0,
-        }
-        case["mc2_probe"] = probe
-        poll_samples = (1, 1024, 65536) if observation_level == "dense" else (65536, 262144, 1048576)
-        poll_slots = {
-            first + sample: (kind, round_index, sample)
-            for first, kind, round_index in (
-                (5, "v1", 0),
-                (8, "final_zero", probe_rounds),
-                (14, "v2", 0),
-                (17, "final_ack", probe_rounds),
-            )
-            for sample in range(3)
-        }
-        published_slots = {4: 0}
-        for round_index in range(1, probe_rounds):
-            first = probe_round_records_first + 7 * (round_index - 1)
-            published_slots[first] = round_index
-            for sample in range(3):
-                poll_slots[first + 1 + sample] = ("v1", round_index, sample)
-                poll_slots[first + 4 + sample] = ("v2", round_index, sample)
-        barrier_slots = range(21, 21 + 2 * probe_barriers)
-
-        def _observe_final_zero_work(iteration: int, calls: int, observed: dict[str, Any], work_phase: str) -> None:
-            if calls not in (1, probe_call_count):
-                raise RuntimeError(f"Invalid MC2 diagnostic call count: {calls}")
-            observed.update(
-                {
-                    "iteration": iteration,
-                    "calls": calls,
-                    "actual": [],
-                    "verified": False,
-                    "work_completed": False,
-                    "before_submission": False,
-                    "after_submission": False,
-                    "observer_visibility_verified": False,
-                    "snapshot_index": -1,
-                    "event_pending": {"work": None, "observer_copy": False},
-                    "observations": [],
-                    "observed_records": [],
-                }
-            )
-            # Indices are immutable only within this successfully drained arena phase.
-            seen: dict[int, dict[str, Any]] = {}
-
-            def _observe_final_zero_snapshot(buffer: torch.Tensor, work_pending: bool | None) -> None:
-                actual = buffer.tolist()
-                observed["actual"] = actual
-                observed["snapshot_index"] += 1
-                snapshot_index = observed["snapshot_index"]
-                new_commits = []
-                qualified = []
-                failure = None
-                for record_index in range(probe_record_count):
-                    offset = probe_counter_words + record_index * probe_record_words
-                    record = actual[offset : offset + probe_record_words]
-                    entry = seen.get(record_index)
-                    if record[0] == 0 and entry is None:
-                        continue
-                    if record[0] != 0x4843434C465A3031:
-                        failure = f"Invalid MC2 final-zero commit at record {record_index}: {record}"
-                        break
-                    if entry is None:
-                        entry = {"record_index": record_index, "first_seen_snapshot_index": snapshot_index}
-                        seen[record_index] = entry
-                        observed["observed_records"].append(entry)
-                        new_commits.append(record_index)
-                        continue
-                    if "words" in entry:
-                        if entry["words"] != record:
-                            failure = f"MC2 final-zero immutable record {record_index} changed: {record}"
-                            break
-                        continue
-                    # Accept the body only in a completed snapshot AFTER seeing commit.
-                    call = record_index // probe_records_per_call + 1
-                    block = (record_index % probe_records_per_call) // probe_records_per_block
-                    slot = record_index % probe_records_per_block
-                    if call > calls or (record[1], record[2], record[3]) != (
-                        call,
-                        (args.rank << 32) | block,
-                        slot,
-                    ):
-                        failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
-                        break
-                    context: dict[str, Any] = {}
-                    valid = False
-                    if slot in poll_slots:
-                        kind, round_index, sample = poll_slots[slot]
-                        role, peer, expected = {
-                            "v1": (block < args.world_size and block != args.rank, block, round_index + 1),
-                            "v2": (block == args.rank, args.rank, args.world_size * (round_index + 1)),
-                            "final_zero": (block >= args.world_size, block - args.world_size, 0),
-                            "final_ack": (block == args.rank, args.rank, args.world_size),
-                        }[kind]
-                        valid = (
-                            role
-                            and record[4] == peer
-                            and record[5] == expected
-                            and -(1 << 31) <= record[6] < (1 << 31)
-                            and record[7] == poll_samples[sample]
-                            and (observation_level != "lean" or record[6] != expected)
-                        )
-                        context = {"wait_kind": kind, "round": round_index}
-                    elif slot in barrier_slots and barrier_observation:
-                        barrier = (slot - 21) // 2
-                        round_index = min(barrier // 4, probe_rounds)
-                        if barrier < 4 * probe_rounds:
-                            boundary = ("entry", "after_v1", "after_movement", "after_v2")[barrier % 4]
-                            barrier_slot = round_index % 2
-                        else:
-                            boundary = ("drain_entry", "output_drain", "post_reset", "final_join")[
-                                barrier - 4 * probe_rounds
-                            ]
-                            barrier_slot = (probe_rounds % 2, 0, 1, 0)[barrier - 4 * probe_rounds]
-                        valid = record[4:8] == [-1, -1, -1, (barrier << 32) | barrier_slot]
-                        context = {
-                            "barrier": barrier,
-                            "round": round_index,
-                            "boundary": boundary,
-                            "witness": "before" if (slot - 21) % 2 == 0 else "after",
-                        }
-                    elif observation_level == "dense":
-                        if slot in (0, 1, 11, 12, 13):
-                            valid = record[4:8] == [-1, -1, -1, 0]
-                        elif slot in published_slots:
-                            round_index = published_slots[slot]
-                            valid = (
-                                block == args.rank
-                                and record[4] == args.rank
-                                and record[5] == round_index + 1
-                                and -(1 << 31) <= record[6] < (1 << 31)
-                                and record[7] == round_index + 1
-                            )
-                            context = {"round": round_index, "checkpoint": "v1_self_published"}
-                        elif slot == 20:
-                            valid = block >= args.world_size and record[4:8] == [
-                                block - args.world_size,
-                                -1,
-                                -1,
-                                2,
-                            ]
-                        elif slot in (2, 3):
-                            valid = (
-                                args.rank == 1
-                                and block == args.world_size
-                                and call == 1
-                                and record[4:8]
-                                == [
-                                    0,
-                                    0,
-                                    0,
-                                    args.mc2_delay_iterations,
-                                ]
-                            )
-                    if not valid:
-                        failure = (
-                            f"Invalid MC2 final-zero {observation_level} checkpoint at record {record_index}: {record}"
-                        )
-                        break
-                    entry.update(
-                        {
-                            "qualified_snapshot_index": snapshot_index,
-                            "words": record,
-                            "call": call,
-                            "rank": args.rank,
-                            "block": block,
-                            "slot": slot,
-                            "peer": record[4] & ((1 << 64) - 1),
-                            "expected": record[5],
-                            "actual": record[6],
-                            "detail": record[7] & ((1 << 64) - 1),
-                            "work_pending": work_pending,
-                            **context,
-                        }
-                    )
-                    qualified.append(record_index)
-                    if work_pending is True:
-                        observed["observer_visibility_verified"] = True
-                if snapshot_index == 0 or new_commits or qualified or failure is not None:
-                    observed["observations"].append(
-                        {
-                            "snapshot_index": snapshot_index,
-                            "work_pending": work_pending,
-                            "new_commits": new_commits,
-                            "qualified_records": qualified,
-                        }
-                    )
-                    _save(result_path, result, f"{work_phase}/snapshot-{snapshot_index}")
-                if failure is not None:
-                    raise RuntimeError(failure)
-
-            _save(result_path, result, f"{work_phase}/prepare")
-            with torch.npu.stream(stream):
-                local = _prepare(iteration)
-                diagnostic.zero_()
-                initialized.record(stream)
-            torch.npu.synchronize()
-            observer.wait_event(initialized)
-            deadline = time.monotonic() + 90
-            with torch.npu.stream(observer):
-                cpu_snapshots[0].copy_(diagnostic, non_blocking=True)
-                copied.record(observer)
-            observed["event_pending"]["observer_copy"] = True
-            _save(result_path, result, f"{work_phase}/initialize")
-            while not copied.query():
-                if time.monotonic() >= deadline:
-                    _save(result_path, result, f"{work_phase}/timeout")
-                    raise RuntimeError(f"MC2 final-zero initialization copy timeout: {observed['event_pending']}")
-                time.sleep(0.05)
-            observed["event_pending"]["observer_copy"] = False
-            _observe_final_zero_snapshot(cpu_snapshots[0], None)
-            if any(observed["actual"]):
-                raise RuntimeError("MC2 final-zero diagnostic initialization is not zero")
-            _rendezvous(store, args.rank, args.world_size, f"{work_phase}/ready")
-            observed["before_submission"] = True
-            if calls == 2:
-                probe["before_pair_submission"] = True
-            _save(result_path, result, f"{work_phase}/submit-before")
-            with torch.npu.stream(stream):
-                if calls == 1:
-                    prepared.run()
-                else:
-                    prepared.run()
-                    prepared.run()
-                work_done.record(stream)
-                torch.add(output, 1, out=consumed)
-            observed["after_submission"] = True
-            observed["event_pending"]["work"] = True
-            if calls == 2:
-                probe["after_pair_submission"] = True
-            _save(result_path, result, f"{work_phase}/submit-after")
-
-            deadline = time.monotonic() + 90
-            buffer_index = 1
-            copy_pending = False
-            copy_started_after_work = False
-            completed_after_work = 0
-            while True:
-                work_pending = not work_done.query()
-                if copy_pending:
-                    copy_pending = not copied.query()
-                    if not copy_pending:
-                        # Query work AFTER knowing the independent copy completed.
-                        work_pending = not work_done.query()
-                        observed["work_completed"] = not work_pending
-                        observed["event_pending"] = {"work": work_pending, "observer_copy": False}
-                        _observe_final_zero_snapshot(cpu_snapshots[buffer_index], work_pending)
-                        if copy_started_after_work:
-                            completed_after_work += 1
-                        if completed_after_work >= 2:
-                            break
-                        buffer_index = 1 - buffer_index
-                observed["work_completed"] = not work_pending
-                observed["event_pending"] = {"work": work_pending, "observer_copy": copy_pending}
-                if calls == 2:
-                    probe["pair_completed"] = not work_pending
-                if time.monotonic() >= deadline:
-                    observed["observations"].append({"snapshot_index": observed["snapshot_index"], "reason": "timeout"})
-                    _save(result_path, result, f"{work_phase}/timeout")
-                    raise RuntimeError(
-                        f"MC2 final-zero observation timeout; pending={observed['event_pending']}; "
-                        f"snapshot_index={observed['snapshot_index']}; saved_checkpoints={observed['observed_records']}; "
-                        "timeout alone does not identify a flag or local-barrier stall"
-                    )
-                if not copy_pending:
-                    copy_started_after_work = not work_pending
-                    with torch.npu.stream(observer):
-                        cpu_snapshots[buffer_index].copy_(diagnostic, non_blocking=True)
-                        copied.record(observer)
-                    copy_pending = True
-                    observed["event_pending"]["observer_copy"] = True
-                time.sleep(0.05)
-
-            observed["work_completed"] = True
-            observed["event_pending"] = {"work": False, "observer_copy": False}
-            if calls == 2:
-                probe["pair_completed"] = True
-            observed["observations"].append({"snapshot_index": observed["snapshot_index"], "reason": "final"})
-            _save(result_path, result, f"{work_phase}/observed")
-            observer.synchronize()
-            stream.synchronize()
-            _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
-            if [observed["actual"][block * probe_record_words] for block in range(probe_block_count)] != [
-                calls
-            ] * probe_block_count:
-                raise RuntimeError(
-                    f"MC2 final-zero block counters are not {calls}: {observed['actual'][:probe_counter_words]}"
-                )
-            required = [
-                (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
-                for call in range(1, calls + 1)
-                for block in range(probe_block_count)
-                for slot in (
-                    *((0, 1, 11, 12, 13) if observation_level == "dense" else ()),
-                    *(barrier_slots if barrier_observation else ()),
-                )
-            ]
-            if observation_level == "dense":
-                required.extend(
-                    (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
-                    for call in range(1, calls + 1)
-                    for slot in (
-                        *published_slots,
-                        17,
-                        *(slot for slot, (kind, _, sample) in poll_slots.items() if kind == "v2" and sample == 0),
-                    )
-                )
-                required.extend(
-                    (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
-                    for call in range(1, calls + 1)
-                    for block in range(args.world_size, probe_block_count)
-                )
-            if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required) or any(
-                "qualified_snapshot_index" not in entry for entry in seen.values()
-            ):
-                raise RuntimeError("MC2 final-zero work has incomplete required or committed records")
-            if calls == 1:
-                _check(iteration, local, None)
-            else:
-                _check_outputs(iteration, local, None)
-            observed["verified"] = True
-            _save(result_path, result, f"{work_phase}/checked")
-
-        if args.world_size == 16:
-            for iteration in (-2, -1, 0, 1):
-                observed: dict[str, Any] = {}
-                probe["preflights"].append(observed)
-                _observe_final_zero_work(iteration, 1, observed, f"{phase}/preflight-{iteration}")
-                probe["checked_preflight_iterations"].append(iteration)
-                _save(result_path, result, f"{phase}/preflight-{iteration}/checked")
-        # No reset follows an incomplete phase. Successful phases have drained
-        # both streams and retained their phase-local immutable observations.
-        _observe_final_zero_work(probe["pair_iteration"], 2, probe, f"{phase}/pair")
-        _save(result_path, result, f"count-{count}/close")
-        prepared.close()
-        _active_prepared = None
-        _active_diagnostic = None
-        prepared = None
-        case["prepared_closed"] = True
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
-        _save(result_path, result, f"count-{count}/checked")
-        return
-
-    if args.mc2_probe_stage is not None:
-        local = _prepare(0)
-        phase = f"count-{count}/mc2-probe/{args.mc2_probe_stage}"
-        _save(result_path, result, phase)
-        with torch.npu.stream(stream):
-            prepared.run()
-        torch.npu.synchronize()
-        uint64_max = (1 << 64) - 1
-        actual = [
-            [word & uint64_max for word in record] for record in output.cpu().view(torch.int64).reshape(4, 8).tolist()
-        ]
-        case["mc2_probe"] = {"stage": args.mc2_probe_stage, "actual": actual}
-        # Preserve every returned word before validating the stage or resources.
-        _save(result_path, result, f"{phase}/observed")
-        magic = 0x4843434C41495631 + {"resource": 0, "before-barrier": 1, "after-barrier": 2}[args.mc2_probe_stage]
-        for block_idx, record in enumerate(actual):
-            if record[0] != magic or record[2] != ((4 << 32) | block_idx):
-                raise RuntimeError(
-                    f"MC2 {args.mc2_probe_stage} diagnostic has invalid magic/block mapping: block={block_idx}, {record}"
-                )
-            if record[3] != ((2 << 32) | args.rank):
-                raise RuntimeError(f"MC2 resource snapshot rank/size mismatch: block={block_idx}, {record}")
-            if any(record[index] in (0, uint64_max) for index in (1, 5, 6, 7)):
-                raise RuntimeError(
-                    f"MC2 resource snapshot has invalid context/window/peer pointers: block={block_idx}, {record}"
-                )
-            if record[4] == uint64_max or record[4] < 200 * 1024 * 1024:
-                raise RuntimeError(f"MC2 resource snapshot has invalid input window size: block={block_idx}, {record}")
-        torch.testing.assert_close(source.cpu(), local, rtol=0, atol=0)
-        _check_guards_all()
-        case["mc2_probe"]["verified"] = True
-        _save(result_path, result, f"count-{count}/close")
-        prepared.close()
-        _active_prepared = None
-        prepared = None
-        case["prepared_closed"] = True
-        _rendezvous(store, args.rank, args.world_size, f"count-{count}/checked")
-        _save(result_path, result, f"count-{count}/checked")
-        return
 
     _save(result_path, result, f"count-{count}/warmup")
     for iteration in (-2, -1):
@@ -954,6 +504,7 @@ def _run_case(
             {
                 "mc2_profile_level": args.profile_level,
                 "mc2_capture_identity": args.mc2_capture_identity,
+                "protocol": result["backend_identity"]["protocol"],
             }
         )
         if args.mc2_capture_identity:
@@ -1015,7 +566,14 @@ def _run_case(
         )
         if args.backend == "hccl_aiv":
             calls[-1]["prepared"] = torch.classes.hccl_aiv_ops.PreparedAllGather(
-                buffers["source"][1], buffers["output"][1], hccl_comm_name, args.world_size, args.chunk_bytes
+                buffers["source"][1],
+                buffers["output"][1],
+                hccl_comm_name,
+                args.world_size,
+                args.chunk_bytes,
+                args.lanes,
+                _SKEW_PHASES[args.skew_phase],
+                args.skew_iterations,
             )
             if args.mc2_capture_identity:
                 calls[-1]["prepared"].enable_capture_identity()
@@ -1041,20 +599,20 @@ def _run_case(
 
     if prefix_group is None:
         raise RuntimeError("AlltoAll-aligned graph requires its initialized HCCL prefix group")
-    prefix_elements = 32
+    prefix_elements = _PREFIX_ELEMENTS
     prefix_buffers["source"] = _guarded(args.world_size * prefix_elements, torch.float32, device)
     prefix_buffers["output"] = _guarded(args.world_size * prefix_elements, torch.float32, device)
     prefix_local = torch.empty(0)
     prefix_expected = torch.empty(0)
 
-    def _prefix_payload(sender: int, destination: int, iteration: int) -> torch.Tensor:
-        marker = ((iteration % 128) * args.world_size + sender) * args.world_size + destination
-        return torch.arange(prefix_elements, dtype=torch.float32) + marker * prefix_elements
-
     def _prepare_prefix(iteration: int) -> None:
         nonlocal prefix_local, prefix_expected
-        prefix_local = torch.cat([_prefix_payload(args.rank, peer, iteration) for peer in range(args.world_size)])
-        prefix_expected = torch.cat([_prefix_payload(peer, args.rank, iteration) for peer in range(args.world_size)])
+        prefix_local = torch.cat(
+            [_prefix_payload(args.rank, peer, iteration, args.world_size) for peer in range(args.world_size)]
+        )
+        prefix_expected = torch.cat(
+            [_prefix_payload(peer, args.rank, iteration, args.world_size) for peer in range(args.world_size)]
+        )
         prefix_buffers["source"][1].copy_(prefix_local)
         prefix_buffers["output"][1].fill_(float("nan"))
 
@@ -1332,9 +890,7 @@ def _run_batch(
     stream = torch.npu.current_stream()
     if args.backend == "hccl_aiv":
         _active_graph = {"stream": stream, "graphs": graphs, "calls": calls}
-    round_elements = args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
-    if uses_shmem:
-        round_elements *= args.lanes
+    round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
     batch_counts = args.counts * args.repeats
     retained_counts = batch_counts + ([] if args.alternate_count is None else [args.alternate_count])
     for call_id, count in enumerate(retained_counts):
@@ -1371,7 +927,14 @@ def _run_batch(
         )
         if args.backend == "hccl_aiv":
             calls[-1]["prepared"] = torch.classes.hccl_aiv_ops.PreparedAllGather(
-                source, output, hccl_comm_name, args.world_size, args.chunk_bytes
+                source,
+                output,
+                hccl_comm_name,
+                args.world_size,
+                args.chunk_bytes,
+                args.lanes,
+                _SKEW_PHASES[args.skew_phase],
+                args.skew_iterations,
             )
     groups = [calls[: len(batch_counts)]]
     if args.alternate_count is not None:
@@ -1686,7 +1249,54 @@ def _init_hccl_process_group(args: argparse.Namespace, result: dict[str, Any]) -
     return group
 
 
+def _materialize_mc2_prefix(
+    args: argparse.Namespace,
+    store: dist.Store,
+    result: dict[str, Any],
+    result_path: Path,
+    prefix_group: dist.ProcessGroup,
+    device: torch.device,
+) -> str:
+    global _active_graph
+
+    if _active_graph is not None:
+        raise RuntimeError("Previous MC2 graph resources were not successfully released")
+    buffers = {
+        "source": _guarded(args.world_size * _PREFIX_ELEMENTS, torch.float32, device),
+        "output": _guarded(args.world_size * _PREFIX_ELEMENTS, torch.float32, device),
+    }
+    _active_graph = {"prefix_group": prefix_group, "buffers": buffers, "stream": torch.npu.current_stream()}
+    local = torch.cat([_prefix_payload(args.rank, peer, -1, args.world_size) for peer in range(args.world_size)])
+    expected = torch.cat([_prefix_payload(peer, args.rank, -1, args.world_size) for peer in range(args.world_size)])
+    buffers["source"][1].copy_(local)
+    buffers["output"][1].fill_(float("nan"))
+    torch.npu.synchronize()
+    phase = "bootstrap/prefix-materialization"
+    _save(result_path, result, phase)
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/prepared")
+    work = dist.all_to_all_single(buffers["output"][1], buffers["source"][1], group=prefix_group, async_op=True)
+    _active_graph["work"] = work
+    work.wait()
+    torch.npu.synchronize()
+    torch.testing.assert_close(buffers["source"][1].cpu(), local, rtol=0, atol=0)
+    torch.testing.assert_close(buffers["output"][1].cpu(), expected, rtol=0, atol=0)
+    for storage, tensor, guard in buffers.values():
+        _check_guards(storage, tensor.numel(), guard)
+    backend = prefix_group._get_backend(device)
+    if not callable(getattr(backend, "get_hccl_comm_name", None)):
+        raise RuntimeError("Prefix ProcessGroupHCCL does not expose get_hccl_comm_name")
+    name = backend.get_hccl_comm_name(dist.get_rank(), init_comm=False)
+    if not isinstance(name, str) or not 0 < len(name) < 128:
+        raise RuntimeError(f"Invalid materialized prefix HCCL communicator name: {name!r}")
+    result["prefix_group"].update(hccl_comm_name=name, materialization_checked=True)
+    _rendezvous(store, args.rank, args.world_size, f"{phase}/checked")
+    _active_graph = None
+    return name
+
+
 def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Path) -> None:
+    global _active_prepared
+
     import torch_npu
 
     torch.set_num_threads(1)
@@ -1741,6 +1351,54 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
         else torch.npu.current_stream()
     )
     with torch.npu.stream(run_stream):
+        if args.backend == "hccl_aiv":
+            prefix_name = None
+            if args.profile_samples:
+                if prefix_group is None:
+                    raise RuntimeError("MC2 profiling requires its prefix process group before initialization")
+                prefix_name = _materialize_mc2_prefix(args, store, result, result_path, prefix_group, device)
+            if _active_prepared is not None:
+                raise RuntimeError("Previous MC2 prepared resources were not successfully released")
+            _save(result_path, result, "bootstrap/mc2-prepare-state")
+            dtype = getattr(torch, args.dtype)
+            setup_source_storage, setup_source, setup_source_guard = _guarded(1, dtype, device)
+            setup_output_storage, setup_output, setup_output_guard = _guarded(args.world_size, dtype, device)
+            setup_source.fill_(1)
+            setup_output.fill_(float("nan"))
+            setup = torch.classes.hccl_aiv_ops.PreparedAllGather(
+                setup_source, setup_output, hccl_comm_name, args.world_size, args.chunk_bytes, args.lanes, 0, 0
+            )
+            _active_prepared = setup
+            protocol = setup.protocol()
+            result["backend_identity"] = {"protocol": protocol}
+            _save(result_path, result, "bootstrap/mc2-protocol")
+            if protocol != _MC2_PROTOCOL:
+                raise RuntimeError(f"Expected {_MC2_PROTOCOL}, loaded native protocol {protocol!r}")
+            if prefix_name is not None:
+                setup.verify_disjoint_buffers(prefix_name)
+                result["prefix_group"]["target_buffers_disjoint"] = True
+            result["mc2_state_initialization"] = {
+                "calls": 1,
+                "outside_capture": True,
+                "drained": False,
+                "prepared_closed": False,
+            }
+            torch.npu.synchronize()
+            _rendezvous(store, args.rank, args.world_size, "bootstrap/mc2-state-ready")
+            _save(result_path, result, "bootstrap/mc2-initialize-state")
+            setup.initialize_state()
+            torch.npu.synchronize()
+            result["mc2_state_initialization"]["drained"] = True
+            torch.testing.assert_close(setup_source.cpu(), torch.ones(1, dtype=dtype), rtol=0, atol=0)
+            assert torch.all(torch.isnan(setup_output.cpu())), "MC2 state initialization produced AllGather output"
+            _check_guards(setup_source_storage, 1, setup_source_guard)
+            _check_guards(setup_output_storage, args.world_size, setup_output_guard)
+            _rendezvous(store, args.rank, args.world_size, "bootstrap/mc2-state-initialized")
+            _save(result_path, result, "bootstrap/mc2-close-setup")
+            setup.close()
+            _active_prepared = None
+            result["mc2_state_initialization"]["prepared_closed"] = True
+            _rendezvous(store, args.rank, args.world_size, "bootstrap/mc2-setup-closed")
         if args.stress_batch:
             _run_batch(args, store, result, result_path, None, None, None, hccl_comm_name)
         else:
@@ -1762,13 +1420,13 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-probe-stage",
         choices=("resource", "before-barrier", "after-barrier", "final-zero"),
-        help="hccl_aiv diagnostic only, not AllGather correctness",
+        help="Retired whole-kernel-barrier diagnostic; rejected before execution",
     )
     parser.add_argument(
         "--mc2-delay-iterations",
         type=int,
         default=None,
-        help="Required final-zero diagnostic delay iterations in 0..100000000",
+        help="Retired final-zero diagnostic option; rejected before execution",
     )
     parser.add_argument("--hccl-op-expansion-mode", type=int, choices=(4,), help="Matched HCCL AIV Only (4)")
     parser.add_argument("--profile-samples", type=int, default=0)
@@ -1786,7 +1444,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Level2 identities: PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536-or-524288; new chunk requires offline qualification",
+        help="Unqualified Level2 lane identities: PE2 FP16/count64/L2/chunk128 or TP16 BF16/count309760/L4/chunk65536",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1802,7 +1460,9 @@ def _main() -> None:
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--skew-phase", choices=("none", "read", "ack"), default="none")
-    parser.add_argument("--skew-iterations", type=int, default=0)
+    parser.add_argument(
+        "--skew-iterations", type=int, default=0, help="Bounded correctness delay steps; not cycles or time units"
+    )
     parser.add_argument("--graph-replays", type=int, help="Checked retained graph replay rounds")
     parser.add_argument("--alternate-count", type=int, help="Second live graph contains one call of this count")
     parser.add_argument(
@@ -1812,40 +1472,13 @@ def _main() -> None:
         "--compile-only", action="store_true", help="Lower DSL only; no SHMEM bootstrap or NPU execution"
     )
     parser.add_argument("--counts", type=int, nargs="+", default=[64, 65, 127, 128, 129])
-    parser.add_argument("--lanes", type=int, help="SHMEM lanes (default 2); not used by hccl_aiv")
+    parser.add_argument("--lanes", type=int, help="Total lane blocks (default 2); MC2 supports 1..32")
     parser.add_argument("--chunk-bytes", type=int, default=128)
     parser.add_argument("--heap-bytes", type=int, help="SHMEM heap bytes (default 64 MiB); not used by hccl_aiv")
     parser.add_argument("--repeats", type=int, default=16)
     args = parser.parse_args()
-    if args.mc2_probe_stage is not None and args.backend != "hccl_aiv":
-        parser.error("mc2-probe-stage requires the hccl_aiv backend")
-    if args.mc2_probe_stage == "final-zero":
-        if args.mc2_delay_iterations is None or not 0 <= args.mc2_delay_iterations <= 100000000:
-            parser.error("final-zero requires mc2-delay-iterations in 0..100000000")
-    elif args.mc2_delay_iterations is not None:
-        parser.error("mc2-delay-iterations requires the final-zero diagnostic")
-    if args.mc2_probe_stage is not None:
-        pe2_control = (
-            args.world_size == 2
-            and args.dtype == "float16"
-            and args.counts == [64]
-            and args.repeats == 1
-            and args.chunk_bytes == 128
-        )
-        pe16_control = (
-            args.mc2_probe_stage == "final-zero"
-            and args.world_size == 16
-            and args.dtype == "bfloat16"
-            and args.counts in ([1], [309760])
-            and args.repeats == 2
-            and args.chunk_bytes == 65536
-            and args.mc2_delay_iterations == 0
-        )
-        if not pe2_control and not pe16_control:
-            parser.error(
-                "mc2-probe-stage requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128; "
-                "only final-zero also permits PE16 BF16, counts=[1] or [309760], repeats=2, chunk-bytes=65536 and delay=0"
-            )
+    if args.mc2_probe_stage is not None or args.mc2_delay_iterations is not None:
+        parser.error("The whole-kernel-barrier MC2 diagnostics are retired; they cannot run the lane protocol")
     if args.backend == "hccl_aiv":
         if args.mode == "graph" and (args.world_size not in (2, 8, 16) or args.mc2_probe_stage is not None):
             parser.error("hccl_aiv basic graph entry requires PE2/8/16 normal AllGather without diagnostics")
@@ -1863,17 +1496,14 @@ def _main() -> None:
                 "hccl_aiv retained graphs require normal PE2 graph, one primary count, "
                 "repeats=1 and distinct alternate count"
             )
-        if args.skew_phase != "none" or args.skew_iterations != 0:
-            parser.error("hccl_aiv requires numerical or aligned profiling checks without skew")
         if args.world_size not in (2, 8, 16):
             parser.error("hccl_aiv requires 2/8/16 ranks")
-        if args.lanes is not None or args.heap_bytes is not None:
-            parser.error("hccl_aiv uses MC2 rank-based blocks/windows, not SHMEM lanes or heap")
-    else:
-        if args.lanes is None:
-            args.lanes = 2
-        if args.heap_bytes is None:
-            args.heap_bytes = 64 * 1024 * 1024
+        if args.heap_bytes is not None:
+            parser.error("hccl_aiv uses MC2 windows, not a SHMEM heap")
+    elif args.heap_bytes is None:
+        args.heap_bytes = 64 * 1024 * 1024
+    if args.lanes is None:
+        args.lanes = 2
     if args.profile_warmup is None:
         args.profile_warmup = 0 if args.profile_submission == "alltoall_graph" else 20
     if args.profile_samples < 0:
@@ -1972,13 +1602,15 @@ def _main() -> None:
         args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
     ):
         parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
-    if args.repeats <= 0 or (args.lanes is not None and args.lanes <= 0):
-        parser.error("Require positive repeats and positive SHMEM lanes")
+    if args.repeats <= 0 or args.lanes <= 0:
+        parser.error("Require positive repeats and positive lanes")
+    if args.backend == "hccl_aiv" and args.lanes > 32:
+        parser.error("MC2 supports lanes in 1..32; native launch also checks hardware capacity")
     if args.backend == "ascendc" and args.lanes > 48:
         parser.error("Ascend C supports lanes in 1..48; native launch also checks hardware capacity")
     if args.backend in ("shmem", "hccl") and args.lanes % 2:
         parser.error("TileLang MIX and matched HCCL configuration require even lanes")
-    chunk_limit = 4 * 1024 * 1024 if args.backend == "hccl_aiv" else 64 * 1024
+    chunk_limit = 64 * 1024
     if not 0 < args.chunk_bytes <= chunk_limit or args.chunk_bytes % 128:
         parser.error(f"Require chunk-bytes <= {chunk_limit} and a positive multiple of 128")
     if len(set(args.counts)) != len(args.counts) or any(
@@ -2001,12 +1633,17 @@ def _main() -> None:
     if args.profile_samples and args.profile_level is None:
         args.profile_level = "Level1"
     capture_identity_preset = (
-        args.world_size == 2 and args.dtype == "float16" and args.counts == [64] and args.chunk_bytes == 128
+        args.world_size == 2
+        and args.dtype == "float16"
+        and args.counts == [64]
+        and args.lanes == 2
+        and args.chunk_bytes == 128
     ) or (
         args.world_size == 16
         and args.dtype == "bfloat16"
         and args.counts == [309760]
-        and args.chunk_bytes in (65536, 524288)
+        and args.lanes == 4
+        and args.chunk_bytes == 65536
     )
     if args.mc2_capture_identity and (
         args.backend != "hccl_aiv"
@@ -2021,8 +1658,8 @@ def _main() -> None:
         or args.repeats != 2
     ):
         parser.error(
-            "mc2-capture-identity requires normal PE2 FP16/count64/chunk128 or "
-            "PE16 BF16/count309760/chunk65536-or-524288, repeats2 Level2 aligned profiling"
+            "mc2-capture-identity requires normal PE2 FP16/count64/L2/chunk128 or "
+            "TP16 BF16/count309760/L4/chunk65536, repeats2 Level2 aligned profiling; lane metadata is unqualified"
         )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -2089,16 +1726,11 @@ def _main() -> None:
             )
         },
     }
+    if args.backend == "hccl_aiv":
+        result["skew_mechanism"] = "per_lane_PIPE_ALL_iterations"
     if args.mc2_capture_identity:
         result["purpose"] = "performance_measurement"
         result["performance_verdict"] = "UNASSESSED"
-    if args.mc2_probe_stage is not None:
-        result["purpose"] = (
-            "mc2_final_zero_diagnostic_not_all_gather_qualification"
-            if args.mc2_probe_stage == "final-zero"
-            else "mc2_diagnostic_not_all_gather_correctness"
-        )
-        result["all_gather_correctness"] = "UNTESTED"
     if args.profile_submission == "alltoall_graph":
         result["prefix_hccl_config"] = {"hccl_op_expansion_mode": 0}
     # Refuse an earlier attempt's rank result or rendezvous namespace.
