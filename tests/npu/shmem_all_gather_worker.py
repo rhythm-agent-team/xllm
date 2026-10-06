@@ -1658,7 +1658,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="PE2 Level2 capture identity diagnostic only, not performance",
+        help="PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536 Level2 identity diagnostic; not performance",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1872,6 +1872,9 @@ def _main() -> None:
         parser.error("mc2-profile-level requires normal hccl_aiv alltoall_graph profiling")
     if args.backend == "hccl_aiv" and args.profile_samples and args.mc2_profile_level is None:
         args.mc2_profile_level = "Level1"
+    capture_identity_preset = (
+        args.world_size == 2 and args.dtype == "float16" and args.counts == [64] and args.chunk_bytes == 128
+    ) or (args.world_size == 16 and args.dtype == "bfloat16" and args.counts == [309760] and args.chunk_bytes == 65536)
     if args.mc2_capture_identity and (
         args.backend != "hccl_aiv"
         or args.profile_submission != "alltoall_graph"
@@ -1881,13 +1884,13 @@ def _main() -> None:
         or args.mc2_profile_level != "Level2"
         or args.mc2_probe_stage is not None
         or args.mode != "eager"
-        or args.world_size != 2
-        or args.dtype != "float16"
-        or args.counts != [64]
-        or args.chunk_bytes != 128
+        or not capture_identity_preset
         or args.repeats != 2
     ):
-        parser.error("mc2-capture-identity requires normal PE2 FP16/count64/chunk128/repeats2 Level2 aligned profiling")
+        parser.error(
+            "mc2-capture-identity requires normal PE2 FP16/count64/chunk128 or "
+            "PE16 BF16/count309760/chunk65536, repeats2 Level2 aligned profiling"
+        )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
