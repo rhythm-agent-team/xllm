@@ -469,10 +469,16 @@ def _run_case(
         torch.npu.synchronize()
         phase = f"count-{count}/continuous-pair"
         case["continuous_pair"] = {"calls": 2, "checked_final_output": False}
+        if args.mc2_pair_drain_first:
+            case["continuous_pair"].update({"inter_call_drains": 1, "first_call_drained": False})
         _save(result_path, result, phase)
         _rendezvous(store, args.rank, args.world_size, phase)
         with torch.npu.stream(stream):
             _gather()
+            if args.mc2_pair_drain_first:
+                torch.npu.synchronize()
+                case["continuous_pair"]["first_call_drained"] = True
+                _save(result_path, result, phase)
             _gather()
             torch.add(output, 1, out=consumed)
         torch.npu.synchronize()
@@ -1214,6 +1220,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "mc2_profile_level",
         "mc2_capture_identity",
         "mc2_submission_identity",
+        "mc2_pair_drain_first",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1498,6 +1505,11 @@ def _main() -> None:
         action="store_true",
         help="Observe public eager host submission identities; not execution/completion or performance proof",
     )
+    parser.add_argument(
+        "--mc2-pair-drain-first",
+        action="store_true",
+        help="Diagnostic drain between the two observed eager calls; not continuous-call qualification",
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -1757,6 +1769,8 @@ def _main() -> None:
         parser.error(
             "mc2-submission-identity requires ordinary hccl_aiv eager numerical calls without profiling/capture"
         )
+    if args.mc2_pair_drain_first and not args.mc2_submission_identity:
+        parser.error("mc2-pair-drain-first requires mc2-submission-identity eager numerical diagnostics")
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1768,6 +1782,7 @@ def _main() -> None:
         "mc2_profile_level": args.profile_level if args.backend == "hccl_aiv" else None,
         "mc2_capture_identity": args.mc2_capture_identity,
         "mc2_submission_identity": args.mc2_submission_identity,
+        "mc2_pair_drain_first": args.mc2_pair_drain_first,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
