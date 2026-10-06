@@ -902,12 +902,13 @@ def _run_batch(
     batch_counts = args.counts * args.repeats
     retained_counts = batch_counts + ([] if args.alternate_count is None else [args.alternate_count])
     for call_id, count in enumerate(retained_counts):
-        source_storage, source, source_guard = _guarded(count, dtype, device)
-        output_storage, output, output_guard = _guarded(args.world_size * count, dtype, device)
-        consumer_storage, consumer, consumer_guard = _guarded(args.world_size * count, dtype, device)
+        call_dtype = getattr(torch, args.alternate_dtype or args.dtype) if call_id >= len(batch_counts) else dtype
+        source_storage, source, source_guard = _guarded(count, call_dtype, device)
+        output_storage, output, output_guard = _guarded(args.world_size * count, call_dtype, device)
+        consumer_storage, consumer, consumer_guard = _guarded(args.world_size * count, call_dtype, device)
         scratch = _prepare_scratch(args, device) if uses_shmem else None
-        local = _payload(args.rank, count, call_id, dtype)
-        expected = torch.cat([_payload(peer, count, call_id, dtype) for peer in range(args.world_size)])
+        local = _payload(args.rank, count, call_id, call_dtype)
+        expected = torch.cat([_payload(peer, count, call_id, call_dtype) for peer in range(args.world_size)])
         source.copy_(local)
         output.fill_(float("nan"))
         consumer.fill_(float("nan"))
@@ -977,6 +978,7 @@ def _run_batch(
         result["batch"].update(
             {
                 "lane_schedules": [call["lane_schedule"] for call in calls],
+                "call_dtypes": [str(call["source"].dtype).removeprefix("torch.") for call in calls],
                 "prepared_closed": False,
             }
         )
@@ -1027,9 +1029,10 @@ def _run_batch(
     def _prepare(group: list[dict[str, Any]], iteration: int) -> None:
         for call in group:
             identity = iteration + call["call_id"]
-            call["local"] = _payload(args.rank, call["count"], identity, dtype)
+            call_dtype = call["source"].dtype
+            call["local"] = _payload(args.rank, call["count"], identity, call_dtype)
             call["expected"] = torch.cat(
-                [_payload(peer, call["count"], identity, dtype) for peer in range(args.world_size)]
+                [_payload(peer, call["count"], identity, call_dtype) for peer in range(args.world_size)]
             )
             call["source"].copy_(call["local"])
             call["output"].fill_(float("nan"))
@@ -1205,6 +1208,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "skew_iterations",
         "graph_replays",
         "alternate_count",
+        "alternate_dtype",
         "dtype",
         "counts",
         "lanes",
@@ -1485,6 +1489,11 @@ def _main() -> None:
     parser.add_argument("--graph-replays", type=int, help="Checked retained graph replay rounds")
     parser.add_argument("--alternate-count", type=int, help="Second live graph contains one call of this count")
     parser.add_argument(
+        "--alternate-dtype",
+        choices=("float32", "float16", "bfloat16"),
+        help="Second retained MC2 graph dtype, sharing the initialized communicator",
+    )
+    parser.add_argument(
         "--stress-batch", action="store_true", help="Retain counts * repeats calls and check after each full drain"
     )
     parser.add_argument(
@@ -1498,6 +1507,16 @@ def _main() -> None:
     args = parser.parse_args()
     if args.mc2_probe_stage is not None or args.mc2_delay_iterations is not None:
         parser.error("The whole-kernel-barrier MC2 diagnostics are retired; they cannot run the lane protocol")
+    if args.alternate_dtype is not None and (
+        args.backend != "hccl_aiv"
+        or not args.stress_batch
+        or args.mode != "graph"
+        or args.alternate_count is None
+        or args.alternate_dtype == args.dtype
+        or args.profile_samples
+        or args.profile_submission is not None
+    ):
+        parser.error("alternate-dtype requires two retained MC2 graphs of different dtypes without profiling")
     if args.backend == "hccl_aiv":
         if args.mode == "graph" and (args.world_size not in (2, 8, 16) or args.mc2_probe_stage is not None):
             parser.error("hccl_aiv basic graph entry requires PE2/8/16 normal AllGather without diagnostics")
@@ -1508,12 +1527,12 @@ def _main() -> None:
             or len(args.counts) != 1
             or args.repeats != 1
             or args.alternate_count is None
-            or args.alternate_count == args.counts[0]
+            or (args.alternate_count == args.counts[0] and args.alternate_dtype is None)
             or not 0 < args.world_size * args.alternate_count <= (1 << 31) - 1
         ):
             parser.error(
                 "hccl_aiv retained graphs require normal PE2 graph, one primary count, "
-                "repeats=1 and distinct alternate count"
+                "repeats=1 and a distinct alternate count or dtype"
             )
         if args.world_size not in (2, 8, 16):
             parser.error("hccl_aiv requires 2/8/16 ranks")
@@ -1729,6 +1748,7 @@ def _main() -> None:
         "skew_iterations": args.skew_iterations,
         "graph_replays": args.graph_replays,
         "alternate_count": args.alternate_count,
+        "alternate_dtype": args.alternate_dtype,
         "compile_only": args.compile_only,
         "dtype": args.dtype,
         "counts": args.counts,
