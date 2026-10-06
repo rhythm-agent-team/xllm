@@ -278,6 +278,8 @@ def _run_case(
     consumer_storage, consumed, consumer_guard = _guarded(args.world_size * count, dtype, device)
     rank_major_output = output.view(args.world_size, count)
     case: dict[str, Any] = {"count": count, "checked_iterations": [], "graph_replays": 0}
+    if args.mc2_submission_identity:
+        case["submission_identities"] = []
     result["cases"].append(case)
     scratch = None
     kernel = None
@@ -331,7 +333,28 @@ def _run_case(
         elif args.backend == "ascendc":
             _gather_ascendc(args, source_tensor, output_tensor, receive, controls, epochs, scratch["tensor"])
         elif args.backend == "hccl_aiv":
-            prepared.run()
+            if args.mc2_submission_identity:
+                phase = result["phase"]
+                observation = {
+                    "submission_index": len(case["submission_identities"]),
+                    "phase": phase,
+                    "host_native_thread_id": threading.get_native_id(),
+                    "run_returned": False,
+                }
+                case["submission_identities"].append(observation)
+                observation["before"] = dict(prepared.eager_submission_identity())
+                _save(result_path, result, phase)
+                try:
+                    prepared.run()
+                    observation["run_returned"] = True
+                    observation["after"] = dict(prepared.eager_submission_identity())
+                finally:
+                    # Preserve partial observations and propagate launch/query errors.
+                    # Queries and file writes precede the consumer/drain and perturb
+                    # submission timing; these records do not qualify performance.
+                    _save(result_path, result, phase)
+            else:
+                prepared.run()
         else:
             torch.ops.xllm_ops.npu_all_gather(source_tensor, output_tensor, comm)
 
@@ -449,8 +472,8 @@ def _run_case(
         _save(result_path, result, phase)
         _rendezvous(store, args.rank, args.world_size, phase)
         with torch.npu.stream(stream):
-            prepared.run()
-            prepared.run()
+            _gather()
+            _gather()
             torch.add(output, 1, out=consumed)
         torch.npu.synchronize()
         _check_outputs(iteration, local, None)
@@ -1190,6 +1213,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "profile_level",
         "mc2_profile_level",
         "mc2_capture_identity",
+        "mc2_submission_identity",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1469,6 +1493,11 @@ def _main() -> None:
         action="store_true",
         help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at reserved L8/L48/chunk65536",
     )
+    parser.add_argument(
+        "--mc2-submission-identity",
+        action="store_true",
+        help="Observe public eager host submission identities; not execution/completion or performance proof",
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -1716,6 +1745,18 @@ def _main() -> None:
             "TP16 BF16/count309760 at L4/L8/L16, or one GLM5.2 TP16 embedding/logits shape at "
             "reserved L8/L48/chunk65536; completion metadata remains unqualified"
         )
+    if args.mc2_submission_identity and (
+        args.backend != "hccl_aiv"
+        or args.mode != "eager"
+        or args.stress_batch
+        or args.profile_samples
+        or args.profile_submission is not None
+        or args.mc2_capture_identity
+        or args.compile_only
+    ):
+        parser.error(
+            "mc2-submission-identity requires ordinary hccl_aiv eager numerical calls without profiling/capture"
+        )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1726,6 +1767,7 @@ def _main() -> None:
         "profile_level": args.profile_level,
         "mc2_profile_level": args.profile_level if args.backend == "hccl_aiv" else None,
         "mc2_capture_identity": args.mc2_capture_identity,
+        "mc2_submission_identity": args.mc2_submission_identity,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
