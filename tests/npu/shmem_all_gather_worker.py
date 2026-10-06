@@ -467,23 +467,33 @@ def _run_case(
         iteration = args.repeats
         local = _prepare(iteration)
         torch.npu.synchronize()
-        phase = f"count-{count}/continuous-pair"
-        case["continuous_pair"] = {"calls": 2, "checked_final_output": False}
+        sequence_key = "continuous_pair" if args.mc2_continuous_calls == 2 else "continuous_sequence"
+        phase = f"count-{count}/{sequence_key.replace('_', '-')}"
+        sequence = {"calls": args.mc2_continuous_calls, "checked_final_output": False}
+        case[sequence_key] = sequence
+        if args.mc2_continuous_calls != 2:
+            sequence["submitted_calls"] = 0
         if args.mc2_pair_drain_first:
             case["continuous_pair"].update({"inter_call_drains": 1, "first_call_drained": False})
         _save(result_path, result, phase)
         _rendezvous(store, args.rank, args.world_size, phase)
         with torch.npu.stream(stream):
-            _gather()
-            if args.mc2_pair_drain_first:
-                torch.npu.synchronize()
-                case["continuous_pair"]["first_call_drained"] = True
-                _save(result_path, result, phase)
-            _gather()
+            try:
+                for call_index in range(args.mc2_continuous_calls):
+                    _gather()
+                    if args.mc2_continuous_calls != 2:
+                        sequence["submitted_calls"] += 1
+                    if args.mc2_pair_drain_first and call_index == 0:
+                        torch.npu.synchronize()
+                        case["continuous_pair"]["first_call_drained"] = True
+                        _save(result_path, result, phase)
+            finally:
+                if args.mc2_continuous_calls != 2:
+                    _save(result_path, result, phase)
             torch.add(output, 1, out=consumed)
         torch.npu.synchronize()
         _check_outputs(iteration, local, None)
-        case["continuous_pair"]["checked_final_output"] = True
+        sequence["checked_final_output"] = True
     else:
         torch.npu.synchronize()
     if graph is not None:
@@ -1221,6 +1231,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "mc2_capture_identity",
         "mc2_submission_identity",
         "mc2_pair_drain_first",
+        "mc2_continuous_calls",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1510,6 +1521,12 @@ def _main() -> None:
         action="store_true",
         help="Diagnostic drain between the two observed eager calls; not continuous-call qualification",
     )
+    parser.add_argument(
+        "--mc2-continuous-calls",
+        type=int,
+        default=2,
+        help="Same-prepared eager calls before one consumer/drain; default 2, numerical stress only",
+    )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
@@ -1771,6 +1788,22 @@ def _main() -> None:
         )
     if args.mc2_pair_drain_first and not args.mc2_submission_identity:
         parser.error("mc2-pair-drain-first requires mc2-submission-identity eager numerical diagnostics")
+    if not 2 <= args.mc2_continuous_calls <= 256:
+        parser.error("mc2-continuous-calls must be in 2..256")
+    if args.mc2_continuous_calls != 2 and (
+        args.backend != "hccl_aiv"
+        or args.mode != "eager"
+        or args.stress_batch
+        or args.profile_samples
+        or args.profile_submission is not None
+        or args.mc2_capture_identity
+        or args.mc2_submission_identity
+        or args.mc2_pair_drain_first
+        or args.compile_only
+    ):
+        parser.error(
+            "mc2-continuous-calls requires ordinary hccl_aiv eager numerics without identity/drain diagnostics"
+        )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1783,6 +1816,7 @@ def _main() -> None:
         "mc2_capture_identity": args.mc2_capture_identity,
         "mc2_submission_identity": args.mc2_submission_identity,
         "mc2_pair_drain_first": args.mc2_pair_drain_first,
+        "mc2_continuous_calls": args.mc2_continuous_calls,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
