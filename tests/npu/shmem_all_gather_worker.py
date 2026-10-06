@@ -1786,7 +1786,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Required Level2 performance identities: PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536",
+        help="Level2 identities: PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536-or-524288; new chunk requires offline qualification",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -2002,7 +2002,12 @@ def _main() -> None:
         args.profile_level = "Level1"
     capture_identity_preset = (
         args.world_size == 2 and args.dtype == "float16" and args.counts == [64] and args.chunk_bytes == 128
-    ) or (args.world_size == 16 and args.dtype == "bfloat16" and args.counts == [309760] and args.chunk_bytes == 65536)
+    ) or (
+        args.world_size == 16
+        and args.dtype == "bfloat16"
+        and args.counts == [309760]
+        and args.chunk_bytes in (65536, 524288)
+    )
     if args.mc2_capture_identity and (
         args.backend != "hccl_aiv"
         or args.profile_submission != "alltoall_graph"
@@ -2017,7 +2022,7 @@ def _main() -> None:
     ):
         parser.error(
             "mc2-capture-identity requires normal PE2 FP16/count64/chunk128 or "
-            "PE16 BF16/count309760/chunk65536, repeats2 Level2 aligned profiling"
+            "PE16 BF16/count309760/chunk65536-or-524288, repeats2 Level2 aligned profiling"
         )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
