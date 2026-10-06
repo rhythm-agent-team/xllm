@@ -310,7 +310,10 @@ def _run_case(
             probe_block_count = 2 * args.world_size
             probe_call_count = 2
             probe_record_words = 8
-            probe_records_per_block = 37
+            probe_max_rounds = 10
+            probe_barrier_capacity = 4 * probe_max_rounds + 4
+            probe_round_records_first = 21 + 2 * probe_barrier_capacity
+            probe_records_per_block = probe_round_records_first + 7 * (probe_max_rounds - 1)
             probe_records_per_call = probe_block_count * probe_records_per_block
             probe_record_count = probe_call_count * probe_records_per_call
             probe_counter_words = probe_block_count * probe_record_words
@@ -343,8 +346,8 @@ def _run_case(
             events = _active_diagnostic["events"]
             initialized = torch.npu.Event(enable_timing=False)
             events.append(initialized)
-            pair_done = torch.npu.Event(enable_timing=False)
-            events.append(pair_done)
+            work_done = torch.npu.Event(enable_timing=False)
+            events.append(work_done)
             copied = torch.npu.Event(enable_timing=False)
             events.append(copied)
         else:
@@ -434,235 +437,358 @@ def _run_case(
 
     if args.mc2_probe_stage == "final-zero":
         phase = f"count-{count}/mc2-probe/final-zero"
+        probe_rounds = (count + args.chunk_bytes // source.element_size() - 1) // (
+            args.chunk_bytes // source.element_size()
+        )
+        probe_barriers = 4 * probe_rounds + 4
+        barrier_observation = observation_level == "dense" or probe_rounds > 1
         probe: dict[str, Any] = {
             "stage": "final-zero",
             "delay_iterations": args.mc2_delay_iterations,
             "observation_level": observation_level,
-            "actual": [],
+            "rounds": probe_rounds,
+            "barriers_per_call": probe_barriers,
+            "records_per_block": probe_records_per_block,
+            "barrier_observation": barrier_observation,
             "verified": False,
             "pair_completed": False,
-            "observer_visibility_verified": False,
             "before_pair_submission": False,
             "after_pair_submission": False,
-            "snapshot_index": -1,
-            "event_pending": {"pair": None, "observer_copy": False},
-            "observations": [],
-            "observed_records": [],
             "checked_preflight_iterations": [],
+            "preflights": [],
             "pair_iteration": args.repeats if args.world_size == 16 else 0,
         }
         case["mc2_probe"] = probe
-        seen: dict[int, dict[str, Any]] = {}
         poll_samples = (1, 1024, 65536) if observation_level == "dense" else (65536, 262144, 1048576)
-        poll_slots = {first + sample: (first, sample) for first in (5, 8, 14, 17) for sample in range(3)}
+        poll_slots = {
+            first + sample: (kind, round_index, sample)
+            for first, kind, round_index in (
+                (5, "v1", 0),
+                (8, "final_zero", probe_rounds),
+                (14, "v2", 0),
+                (17, "final_ack", probe_rounds),
+            )
+            for sample in range(3)
+        }
+        published_slots = {4: 0}
+        for round_index in range(1, probe_rounds):
+            first = probe_round_records_first + 7 * (round_index - 1)
+            published_slots[first] = round_index
+            for sample in range(3):
+                poll_slots[first + 1 + sample] = ("v1", round_index, sample)
+                poll_slots[first + 4 + sample] = ("v2", round_index, sample)
+        barrier_slots = range(21, 21 + 2 * probe_barriers)
 
-        def _observe_final_zero_snapshot(buffer: torch.Tensor, pair_pending: bool | None) -> None:
-            actual = buffer.tolist()
-            probe["actual"] = actual
-            probe["snapshot_index"] += 1
-            snapshot_index = probe["snapshot_index"]
-            new_commits = []
-            qualified = []
-            failure = None
-            for record_index in range(probe_record_count):
-                offset = probe_counter_words + record_index * probe_record_words
-                record = actual[offset : offset + probe_record_words]
-                entry = seen.get(record_index)
-                if record[0] == 0 and entry is None:
-                    continue
-                if record[0] != 0x4843434C465A3031:
-                    failure = f"Invalid MC2 final-zero commit at record {record_index}: {record}"
-                    break
-                if entry is None:
-                    entry = {"record_index": record_index, "first_seen_snapshot_index": snapshot_index}
-                    seen[record_index] = entry
-                    probe["observed_records"].append(entry)
-                    new_commits.append(record_index)
-                    continue
-                if "words" in entry:
-                    if entry["words"] != record:
-                        failure = f"MC2 final-zero immutable record {record_index} changed: {record}"
+        def _observe_final_zero_work(iteration: int, calls: int, observed: dict[str, Any], work_phase: str) -> None:
+            if calls not in (1, probe_call_count):
+                raise RuntimeError(f"Invalid MC2 diagnostic call count: {calls}")
+            observed.update(
+                {
+                    "iteration": iteration,
+                    "calls": calls,
+                    "actual": [],
+                    "verified": False,
+                    "work_completed": False,
+                    "before_submission": False,
+                    "after_submission": False,
+                    "observer_visibility_verified": False,
+                    "snapshot_index": -1,
+                    "event_pending": {"work": None, "observer_copy": False},
+                    "observations": [],
+                    "observed_records": [],
+                }
+            )
+            # Indices are immutable only within this successfully drained arena phase.
+            seen: dict[int, dict[str, Any]] = {}
+
+            def _observe_final_zero_snapshot(buffer: torch.Tensor, work_pending: bool | None) -> None:
+                actual = buffer.tolist()
+                observed["actual"] = actual
+                observed["snapshot_index"] += 1
+                snapshot_index = observed["snapshot_index"]
+                new_commits = []
+                qualified = []
+                failure = None
+                for record_index in range(probe_record_count):
+                    offset = probe_counter_words + record_index * probe_record_words
+                    record = actual[offset : offset + probe_record_words]
+                    entry = seen.get(record_index)
+                    if record[0] == 0 and entry is None:
+                        continue
+                    if record[0] != 0x4843434C465A3031:
+                        failure = f"Invalid MC2 final-zero commit at record {record_index}: {record}"
                         break
-                    continue
-                # The body is accepted only from a completed copy AFTER seeing commit.
-                call = record_index // probe_records_per_call + 1
-                block = (record_index % probe_records_per_call) // probe_records_per_block
-                slot = record_index % probe_records_per_block
-                if (record[1], record[2], record[3]) != (call, (args.rank << 32) | block, slot):
-                    failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
-                    break
-                if observation_level == "lean" and slot not in poll_slots:
-                    failure = f"Invalid MC2 final-zero lean checkpoint at record {record_index}: {record}"
-                    break
-                if slot in poll_slots:
-                    first, sample = poll_slots[slot]
-                    role, peer, expected = {
-                        5: (block < args.world_size and block != args.rank, block, 1),
-                        8: (block >= args.world_size, block - args.world_size, 0),
-                        14: (block == args.rank, args.rank, args.world_size),
-                        17: (block == args.rank, args.rank, args.world_size),
-                    }[first]
-                    if (
-                        not role
-                        or record[4] != peer
-                        or record[5] != expected
-                        or not -(1 << 31) <= record[6] < (1 << 31)
-                        or record[7] != poll_samples[sample]
+                    if entry is None:
+                        entry = {"record_index": record_index, "first_seen_snapshot_index": snapshot_index}
+                        seen[record_index] = entry
+                        observed["observed_records"].append(entry)
+                        new_commits.append(record_index)
+                        continue
+                    if "words" in entry:
+                        if entry["words"] != record:
+                            failure = f"MC2 final-zero immutable record {record_index} changed: {record}"
+                            break
+                        continue
+                    # Accept the body only in a completed snapshot AFTER seeing commit.
+                    call = record_index // probe_records_per_call + 1
+                    block = (record_index % probe_records_per_call) // probe_records_per_block
+                    slot = record_index % probe_records_per_block
+                    if call > calls or (record[1], record[2], record[3]) != (
+                        call,
+                        (args.rank << 32) | block,
+                        slot,
                     ):
-                        failure = f"Invalid MC2 final-zero {observation_level} poll at record {record_index}: {record}"
+                        failure = f"Invalid MC2 final-zero call/rank/block/slot at record {record_index}: {record}"
                         break
-                entry.update(
-                    {
-                        "qualified_snapshot_index": snapshot_index,
-                        "words": record,
-                        "call": call,
-                        "rank": args.rank,
-                        "block": block,
-                        "slot": slot,
-                        "peer": record[4] & ((1 << 64) - 1),
-                        "expected": record[5],
-                        "actual": record[6],
-                        "detail": record[7] & ((1 << 64) - 1),
-                    }
+                    context: dict[str, Any] = {}
+                    valid = False
+                    if slot in poll_slots:
+                        kind, round_index, sample = poll_slots[slot]
+                        role, peer, expected = {
+                            "v1": (block < args.world_size and block != args.rank, block, round_index + 1),
+                            "v2": (block == args.rank, args.rank, args.world_size * (round_index + 1)),
+                            "final_zero": (block >= args.world_size, block - args.world_size, 0),
+                            "final_ack": (block == args.rank, args.rank, args.world_size),
+                        }[kind]
+                        valid = (
+                            role
+                            and record[4] == peer
+                            and record[5] == expected
+                            and -(1 << 31) <= record[6] < (1 << 31)
+                            and record[7] == poll_samples[sample]
+                            and (observation_level != "lean" or record[6] != expected)
+                        )
+                        context = {"wait_kind": kind, "round": round_index}
+                    elif slot in barrier_slots and barrier_observation:
+                        barrier = (slot - 21) // 2
+                        round_index = min(barrier // 4, probe_rounds)
+                        if barrier < 4 * probe_rounds:
+                            boundary = ("entry", "after_v1", "after_movement", "after_v2")[barrier % 4]
+                            barrier_slot = round_index % 2
+                        else:
+                            boundary = ("drain_entry", "output_drain", "post_reset", "final_join")[
+                                barrier - 4 * probe_rounds
+                            ]
+                            barrier_slot = (probe_rounds % 2, 0, 1, 0)[barrier - 4 * probe_rounds]
+                        valid = record[4:8] == [-1, -1, -1, (barrier << 32) | barrier_slot]
+                        context = {
+                            "barrier": barrier,
+                            "round": round_index,
+                            "boundary": boundary,
+                            "witness": "before" if (slot - 21) % 2 == 0 else "after",
+                        }
+                    elif observation_level == "dense":
+                        if slot in (0, 1, 11, 12, 13):
+                            valid = record[4:8] == [-1, -1, -1, 0]
+                        elif slot in published_slots:
+                            round_index = published_slots[slot]
+                            valid = (
+                                block == args.rank
+                                and record[4] == args.rank
+                                and record[5] == round_index + 1
+                                and -(1 << 31) <= record[6] < (1 << 31)
+                                and record[7] == round_index + 1
+                            )
+                            context = {"round": round_index, "checkpoint": "v1_self_published"}
+                        elif slot == 20:
+                            valid = block >= args.world_size and record[4:8] == [
+                                block - args.world_size,
+                                -1,
+                                -1,
+                                2,
+                            ]
+                        elif slot in (2, 3):
+                            valid = (
+                                args.rank == 1
+                                and block == args.world_size
+                                and call == 1
+                                and record[4:8]
+                                == [
+                                    0,
+                                    0,
+                                    0,
+                                    args.mc2_delay_iterations,
+                                ]
+                            )
+                    if not valid:
+                        failure = (
+                            f"Invalid MC2 final-zero {observation_level} checkpoint at record {record_index}: {record}"
+                        )
+                        break
+                    entry.update(
+                        {
+                            "qualified_snapshot_index": snapshot_index,
+                            "words": record,
+                            "call": call,
+                            "rank": args.rank,
+                            "block": block,
+                            "slot": slot,
+                            "peer": record[4] & ((1 << 64) - 1),
+                            "expected": record[5],
+                            "actual": record[6],
+                            "detail": record[7] & ((1 << 64) - 1),
+                            "work_pending": work_pending,
+                            **context,
+                        }
+                    )
+                    qualified.append(record_index)
+                    if work_pending is True:
+                        observed["observer_visibility_verified"] = True
+                if snapshot_index == 0 or new_commits or qualified or failure is not None:
+                    observed["observations"].append(
+                        {
+                            "snapshot_index": snapshot_index,
+                            "work_pending": work_pending,
+                            "new_commits": new_commits,
+                            "qualified_records": qualified,
+                        }
+                    )
+                    _save(result_path, result, f"{work_phase}/snapshot-{snapshot_index}")
+                if failure is not None:
+                    raise RuntimeError(failure)
+
+            _save(result_path, result, f"{work_phase}/prepare")
+            with torch.npu.stream(stream):
+                local = _prepare(iteration)
+                diagnostic.zero_()
+                initialized.record(stream)
+            torch.npu.synchronize()
+            observer.wait_event(initialized)
+            deadline = time.monotonic() + 90
+            with torch.npu.stream(observer):
+                cpu_snapshots[0].copy_(diagnostic, non_blocking=True)
+                copied.record(observer)
+            observed["event_pending"]["observer_copy"] = True
+            _save(result_path, result, f"{work_phase}/initialize")
+            while not copied.query():
+                if time.monotonic() >= deadline:
+                    _save(result_path, result, f"{work_phase}/timeout")
+                    raise RuntimeError(f"MC2 final-zero initialization copy timeout: {observed['event_pending']}")
+                time.sleep(0.05)
+            observed["event_pending"]["observer_copy"] = False
+            _observe_final_zero_snapshot(cpu_snapshots[0], None)
+            if any(observed["actual"]):
+                raise RuntimeError("MC2 final-zero diagnostic initialization is not zero")
+            _rendezvous(store, args.rank, args.world_size, f"{work_phase}/ready")
+            observed["before_submission"] = True
+            if calls == 2:
+                probe["before_pair_submission"] = True
+            _save(result_path, result, f"{work_phase}/submit-before")
+            with torch.npu.stream(stream):
+                if calls == 1:
+                    prepared.run()
+                else:
+                    prepared.run()
+                    prepared.run()
+                work_done.record(stream)
+                torch.add(output, 1, out=consumed)
+            observed["after_submission"] = True
+            observed["event_pending"]["work"] = True
+            if calls == 2:
+                probe["after_pair_submission"] = True
+            _save(result_path, result, f"{work_phase}/submit-after")
+
+            deadline = time.monotonic() + 90
+            buffer_index = 1
+            copy_pending = False
+            copy_started_after_work = False
+            completed_after_work = 0
+            while True:
+                work_pending = not work_done.query()
+                if copy_pending:
+                    copy_pending = not copied.query()
+                    if not copy_pending:
+                        # Query work AFTER knowing the independent copy completed.
+                        work_pending = not work_done.query()
+                        observed["work_completed"] = not work_pending
+                        observed["event_pending"] = {"work": work_pending, "observer_copy": False}
+                        _observe_final_zero_snapshot(cpu_snapshots[buffer_index], work_pending)
+                        if copy_started_after_work:
+                            completed_after_work += 1
+                        if completed_after_work >= 2:
+                            break
+                        buffer_index = 1 - buffer_index
+                observed["work_completed"] = not work_pending
+                observed["event_pending"] = {"work": work_pending, "observer_copy": copy_pending}
+                if calls == 2:
+                    probe["pair_completed"] = not work_pending
+                if time.monotonic() >= deadline:
+                    observed["observations"].append({"snapshot_index": observed["snapshot_index"], "reason": "timeout"})
+                    _save(result_path, result, f"{work_phase}/timeout")
+                    raise RuntimeError(
+                        f"MC2 final-zero observation timeout; pending={observed['event_pending']}; "
+                        f"snapshot_index={observed['snapshot_index']}; saved_checkpoints={observed['observed_records']}; "
+                        "timeout alone does not identify a flag or local-barrier stall"
+                    )
+                if not copy_pending:
+                    copy_started_after_work = not work_pending
+                    with torch.npu.stream(observer):
+                        cpu_snapshots[buffer_index].copy_(diagnostic, non_blocking=True)
+                        copied.record(observer)
+                    copy_pending = True
+                    observed["event_pending"]["observer_copy"] = True
+                time.sleep(0.05)
+
+            observed["work_completed"] = True
+            observed["event_pending"] = {"work": False, "observer_copy": False}
+            if calls == 2:
+                probe["pair_completed"] = True
+            observed["observations"].append({"snapshot_index": observed["snapshot_index"], "reason": "final"})
+            _save(result_path, result, f"{work_phase}/observed")
+            observer.synchronize()
+            stream.synchronize()
+            _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
+            if [observed["actual"][block * probe_record_words] for block in range(probe_block_count)] != [
+                calls
+            ] * probe_block_count:
+                raise RuntimeError(
+                    f"MC2 final-zero block counters are not {calls}: {observed['actual'][:probe_counter_words]}"
                 )
-                qualified.append(record_index)
-                if pair_pending is True:
-                    probe["observer_visibility_verified"] = True
-            if snapshot_index == 0 or new_commits or qualified or failure is not None:
-                probe["observations"].append(
-                    {
-                        "snapshot_index": snapshot_index,
-                        "pair_pending": pair_pending,
-                        "new_commits": new_commits,
-                        "qualified_records": qualified,
-                        "actual": actual,
-                    }
+            required = [
+                (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
+                for call in range(1, calls + 1)
+                for block in range(probe_block_count)
+                for slot in (
+                    *((0, 1, 11, 12, 13) if observation_level == "dense" else ()),
+                    *(barrier_slots if barrier_observation else ()),
                 )
-                _save(result_path, result, f"{phase}/snapshot-{snapshot_index}")
-            if failure is not None:
-                raise RuntimeError(failure)
+            ]
+            if observation_level == "dense":
+                required.extend(
+                    (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
+                    for call in range(1, calls + 1)
+                    for slot in (
+                        *published_slots,
+                        17,
+                        *(slot for slot, (kind, _, sample) in poll_slots.items() if kind == "v2" and sample == 0),
+                    )
+                )
+                required.extend(
+                    (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
+                    for call in range(1, calls + 1)
+                    for block in range(args.world_size, probe_block_count)
+                )
+            if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required) or any(
+                "qualified_snapshot_index" not in entry for entry in seen.values()
+            ):
+                raise RuntimeError("MC2 final-zero work has incomplete required or committed records")
+            if calls == 1:
+                _check(iteration, local, None)
+            else:
+                _check_outputs(iteration, local, None)
+            observed["verified"] = True
+            _save(result_path, result, f"{work_phase}/checked")
 
         if args.world_size == 16:
             for iteration in (-2, -1, 0, 1):
-                _save(result_path, result, f"{phase}/preflight-{iteration}")
-                with torch.npu.stream(stream):
-                    local = _prepare(iteration)
-                    diagnostic.zero_()
-                    _submit()
-                _check(iteration, local, None)
-                _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
+                observed: dict[str, Any] = {}
+                probe["preflights"].append(observed)
+                _observe_final_zero_work(iteration, 1, observed, f"{phase}/preflight-{iteration}")
                 probe["checked_preflight_iterations"].append(iteration)
                 _save(result_path, result, f"{phase}/preflight-{iteration}/checked")
-
-        with torch.npu.stream(stream):
-            local = _prepare(probe["pair_iteration"])
-            diagnostic.zero_()
-            initialized.record(stream)
-        torch.npu.synchronize()
-        observer.wait_event(initialized)
-        deadline = time.monotonic() + 90
-        with torch.npu.stream(observer):
-            cpu_snapshots[0].copy_(diagnostic, non_blocking=True)
-            copied.record(observer)
-        probe["event_pending"]["observer_copy"] = True
-        _save(result_path, result, f"{phase}/initialize")
-        while not copied.query():
-            if time.monotonic() >= deadline:
-                _save(result_path, result, f"{phase}/timeout")
-                raise RuntimeError(f"MC2 final-zero initialization copy timeout: {probe['event_pending']}")
-            time.sleep(0.05)
-        probe["event_pending"]["observer_copy"] = False
-        _observe_final_zero_snapshot(cpu_snapshots[0], None)
-        if any(probe["actual"]):
-            raise RuntimeError("MC2 final-zero diagnostic initialization is not zero")
-        _rendezvous(store, args.rank, args.world_size, f"{phase}/ready")
-        probe["before_pair_submission"] = True
-        _save(result_path, result, f"{phase}/submit-before")
-        with torch.npu.stream(stream):
-            prepared.run()
-            prepared.run()
-            pair_done.record(stream)
-            torch.add(output, 1, out=consumed)
-        probe["after_pair_submission"] = True
-        _save(result_path, result, f"{phase}/submit-after")
-
-        deadline = time.monotonic() + 90
-        buffer_index = 1
-        copy_pending = False
-        copy_started_after_pair = False
-        completed_after_pair = 0
-        while True:
-            pair_pending = not pair_done.query()
-            if copy_pending:
-                copy_pending = not copied.query()
-                if not copy_pending:
-                    # Query the pair AFTER knowing this independent copy completed.
-                    pair_pending = not pair_done.query()
-                    probe["pair_completed"] = not pair_pending
-                    probe["event_pending"] = {"pair": pair_pending, "observer_copy": False}
-                    _observe_final_zero_snapshot(cpu_snapshots[buffer_index], pair_pending)
-                    if copy_started_after_pair:
-                        completed_after_pair += 1
-                    if completed_after_pair >= 2:
-                        break
-                    buffer_index = 1 - buffer_index
-            probe["pair_completed"] = not pair_pending
-            probe["event_pending"] = {"pair": pair_pending, "observer_copy": copy_pending}
-            if time.monotonic() >= deadline:
-                probe["observations"].append(
-                    {"snapshot_index": probe["snapshot_index"], "reason": "timeout", "actual": probe["actual"]}
-                )
-                _save(result_path, result, f"{phase}/timeout")
-                raise RuntimeError(
-                    f"MC2 final-zero observation timeout; pending={probe['event_pending']}; "
-                    f"snapshot_index={probe['snapshot_index']}; saved_checkpoints={probe['observed_records']}; "
-                    "timeout alone does not establish final-zero deadlock"
-                )
-            if not copy_pending:
-                copy_started_after_pair = not pair_pending
-                with torch.npu.stream(observer):
-                    cpu_snapshots[buffer_index].copy_(diagnostic, non_blocking=True)
-                    copied.record(observer)
-                copy_pending = True
-                probe["event_pending"]["observer_copy"] = True
-            time.sleep(0.05)
-
-        probe["pair_completed"] = True
-        probe["event_pending"] = {"pair": False, "observer_copy": False}
-        probe["observations"].append(
-            {"snapshot_index": probe["snapshot_index"], "reason": "final", "actual": probe["actual"]}
-        )
-        _save(result_path, result, f"{phase}/observed")
-        observer.synchronize()
-        stream.synchronize()
-        _check_outputs(probe["pair_iteration"], local, None)
-        _check_guards(diagnostic_storage, probe_words, diagnostic_guard)
-        if [probe["actual"][block * probe_record_words] for block in range(probe_block_count)] != [
-            2
-        ] * probe_block_count:
-            raise RuntimeError(f"MC2 final-zero block counters are not two: {probe['actual'][:probe_counter_words]}")
-        if observation_level == "dense":
-            required = [
-                (call - 1) * probe_records_per_call + block * probe_records_per_block + slot
-                for call in range(1, probe_call_count + 1)
-                for block in range(probe_block_count)
-                for slot in (0, 1, 11, 12, 13, *range(21, probe_records_per_block))
-            ]
-            required.extend(
-                (call - 1) * probe_records_per_call + args.rank * probe_records_per_block + slot
-                for call in range(1, probe_call_count + 1)
-                for slot in (14, 17)
-            )
-            required.extend(
-                (call - 1) * probe_records_per_call + block * probe_records_per_block + 20
-                for call in range(1, probe_call_count + 1)
-                for block in range(args.world_size, probe_block_count)
-            )
-            if any(index not in seen or "qualified_snapshot_index" not in seen[index] for index in required):
-                raise RuntimeError(
-                    "MC2 final-zero pair has incomplete common, self-sender V2/ACK or output ACK_SENT records"
-                )
-        probe["verified"] = True
+        # No reset follows an incomplete phase. Successful phases have drained
+        # both streams and retained their phase-local immutable observations.
+        _observe_final_zero_work(probe["pair_iteration"], 2, probe, f"{phase}/pair")
         _save(result_path, result, f"count-{count}/close")
         prepared.close()
         _active_prepared = None
@@ -1708,7 +1834,7 @@ def _main() -> None:
             args.mc2_probe_stage == "final-zero"
             and args.world_size == 16
             and args.dtype == "bfloat16"
-            and args.counts == [1]
+            and args.counts in ([1], [309760])
             and args.repeats == 2
             and args.chunk_bytes == 65536
             and args.mc2_delay_iterations == 0
@@ -1716,7 +1842,7 @@ def _main() -> None:
         if not pe2_control and not pe16_control:
             parser.error(
                 "mc2-probe-stage requires PE2 FP16, counts=[64], repeats=1 and chunk-bytes=128; "
-                "only final-zero also permits PE16 BF16, counts=[1], repeats=2, chunk-bytes=65536 and delay=0"
+                "only final-zero also permits PE16 BF16, counts=[1] or [309760], repeats=2, chunk-bytes=65536 and delay=0"
             )
     if args.backend == "hccl_aiv":
         if args.mode == "graph" and (args.world_size not in (2, 8, 16) or args.mc2_probe_stage is not None):
