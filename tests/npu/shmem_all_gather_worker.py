@@ -42,6 +42,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -821,7 +822,22 @@ def _run_case(
         "directory": str(profile_dir),
     }
     if args.backend == "hccl_aiv":
-        profile.update({"mc2_profile_level": args.mc2_profile_level, "profiler": f"CPU+NPU_{args.mc2_profile_level}"})
+        profile.update(
+            {
+                "mc2_profile_level": args.mc2_profile_level,
+                "profiler": f"CPU+NPU_{args.mc2_profile_level}",
+                "mc2_capture_identity": args.mc2_capture_identity,
+            }
+        )
+        if args.mc2_capture_identity:
+            profile.update(
+                {
+                    "purpose": "mc2_capture_identity_diagnostic_not_performance",
+                    "performance_verdict": "NOT_PERFORMANCE",
+                    "capture_identity_records": [],
+                    "replay_thread_identity": {},
+                }
+            )
     case["profile"] = profile
     _save(result_path, result, f"count-{count}/profile/prepare")
     profiler = torch_npu.profiler.profile(
@@ -874,6 +890,8 @@ def _run_case(
             calls[-1]["prepared"] = torch.classes.hccl_aiv_ops.PreparedAllGather(
                 buffers["source"][1], buffers["output"][1], hccl_comm_name, args.world_size, args.chunk_bytes
             )
+            if args.mc2_capture_identity:
+                calls[-1]["prepared"].enable_capture_identity()
 
     def _check_profile_group(executed: bool | None) -> str:
         observed = set()
@@ -1021,11 +1039,34 @@ def _run_case(
         _submit_prefix()
         for call in calls:
             if args.backend == "hccl_aiv":
+                if args.mc2_capture_identity:
+                    call["capture_host_thread_id"] = threading.get_native_id()
                 call["prepared"].run()
             else:
                 _gather(call["buffers"]["source"][1], call["buffers"]["output"][1], call["rank_major"])
     torch.npu.synchronize()
     _rendezvous(store, args.rank, args.world_size, f"{phase}/drained")
+    if args.mc2_capture_identity:
+        identity_dump = profile_dir / "capture-instance-graph.json"
+        if identity_dump.exists() or identity_dump.is_symlink():
+            raise RuntimeError(f"MC2 capture identity dump path is not fresh: {identity_dump}")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        calls[0]["prepared"].dump_capture_identity_graph(str(identity_dump))
+        profile["capture_identity_graph_json"] = json.loads(identity_dump.read_text(encoding="utf-8"))
+        profile["capture_identity_graph"] = _file_identity(identity_dump)
+        for call, iteration in zip(calls, capture_iterations, strict=True):
+            profile["capture_identity_records"].append(
+                {
+                    "sample_index": call["record"]["sample_index"],
+                    "input_iteration": iteration,
+                    "host_thread_id": call["capture_host_thread_id"],
+                    **dict(call["prepared"].take_capture_identity_record()),
+                }
+            )
+        profile["capture_identity_dump_instance_handle"] = profile["capture_identity_records"][0][
+            "before_capture_instance_handle"
+        ]
+        _save(result_path, result, f"{phase}/identity-observed")
     aligned["capture"] = {
         "input_iterations": capture_iterations,
         "prefix_input_iteration": -args.profile_graph_warmup - 1,
@@ -1048,7 +1089,17 @@ def _run_case(
         with torch.npu.stream(stream):
             if measured:
                 with torch.profiler.record_function(aligned["replay_range"]):
+                    if args.mc2_capture_identity:
+                        profile["replay_thread_identity"]["before"] = {
+                            "host_thread_id": threading.get_native_id(),
+                            **dict(calls[0]["prepared"].thread_identity()),
+                        }
                     profile_graph.replay()
+                    if args.mc2_capture_identity:
+                        profile["replay_thread_identity"]["after"] = {
+                            **dict(calls[0]["prepared"].thread_identity()),
+                            "host_thread_id": threading.get_native_id(),
+                        }
             else:
                 profile_graph.replay()
         torch.npu.synchronize()
@@ -1425,6 +1476,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "mc2_probe_stage",
         "mc2_delay_iterations",
         "mc2_profile_level",
+        "mc2_capture_identity",
         "profile_samples",
         "profile_warmup",
         "profile_rank0_delay_ms",
@@ -1453,6 +1505,8 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "environment",
     )
     configuration_data = {name: result[name] for name in configuration_fields}
+    if args.mc2_capture_identity:
+        configuration_data["purpose"] = result["purpose"]
     if args.backend in ("hccl", "hccl_aiv"):
         configuration_data["hccl_config"] = result["hccl_config"]
     if args.profile_submission == "alltoall_graph":
@@ -1600,6 +1654,11 @@ def _main() -> None:
         choices=("Level1", "Level2"),
         default=None,
         help="Normal hccl_aiv aligned profiling coverage (default Level1)",
+    )
+    parser.add_argument(
+        "--mc2-capture-identity",
+        action="store_true",
+        help="PE2 Level2 capture identity diagnostic only, not performance",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1813,6 +1872,22 @@ def _main() -> None:
         parser.error("mc2-profile-level requires normal hccl_aiv alltoall_graph profiling")
     if args.backend == "hccl_aiv" and args.profile_samples and args.mc2_profile_level is None:
         args.mc2_profile_level = "Level1"
+    if args.mc2_capture_identity and (
+        args.backend != "hccl_aiv"
+        or args.profile_submission != "alltoall_graph"
+        or args.profile_samples != 50
+        or args.profile_warmup != 0
+        or args.profile_graph_warmup != 20
+        or args.mc2_profile_level != "Level2"
+        or args.mc2_probe_stage is not None
+        or args.mode != "eager"
+        or args.world_size != 2
+        or args.dtype != "float16"
+        or args.counts != [64]
+        or args.chunk_bytes != 128
+        or args.repeats != 2
+    ):
+        parser.error("mc2-capture-identity requires normal PE2 FP16/count64/chunk128/repeats2 Level2 aligned profiling")
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.artifact_dir / f"rank-{args.rank}.json"
@@ -1821,6 +1896,7 @@ def _main() -> None:
         "mc2_probe_stage": args.mc2_probe_stage,
         "mc2_delay_iterations": args.mc2_delay_iterations,
         "mc2_profile_level": args.mc2_profile_level,
+        "mc2_capture_identity": args.mc2_capture_identity,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
         "comparison_id": args.comparison_id,
@@ -1876,6 +1952,9 @@ def _main() -> None:
             )
         },
     }
+    if args.mc2_capture_identity:
+        result["purpose"] = "mc2_capture_identity_diagnostic_not_performance"
+        result["performance_verdict"] = "NOT_PERFORMANCE"
     if args.mc2_probe_stage is not None:
         result["purpose"] = (
             "mc2_final_zero_diagnostic_not_all_gather_qualification"
