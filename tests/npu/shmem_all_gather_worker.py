@@ -56,7 +56,7 @@ from scripts.logger import logger
 
 _GUARD_BYTES = 128
 _GUARD_VALUE = -123
-_SKEW_PHASES = {"none": 0, "read": 1, "ack": 2}
+_SKEW_PHASES = {"none": 0, "read": 1, "ack": 2, "ready": 3}
 _PREFIX_ELEMENTS = 32
 _MC2_PROTOCOL = "mc2_lane_fanout_v2"
 # Retain failed MC2 state until the process boundary reports the original error.
@@ -1482,7 +1482,7 @@ def _main() -> None:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--mode", choices=("eager", "graph"), default="eager")
-    parser.add_argument("--skew-phase", choices=("none", "read", "ack"), default="none")
+    parser.add_argument("--skew-phase", choices=("none", "read", "ack", "ready"), default="none")
     parser.add_argument(
         "--skew-iterations", type=int, default=0, help="Bounded correctness delay steps; not cycles or time units"
     )
@@ -1642,10 +1642,12 @@ def _main() -> None:
             parser.error("Retained graphs require at least two replay rounds")
         if args.backend != "hccl_aiv" and args.alternate_count is not None and args.alternate_count not in args.counts:
             parser.error("Alternate count must belong to --counts")
+    if args.skew_phase == "ready" and args.backend != "hccl_aiv":
+        parser.error("READY publication skew requires the hccl_aiv backend")
     if (args.skew_phase == "none" and args.skew_iterations != 0) or (
         args.skew_phase != "none" and not 0 < args.skew_iterations <= 32768
     ):
-        parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
+        parser.error("Require skew-iterations=0 for none, or 1..32768 for ready/read/ack instrumentation")
     if args.repeats <= 0 or args.lanes <= 0:
         parser.error("Require positive repeats and positive lanes")
     if args.backend == "hccl_aiv" and args.lanes > 48:
