@@ -1642,7 +1642,7 @@ def _main() -> None:
         args.world_size == 16
         and args.chunk_bytes == 65536
         and (
-            (args.dtype == "bfloat16" and args.counts == [309760] and args.lanes in (4, 8))
+            (args.dtype == "bfloat16" and args.counts == [309760] and args.lanes in (4, 8, 16))
             or (
                 args.dtype in ("float16", "bfloat16")
                 and args.lanes == 8
@@ -1667,7 +1667,7 @@ def _main() -> None:
     ):
         parser.error(
             "mc2-capture-identity requires repeats2 Level2 aligned profiling and the PE2 control, "
-            "TP16 BF16/count309760/L4-or-L8, or one GLM5.2 TP16 embedding/logits shape at "
+            "TP16 BF16/count309760 at L4/L8/L16, or one GLM5.2 TP16 embedding/logits shape at "
             "L8/chunk65536; completion metadata remains unqualified"
         )
     args.artifact_dir = args.artifact_dir.resolve()
