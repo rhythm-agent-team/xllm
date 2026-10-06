@@ -928,6 +928,8 @@ def _run_case(
         "mode": args.mode,
         "scope": "gather_only",
         "duration_source": "msprof_device_trace",
+        "profiler": f"CPU+NPU_{args.profile_level}",
+        "profile_level": args.profile_level,
         "evidence_version": 1,
         "device_association": "UNVERIFIED",
         "comparison_id": args.comparison_id,
@@ -950,16 +952,15 @@ def _run_case(
     if args.backend == "hccl_aiv":
         profile.update(
             {
-                "mc2_profile_level": args.mc2_profile_level,
-                "profiler": f"CPU+NPU_{args.mc2_profile_level}",
+                "mc2_profile_level": args.profile_level,
                 "mc2_capture_identity": args.mc2_capture_identity,
             }
         )
         if args.mc2_capture_identity:
             profile.update(
                 {
-                    "purpose": "mc2_capture_identity_diagnostic_not_performance",
-                    "performance_verdict": "NOT_PERFORMANCE",
+                    "purpose": "performance_measurement",
+                    "performance_verdict": "UNASSESSED",
                     "capture_identity_records": [],
                     "replay_thread_identity": {},
                 }
@@ -972,7 +973,7 @@ def _run_case(
         experimental_config=torch_npu.profiler._ExperimentalConfig(
             profiler_level=(
                 torch_npu.profiler.ProfilerLevel.Level2
-                if args.mc2_profile_level == "Level2"
+                if args.profile_level == "Level2"
                 else torch_npu.profiler.ProfilerLevel.Level1
             ),
             export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
@@ -1601,6 +1602,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "backend",
         "mc2_probe_stage",
         "mc2_delay_iterations",
+        "profile_level",
         "mc2_profile_level",
         "mc2_capture_identity",
         "profile_samples",
@@ -1776,15 +1778,15 @@ def _main() -> None:
     )
     parser.add_argument("--profile-graph-warmup", type=int, help="Full aligned-graph warmup replays (default 20)")
     parser.add_argument(
-        "--mc2-profile-level",
+        "--profile-level",
         choices=("Level1", "Level2"),
         default=None,
-        help="Normal hccl_aiv aligned profiling coverage (default Level1)",
+        help="Aligned profiling coverage (default Level1)",
     )
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536 Level2 identity diagnostic; not performance",
+        help="Required Level2 performance identities: PE2 FP16/count64/chunk128 or PE16 BF16/count309760/chunk65536",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
@@ -1994,10 +1996,10 @@ def _main() -> None:
         required_bytes = args.world_size * args.lanes * args.chunk_bytes + (2 * args.world_size + 1) * args.lanes * 128
         if args.heap_bytes < required_bytes:
             parser.error(f"Symmetric buffers require at least {required_bytes} heap bytes")
-    if args.mc2_profile_level is not None and (args.backend != "hccl_aiv" or not args.profile_samples):
-        parser.error("mc2-profile-level requires normal hccl_aiv alltoall_graph profiling")
-    if args.backend == "hccl_aiv" and args.profile_samples and args.mc2_profile_level is None:
-        args.mc2_profile_level = "Level1"
+    if args.profile_level is not None and not args.profile_samples:
+        parser.error("profile-level requires alltoall_graph profiling")
+    if args.profile_samples and args.profile_level is None:
+        args.profile_level = "Level1"
     capture_identity_preset = (
         args.world_size == 2 and args.dtype == "float16" and args.counts == [64] and args.chunk_bytes == 128
     ) or (args.world_size == 16 and args.dtype == "bfloat16" and args.counts == [309760] and args.chunk_bytes == 65536)
@@ -2007,7 +2009,7 @@ def _main() -> None:
         or args.profile_samples != 50
         or args.profile_warmup != 0
         or args.profile_graph_warmup != 20
-        or args.mc2_profile_level != "Level2"
+        or args.profile_level != "Level2"
         or args.mc2_probe_stage is not None
         or args.mode != "eager"
         or not capture_identity_preset
@@ -2024,7 +2026,8 @@ def _main() -> None:
         "backend": args.backend,
         "mc2_probe_stage": args.mc2_probe_stage,
         "mc2_delay_iterations": args.mc2_delay_iterations,
-        "mc2_profile_level": args.mc2_profile_level,
+        "profile_level": args.profile_level,
+        "mc2_profile_level": args.profile_level if args.backend == "hccl_aiv" else None,
         "mc2_capture_identity": args.mc2_capture_identity,
         "profile_samples": args.profile_samples,
         "profile_warmup": args.profile_warmup,
@@ -2082,8 +2085,8 @@ def _main() -> None:
         },
     }
     if args.mc2_capture_identity:
-        result["purpose"] = "mc2_capture_identity_diagnostic_not_performance"
-        result["performance_verdict"] = "NOT_PERFORMANCE"
+        result["purpose"] = "performance_measurement"
+        result["performance_verdict"] = "UNASSESSED"
     if args.mc2_probe_stage is not None:
         result["purpose"] = (
             "mc2_final_zero_diagnostic_not_all_gather_qualification"
