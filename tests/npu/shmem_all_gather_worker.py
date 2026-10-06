@@ -58,7 +58,7 @@ _GUARD_BYTES = 128
 _GUARD_VALUE = -123
 _SKEW_PHASES = {"none": 0, "read": 1, "ack": 2}
 _PREFIX_ELEMENTS = 32
-_MC2_PROTOCOL = "mc2_lane_fanout_v1"
+_MC2_PROTOCOL = "mc2_lane_fanout_v2"
 # Retain failed MC2 state until the process boundary reports the original error.
 _active_prepared: Any | None = None
 _active_graph: dict[str, Any] | None = None
@@ -309,13 +309,16 @@ def _run_case(
             args.lanes,
             _SKEW_PHASES[args.skew_phase],
             args.skew_iterations,
+            args.row_width or 0,
         )
         _active_prepared = prepared
+        case["lane_schedule"] = dict(prepared.schedule())
     ready_phase = f"count-{count}/{'compiled' if args.backend == 'shmem' else 'ready'}"
     _save(result_path, result, ready_phase)
     _rendezvous(store, args.rank, args.world_size, ready_phase)
-    round_elements = args.lanes * args.chunk_bytes // source.element_size()
-    rounds = (count + round_elements - 1) // round_elements
+    if scratch is not None:
+        round_elements = args.lanes * args.chunk_bytes // source.element_size()
+        rounds = (count + round_elements - 1) // round_elements
     stream = torch.npu.Stream() if args.profile_samples and args.backend != "hccl_aiv" else torch.npu.current_stream()
 
     def _gather(
@@ -505,6 +508,7 @@ def _run_case(
                 "mc2_profile_level": args.profile_level,
                 "mc2_capture_identity": args.mc2_capture_identity,
                 "protocol": result["backend_identity"]["protocol"],
+                "lane_schedule": case["lane_schedule"],
             }
         )
         if args.mc2_capture_identity:
@@ -574,7 +578,10 @@ def _run_case(
                 args.lanes,
                 _SKEW_PHASES[args.skew_phase],
                 args.skew_iterations,
+                args.row_width or 0,
             )
+            if dict(calls[-1]["prepared"].schedule()) != case["lane_schedule"]:
+                raise RuntimeError("MC2 profiling owners disagree on the static lane schedule")
             if args.mc2_capture_identity:
                 calls[-1]["prepared"].enable_capture_identity()
 
@@ -890,7 +897,8 @@ def _run_batch(
     stream = torch.npu.current_stream()
     if args.backend == "hccl_aiv":
         _active_graph = {"stream": stream, "graphs": graphs, "calls": calls}
-    round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
+    if uses_shmem:
+        round_elements = args.lanes * args.chunk_bytes // torch.empty((), dtype=dtype).element_size()
     batch_counts = args.counts * args.repeats
     retained_counts = batch_counts + ([] if args.alternate_count is None else [args.alternate_count])
     for call_id, count in enumerate(retained_counts):
@@ -903,12 +911,10 @@ def _run_batch(
         source.copy_(local)
         output.fill_(float("nan"))
         consumer.fill_(float("nan"))
-        rounds = (count + round_elements - 1) // round_elements
         calls.append(
             {
                 "call_id": call_id,
                 "count": count,
-                "rounds": rounds,
                 "kernel": kernels[count] if args.backend == "shmem" else None,
                 "source": source,
                 "source_storage": source_storage,
@@ -935,32 +941,45 @@ def _run_batch(
                 args.lanes,
                 _SKEW_PHASES[args.skew_phase],
                 args.skew_iterations,
+                args.row_width or 0,
             )
+            calls[-1]["lane_schedule"] = dict(calls[-1]["prepared"].schedule())
+        else:
+            calls[-1]["rounds"] = (count + round_elements - 1) // round_elements
     groups = [calls[: len(batch_counts)]]
     if args.alternate_count is not None:
         groups.append(calls[len(batch_counts) :])
-    group_rounds = [sum(call["rounds"] for call in group) for group in groups]
     torch.npu.synchronize()
     starting_epochs = None
     if uses_shmem:
+        group_rounds = [sum(call["rounds"] for call in group) for group in groups]
         starting_epochs = epochs.cpu().view(args.lanes, 32)[:, 0].clone()
         assert torch.all((starting_epochs == 0) | (starting_epochs == 1)), "Invalid device epoch"
     result["batch"] = {
         "counts": batch_counts,
-        "rounds": [call["rounds"] for call in groups[0]],
-        "total_rounds": group_rounds[0],
         "checked_calls": [],
         "graph_groups": [[call["count"] for call in group] for group in groups],
-        "group_rounds": group_rounds,
         "graph_warmups": [],
         "graph_captures": [],
         "graph_replays": [],
         "graphs_reset": False,
     }
     if uses_shmem:
-        result["batch"]["starting_epochs"] = starting_epochs.tolist()
+        result["batch"].update(
+            {
+                "rounds": [call["rounds"] for call in groups[0]],
+                "total_rounds": group_rounds[0],
+                "group_rounds": group_rounds,
+                "starting_epochs": starting_epochs.tolist(),
+            }
+        )
     else:
-        result["batch"]["prepared_closed"] = False
+        result["batch"].update(
+            {
+                "lane_schedules": [call["lane_schedule"] for call in calls],
+                "prepared_closed": False,
+            }
+        )
     _rendezvous(store, args.rank, args.world_size, "batch/prepared")
 
     def _submit(group: list[dict[str, Any]]) -> None:
@@ -1366,7 +1385,7 @@ def _run_hccl(args: argparse.Namespace, result: dict[str, Any], result_path: Pat
             setup_source.fill_(1)
             setup_output.fill_(float("nan"))
             setup = torch.classes.hccl_aiv_ops.PreparedAllGather(
-                setup_source, setup_output, hccl_comm_name, args.world_size, args.chunk_bytes, args.lanes, 0, 0
+                setup_source, setup_output, hccl_comm_name, args.world_size, args.chunk_bytes, args.lanes, 0, 0, 0
             )
             _active_prepared = setup
             protocol = setup.protocol()
@@ -1444,12 +1463,12 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at L8/chunk65536",
+        help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at reserved L8/L48/chunk65536",
     )
     parser.add_argument("--comparison-id")
     parser.add_argument("--round-id", type=int)
     parser.add_argument("--stage-index", type=int)
-    parser.add_argument("--row-width", type=int)
+    parser.add_argument("--row-width", type=int, help="Per-rank MC2 scheduling row width, or profiling shape metadata")
     parser.add_argument("--native-library", type=Path)
     parser.add_argument("--native-build-revision")
     parser.add_argument("--kernel-source", type=Path, help="Standalone Ascend C kernel source identity")
@@ -1472,7 +1491,7 @@ def _main() -> None:
         "--compile-only", action="store_true", help="Lower DSL only; no SHMEM bootstrap or NPU execution"
     )
     parser.add_argument("--counts", type=int, nargs="+", default=[64, 65, 127, 128, 129])
-    parser.add_argument("--lanes", type=int, help="Total lane blocks (default 2); MC2 supports 1..32")
+    parser.add_argument("--lanes", type=int, help="MC2 reserved lanes 1..48 (default 48); other backends default to 2")
     parser.add_argument("--chunk-bytes", type=int, default=128)
     parser.add_argument("--heap-bytes", type=int, help="SHMEM heap bytes (default 64 MiB); not used by hccl_aiv")
     parser.add_argument("--repeats", type=int, default=16)
@@ -1503,7 +1522,7 @@ def _main() -> None:
     elif args.heap_bytes is None:
         args.heap_bytes = 64 * 1024 * 1024
     if args.lanes is None:
-        args.lanes = 2
+        args.lanes = 48 if args.backend == "hccl_aiv" else 2
     if args.profile_warmup is None:
         args.profile_warmup = 0 if args.profile_submission == "alltoall_graph" else 20
     if args.profile_samples < 0:
@@ -1544,12 +1563,18 @@ def _main() -> None:
             parser.error("comparison-id must be a nonempty 1..128 character alphanumeric/underscore/dot/hyphen ID")
         if args.round_id is None or args.round_id < 0 or args.stage_index is None or args.stage_index < 0:
             parser.error("Profiling requires nonnegative round-id and stage-index")
-        if args.row_width is not None and (args.row_width <= 0 or any(count % args.row_width for count in args.counts)):
-            parser.error("row-width must be positive and divide every count")
-    elif args.profile_warmup != 20 or any(
-        value is not None for value in (args.comparison_id, args.round_id, args.stage_index, args.row_width)
+    elif (
+        args.profile_warmup != 20
+        or any(value is not None for value in (args.comparison_id, args.round_id, args.stage_index))
+        or (args.row_width is not None and args.backend != "hccl_aiv")
     ):
         parser.error("Profiling metadata requires positive profile-samples")
+    if args.row_width is not None and (
+        args.row_width <= 0
+        or any(count % args.row_width for count in args.counts)
+        or (args.alternate_count is not None and args.alternate_count % args.row_width != 0)
+    ):
+        parser.error("row-width must be positive and divide every primary and alternate count")
     if args.compile_only and args.backend != "shmem":
         parser.error("compile-only is available only for the TileLang SHMEM backend")
     if args.backend in ("hccl", "ascendc", "hccl_aiv"):
@@ -1604,8 +1629,8 @@ def _main() -> None:
         parser.error("Require skew-iterations=0 for none, or 1..32768 for read/ack instrumentation")
     if args.repeats <= 0 or args.lanes <= 0:
         parser.error("Require positive repeats and positive lanes")
-    if args.backend == "hccl_aiv" and args.lanes > 32:
-        parser.error("MC2 supports lanes in 1..32; native launch also checks hardware capacity")
+    if args.backend == "hccl_aiv" and args.lanes > 48:
+        parser.error("MC2 supports reserved lanes in 1..48; native launch also checks hardware capacity")
     if args.backend == "ascendc" and args.lanes > 48:
         parser.error("Ascend C supports lanes in 1..48; native launch also checks hardware capacity")
     if args.backend in ("shmem", "hccl") and args.lanes % 2:
@@ -1645,7 +1670,7 @@ def _main() -> None:
             (args.dtype == "bfloat16" and args.counts == [309760] and args.lanes in (4, 8, 16))
             or (
                 args.dtype in ("float16", "bfloat16")
-                and args.lanes == 8
+                and args.lanes in (8, 48)
                 and args.row_width in (384, 9680)
                 and len(args.counts) == 1
                 and args.counts[0]
@@ -1668,7 +1693,7 @@ def _main() -> None:
         parser.error(
             "mc2-capture-identity requires repeats2 Level2 aligned profiling and the PE2 control, "
             "TP16 BF16/count309760 at L4/L8/L16, or one GLM5.2 TP16 embedding/logits shape at "
-            "L8/chunk65536; completion metadata remains unqualified"
+            "reserved L8/L48/chunk65536; completion metadata remains unqualified"
         )
     args.artifact_dir = args.artifact_dir.resolve()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
