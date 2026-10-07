@@ -1509,7 +1509,7 @@ def _main() -> None:
     parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
-        help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at reserved L8/L48/chunk65536",
+        help="Collect unqualified identities: Level2 controls, or the Level1 TP16 BF16/count309760/row9680/L48 instrumentation control",
     )
     parser.add_argument(
         "--mc2-submission-identity",
@@ -1757,22 +1757,31 @@ def _main() -> None:
             )
         )
     )
+    level1_identity_control = (
+        args.profile_level == "Level1"
+        and args.world_size == 16
+        and args.dtype == "bfloat16"
+        and args.counts == [309760]
+        and args.row_width == 9680
+        and args.lanes == 48
+        and args.chunk_bytes == 65536
+    )
     if args.mc2_capture_identity and (
         args.backend != "hccl_aiv"
         or args.profile_submission != "alltoall_graph"
         or args.profile_samples != 50
         or args.profile_warmup != 0
         or args.profile_graph_warmup != 20
-        or args.profile_level != "Level2"
+        or not (args.profile_level == "Level2" or level1_identity_control)
         or args.mc2_probe_stage is not None
         or args.mode != "eager"
         or not capture_identity_preset
         or args.repeats != 2
     ):
         parser.error(
-            "mc2-capture-identity requires repeats2 Level2 aligned profiling and the PE2 control, "
-            "TP16 BF16/count309760 at L4/L8/L16, or one GLM5.2 TP16 embedding/logits shape at "
-            "reserved L8/L48/chunk65536; completion metadata remains unqualified"
+            "mc2-capture-identity requires repeats2 and Level2 aligned controls, or the exact "
+            "Level1 TP16 BF16/count309760/row9680/L48/chunk65536 instrumentation control; "
+            "completion metadata remains unqualified"
         )
     if args.mc2_submission_identity and (
         args.backend != "hccl_aiv"
