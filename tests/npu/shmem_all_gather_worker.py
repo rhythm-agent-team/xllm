@@ -58,7 +58,7 @@ _GUARD_BYTES = 128
 _GUARD_VALUE = -123
 _SKEW_PHASES = {"none": 0, "read": 1, "ack": 2, "ready": 3}
 _PREFIX_ELEMENTS = 32
-_MC2_PROTOCOL = "mc2_lane_fanout_v2"
+_MC2_PROTOCOL = "mc2_lane_pull_v3"
 # Retain failed MC2 state until the process boundary reports the original error.
 _active_prepared: Any | None = None
 _active_graph: dict[str, Any] | None = None
