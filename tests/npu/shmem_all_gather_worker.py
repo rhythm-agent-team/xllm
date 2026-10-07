@@ -561,17 +561,21 @@ def _run_case(
             )
     case["profile"] = profile
     _save(result_path, result, f"count-{count}/profile/prepare")
+    experimental_options = {
+        "profiler_level": (
+            torch_npu.profiler.ProfilerLevel.Level2
+            if args.profile_level == "Level2"
+            else torch_npu.profiler.ProfilerLevel.Level1
+        ),
+        "export_type": [torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
+    }
+    if args.profile_disable_aic_metrics:
+        experimental_options["aic_metrics"] = torch_npu.profiler.AiCMetrics.AiCoreNone
+        profile["aic_metrics"] = "ACL_AICORE_NONE"
     profiler = torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(profile_dir)),
-        experimental_config=torch_npu.profiler._ExperimentalConfig(
-            profiler_level=(
-                torch_npu.profiler.ProfilerLevel.Level2
-                if args.profile_level == "Level2"
-                else torch_npu.profiler.ProfilerLevel.Level1
-            ),
-            export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
-        ),
+        experimental_config=torch_npu.profiler._ExperimentalConfig(**experimental_options),
     )
     profile["submission_pattern"] = "alltoall_aligned_graph"
     calls = []
@@ -1227,6 +1231,7 @@ def _bootstrap_store(args: argparse.Namespace, result: dict[str, Any], identitie
         "mc2_probe_stage",
         "mc2_delay_iterations",
         "profile_level",
+        "profile_disable_aic_metrics",
         "mc2_profile_level",
         "mc2_capture_identity",
         "mc2_submission_identity",
@@ -1507,6 +1512,11 @@ def _main() -> None:
         help="Aligned profiling coverage (default Level1)",
     )
     parser.add_argument(
+        "--profile-disable-aic-metrics",
+        action="store_true",
+        help="Diagnostic only: TP16 BF16/logits32 HCCL Level2 without AICore metrics",
+    )
+    parser.add_argument(
         "--mc2-capture-identity",
         action="store_true",
         help="Collect unqualified Level2 identities for the PE2 control or TP16 GLM5.2 embedding/logits shapes at reserved L8/L48/chunk65536",
@@ -1736,6 +1746,21 @@ def _main() -> None:
         parser.error("profile-level requires alltoall_graph profiling")
     if args.profile_samples and args.profile_level is None:
         args.profile_level = "Level1"
+    if args.profile_disable_aic_metrics and not (
+        args.backend == "hccl"
+        and args.profile_samples == 50
+        and args.profile_submission == "alltoall_graph"
+        and args.profile_level == "Level2"
+        and args.world_size == 16
+        and args.dtype == "bfloat16"
+        and args.counts == [309760]
+        and args.row_width == 9680
+        and args.lanes == 48
+        and args.chunk_bytes == 65536
+        and args.repeats == 2
+        and args.profile_graph_warmup == 20
+    ):
+        parser.error("AICore metrics control requires the exact TP16 BF16/logits32 HCCL Level2 workload")
     capture_identity_preset = (
         args.world_size == 2
         and args.dtype == "float16"
@@ -1812,6 +1837,7 @@ def _main() -> None:
         "mc2_probe_stage": args.mc2_probe_stage,
         "mc2_delay_iterations": args.mc2_delay_iterations,
         "profile_level": args.profile_level,
+        "profile_disable_aic_metrics": args.profile_disable_aic_metrics,
         "mc2_profile_level": args.profile_level if args.backend == "hccl_aiv" else None,
         "mc2_capture_identity": args.mc2_capture_identity,
         "mc2_submission_identity": args.mc2_submission_identity,
