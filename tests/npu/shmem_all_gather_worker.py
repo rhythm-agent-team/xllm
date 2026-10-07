@@ -89,9 +89,9 @@ def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch
     # initial 16 repeats, position zero distinguishes all supported PE/call pairs.
     # The odd column stride and row marker expose both intra-row errors and
     # whole-row shifts; no scalar pattern claims global position uniqueness.
-    rows = positions // 512
-    columns = positions % 512
-    values = (identity + (2 * iteration + 1) * columns + 31 * rows) % 512 - 256
+    rows = positions >> 9
+    columns = positions & 511
+    values = ((identity + (2 * iteration + 1) * columns + 31 * rows) & 511) - 256
     return values.to(dtype)
 
 
