@@ -83,7 +83,9 @@ def _file_identity(path: str | Path) -> dict[str, str]:
 
 
 def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch.Tensor:
-    positions = torch.arange(count, dtype=torch.int64)
+    # Both position terms repeat after 512 columns * 512 row markers.
+    period = 512 * 512
+    positions = torch.arange(min(count, period), dtype=torch.int64)
     identity = rank + 16 * (iteration + 2)
     # Signed markers and their +1 consumer results are exact in BF16. For the
     # initial 16 repeats, position zero distinguishes all supported PE/call pairs.
@@ -92,7 +94,8 @@ def _payload(rank: int, count: int, iteration: int, dtype: torch.dtype) -> torch
     rows = positions // 512
     columns = positions % 512
     values = (identity + (2 * iteration + 1) * columns + 31 * rows) % 512 - 256
-    return values.to(dtype)
+    payload = values.to(dtype)
+    return payload if count <= period else payload.repeat((count + period - 1) // period)[:count]
 
 
 def _prefix_payload(sender: int, destination: int, iteration: int, world_size: int) -> torch.Tensor:
