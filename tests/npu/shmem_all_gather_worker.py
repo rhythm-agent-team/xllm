@@ -114,9 +114,10 @@ def _guarded(count: int, dtype: torch.dtype, device: torch.device) -> tuple[torc
 
 
 def _check_guards(storage: torch.Tensor, count: int, guard_elements: int) -> None:
-    actual = storage.cpu()
-    assert torch.all(actual[:guard_elements] == _GUARD_VALUE), "Leading guard changed"
-    assert torch.all(actual[guard_elements + count :] == _GUARD_VALUE), "Tail padding or trailing guard changed"
+    leading = storage[:guard_elements].cpu()
+    trailing = storage[guard_elements + count :].cpu()
+    assert torch.all(leading == _GUARD_VALUE), "Leading guard changed"
+    assert torch.all(trailing == _GUARD_VALUE), "Tail padding or trailing guard changed"
 
 
 def _prepare_scratch(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:

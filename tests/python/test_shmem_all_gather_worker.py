@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tests.npu.shmem_all_gather_worker import _payload
+from tests.npu.shmem_all_gather_worker import _check_guards, _guarded, _payload
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -44,3 +44,29 @@ def test_payload_changes_between_calls_and_has_independent_storage() -> None:
     assert not torch.equal(first, _payload(2, 262145, -1, torch.bfloat16))
     first.fill_(0)
     assert torch.count_nonzero(repeated) > 0
+
+
+@pytest.mark.parametrize("count", [1, 63, 64, 65, 262145])
+def test_guards_check_every_boundary_without_copying_payload(count: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage, payload, guard = _guarded(count, torch.bfloat16, torch.device("cpu"))
+    payload.fill_(float("nan"))
+    copied = []
+    original_cpu = torch.Tensor.cpu
+
+    def _record_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        copied.append(tensor.numel())
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _record_cpu)
+    _check_guards(storage, count, guard)
+    assert copied == [guard, storage.numel() - guard - count]
+    for index in range(guard):
+        storage[index] = 0
+        with pytest.raises(AssertionError, match="Leading guard changed"):
+            _check_guards(storage, count, guard)
+        storage[index] = -123
+    for index in range(guard + count, storage.numel()):
+        storage[index] = 0
+        with pytest.raises(AssertionError, match="Tail padding or trailing guard changed"):
+            _check_guards(storage, count, guard)
+        storage[index] = -123
