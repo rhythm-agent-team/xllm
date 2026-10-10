@@ -120,6 +120,20 @@ def _check_guards(storage: torch.Tensor, count: int, guard_elements: int) -> Non
     assert torch.all(trailing == _GUARD_VALUE), "Tail padding or trailing guard changed"
 
 
+def _check_profile_tensor(actual: torch.Tensor, expected: torch.Tensor, executed: bool | None) -> str:
+    assert actual.shape == expected.shape, "Profile tensor shape changed"
+    assert actual.dtype == expected.dtype, "Profile tensor dtype changed"
+    assert actual.device == expected.device, "Profile tensor device changed"
+    assert actual.layout == expected.layout, "Profile tensor layout changed"
+    if executed is not True and torch.all(torch.isnan(actual)):
+        return "POISONED"
+    assert executed is not False, "Unexpected retained output state"
+    # The oracle contains finite exact markers. Keep the full failure diagnostic.
+    if not torch.equal(actual, expected):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    return "CORRECT"
+
+
 def _prepare_scratch(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     band_elements = max(1, args.skew_iterations) * 32
     elements = 2 * band_elements
@@ -634,12 +648,9 @@ def _run_case(
             for key, expected in (("source", call["local"]), ("output", call["expected"])):
                 storage, tensor, guard = call["buffers"][key]
                 actual = tensor.cpu()
-                if key == "output" and torch.all(torch.isnan(actual)):
-                    observed.add("POISONED")
-                else:
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                    if key == "output":
-                        observed.add("CORRECT")
+                state = _check_profile_tensor(actual, expected, executed if key == "output" else True)
+                if key == "output":
+                    observed.add(state)
                 _check_guards(storage, tensor.numel(), guard)
         assert len(observed) == 1, "Retained group has partially executed outputs"
         output_state = observed.pop()

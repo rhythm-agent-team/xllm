@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Full-element equivalence of the AllGather worker's CPU payload oracle."""
+"""AllGather worker payload, boundary, and profile-state checks."""
 
 import pytest
 import torch
 
-from tests.npu.shmem_all_gather_worker import _check_guards, _guarded, _payload
+from tests.npu.shmem_all_gather_worker import _check_guards, _check_profile_tensor, _guarded, _payload
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -70,3 +70,65 @@ def test_guards_check_every_boundary_without_copying_payload(count: int, monkeyp
         with pytest.raises(AssertionError, match="Tail padding or trailing guard changed"):
             _check_guards(storage, count, guard)
         storage[index] = -123
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("executed", [True, False, None])
+def test_profile_tensor_checks_full_payload_and_execution_state(dtype: torch.dtype, executed: bool | None) -> None:
+    expected = _payload(1, 1025, 0, dtype)
+    actual = expected.clone()
+    if executed is False:
+        with pytest.raises(AssertionError, match="Unexpected retained output state"):
+            _check_profile_tensor(actual, expected, executed)
+    else:
+        assert _check_profile_tensor(actual, expected, executed) == "CORRECT"
+    actual.fill_(float("nan"))
+    if executed is True:
+        with pytest.raises(AssertionError):
+            _check_profile_tensor(actual, expected, executed)
+    else:
+        assert _check_profile_tensor(actual, expected, executed) == "POISONED"
+    for index in (0, 511, 512, 1024):
+        for value in (float("nan"), float("inf"), float("-inf"), expected[index].item() + 1):
+            actual.copy_(expected)
+            actual[index] = value
+            with pytest.raises(AssertionError):
+                _check_profile_tensor(actual, expected, executed)
+        actual.fill_(float("nan"))
+        actual[index] = expected[index]
+        with pytest.raises(AssertionError):
+            _check_profile_tensor(actual, expected, executed)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_executed_profile_tensor_skips_poison_scan_and_keeps_failure_diagnostic(
+    dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = torch.tensor([0, -1, 255], dtype=dtype)
+    actual = expected.clone()
+    actual[0] = -0.0
+
+    def _unexpected_poison_scan(tensor: torch.Tensor) -> torch.Tensor:
+        pytest.fail("Executed profile output must not scan for poison")
+
+    monkeypatch.setattr(torch, "isnan", _unexpected_poison_scan)
+    assert _check_profile_tensor(actual, expected, True) == "CORRECT"
+    actual[-1] += 1
+    with pytest.raises(AssertionError, match="Greatest absolute difference.*index"):
+        _check_profile_tensor(actual, expected, True)
+
+
+@pytest.mark.parametrize("executed", [True, False, None])
+def test_profile_tensor_rejects_metadata_changes(executed: bool | None) -> None:
+    expected = torch.zeros(4, dtype=torch.float32)
+    # torch.equal alone accepts both a dtype change and these equal values.
+    actual = expected.to(torch.float16)
+    assert torch.equal(actual, expected)
+    with pytest.raises(AssertionError, match="Profile tensor dtype changed"):
+        _check_profile_tensor(actual, expected, executed)
+    with pytest.raises(AssertionError, match="Profile tensor shape changed"):
+        _check_profile_tensor(expected.view(2, 2), expected, executed)
+    with pytest.raises(AssertionError, match="Profile tensor device changed"):
+        _check_profile_tensor(torch.empty_like(expected, device="meta"), expected, executed)
+    with pytest.raises(AssertionError, match="Profile tensor layout changed"):
+        _check_profile_tensor(expected.to_sparse(), expected, executed)
