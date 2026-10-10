@@ -48,7 +48,6 @@ _EXPORTS = {
     "linear": (
         "atb_matmul_ein_sum",
         "atb_matmul_ein_sum_out",
-        "supports_atb_matmul_ein_sum_out",
         "prepare_quant_weight",
         "prepare_row_parallel_weight",
     ),
@@ -102,7 +101,6 @@ _EXPORTS = {
         "dynamic_quant",
         "quant_matmul",
         "quant_matmul_out",
-        "supports_quant_matmul_out",
         "quantize_per_tensor",
     ),
     "rotary_embedding": (
@@ -126,7 +124,6 @@ _EXPORTS = {
         "sparse_flash_attention_out",
         "sparse_flash_attention_lse",
         "sparse_flash_attention_lse_out",
-        "supports_sparse_flash_attention_lse_out",
     ),
     "dsa": (
         "compressor",
@@ -154,7 +151,6 @@ __all__ = [
     "vision_fusion_attention",
     "atb_matmul_ein_sum",
     "atb_matmul_ein_sum_out",
-    "supports_atb_matmul_ein_sum_out",
     "fused_qk_norm_rope",
     "interleaved_rotary_embedding",
     "npu_inplace_partial_rotary_mul",
@@ -193,7 +189,6 @@ __all__ = [
     "supports_mla_kv_cache_slot_reuse",
     "quant_matmul",
     "quant_matmul_out",
-    "supports_quant_matmul_out",
     "quantize_per_tensor",
     "dynamic_quant",
     "dynamic_block_quant",
@@ -209,7 +204,6 @@ __all__ = [
     "sparse_flash_attention_out",
     "sparse_flash_attention_lse",
     "sparse_flash_attention_lse_out",
-    "supports_sparse_flash_attention_lse_out",
     "causal_conv1d_decode",
     "compressor",
     "dequant_swiglu_quant",
