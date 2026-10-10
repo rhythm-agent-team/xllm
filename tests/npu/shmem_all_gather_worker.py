@@ -134,18 +134,6 @@ def _check_profile_tensor(actual: torch.Tensor, expected: torch.Tensor, executed
     return "CORRECT"
 
 
-def _check_profile_output(
-    actual: torch.Tensor, count: int, iteration: int, world_size: int, dtype: torch.dtype, executed: bool | None
-) -> str:
-    assert actual.shape == (world_size * count,), "Profile output shape changed"
-    observed = set()
-    for peer, row in enumerate(actual.view(world_size, count)):
-        expected = _payload(peer, count, iteration, dtype)
-        observed.add(_check_profile_tensor(row, expected, executed))
-    assert len(observed) == 1, "Retained output has partially executed ranks"
-    return observed.pop()
-
-
 def _prepare_scratch(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     band_elements = max(1, args.skew_iterations) * 32
     elements = 2 * band_elements
@@ -625,6 +613,7 @@ def _run_case(
             "output": _guarded(args.world_size * count, dtype, device),
         }
         local = _payload(args.rank, count, iteration, dtype)
+        expected = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
         buffers["source"][1].copy_(local)
         buffers["output"][1].fill_(float("nan"))
         calls.append(
@@ -632,7 +621,7 @@ def _run_case(
                 "buffers": buffers,
                 "rank_major": buffers["output"][1].view(args.world_size, count),
                 "local": local,
-                "iteration": iteration,
+                "expected": expected,
                 "record": {"sample_index": sample_index, "input_iteration": iteration},
             }
         )
@@ -656,12 +645,13 @@ def _run_case(
     def _check_profile_group(executed: bool | None) -> str:
         observed = set()
         for call in calls:
-            storage, source, guard = call["buffers"]["source"]
-            _check_profile_tensor(source.cpu(), call["local"], True)
-            _check_guards(storage, count, guard)
-            storage, output, guard = call["buffers"]["output"]
-            observed.add(_check_profile_output(output.cpu(), count, call["iteration"], args.world_size, dtype, executed))
-            _check_guards(storage, output.numel(), guard)
+            for key, expected in (("source", call["local"]), ("output", call["expected"])):
+                storage, tensor, guard = call["buffers"][key]
+                actual = tensor.cpu()
+                state = _check_profile_tensor(actual, expected, executed if key == "output" else True)
+                if key == "output":
+                    observed.add(state)
+                _check_guards(storage, tensor.numel(), guard)
         assert len(observed) == 1, "Retained group has partially executed outputs"
         output_state = observed.pop()
         if executed is not None:
@@ -713,7 +703,7 @@ def _run_case(
             local = _payload(args.rank, count, iteration, dtype)
             assert not torch.equal(local, call["local"]), "Graph input did not change between phases"
             call["local"] = local
-            call["iteration"] = iteration
+            call["expected"] = torch.cat([_payload(peer, count, iteration, dtype) for peer in range(args.world_size)])
             call["buffers"]["source"][1].copy_(local)
             call["buffers"]["output"][1].fill_(float("nan"))
             iterations.append(iteration)

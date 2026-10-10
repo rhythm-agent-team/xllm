@@ -17,13 +17,7 @@
 import pytest
 import torch
 
-from tests.npu.shmem_all_gather_worker import (
-    _check_guards,
-    _check_profile_output,
-    _check_profile_tensor,
-    _guarded,
-    _payload,
-)
+from tests.npu.shmem_all_gather_worker import _check_guards, _check_profile_tensor, _guarded, _payload
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -138,43 +132,3 @@ def test_profile_tensor_rejects_metadata_changes(executed: bool | None) -> None:
         _check_profile_tensor(torch.empty_like(expected, device="meta"), expected, executed)
     with pytest.raises(AssertionError, match="Profile tensor layout changed"):
         _check_profile_tensor(expected.to_sparse(), expected, executed)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("world_size", [2, 8, 16])
-def test_profile_output_checks_every_rank_and_phase(dtype: torch.dtype, world_size: int) -> None:
-    count = 513
-    iterations = (0, -1300, 6)
-    positions = torch.arange(count, dtype=torch.int64)
-    rows = positions // 512
-    columns = positions % 512
-    for iteration in iterations:
-        actual = torch.cat(
-            [
-                ((peer + 16 * (iteration + 2) + (2 * iteration + 1) * columns + 31 * rows) % 512 - 256).to(dtype)
-                for peer in range(world_size)
-            ]
-        )
-        for executed in (True, None):
-            assert _check_profile_output(actual, count, iteration, world_size, dtype, executed) == "CORRECT"
-        for peer in range(world_size):
-            for index in (0, 511, 512):
-                position = peer * count + index
-                actual[position] += 1
-                with pytest.raises(AssertionError):
-                    _check_profile_output(actual, count, iteration, world_size, dtype, True)
-                actual[position] -= 1
-        with pytest.raises(AssertionError):
-            _check_profile_output(actual, count, iteration + 1, world_size, dtype, True)
-        with pytest.raises(AssertionError, match="Unexpected retained output state"):
-            _check_profile_output(actual, count, iteration, world_size, dtype, False)
-        poisoned = torch.full_like(actual, float("nan"))
-        for executed in (False, None):
-            assert _check_profile_output(poisoned, count, iteration, world_size, dtype, executed) == "POISONED"
-        with pytest.raises(AssertionError):
-            _check_profile_output(poisoned, count, iteration, world_size, dtype, True)
-        poisoned[:count] = actual[:count]
-        with pytest.raises(AssertionError, match="partially executed ranks"):
-            _check_profile_output(poisoned, count, iteration, world_size, dtype, None)
-        with pytest.raises(AssertionError, match="Profile output shape changed"):
-            _check_profile_output(actual[:-1], count, iteration, world_size, dtype, True)
